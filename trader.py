@@ -54,6 +54,9 @@ MOMENTUM_ENTRY_RETRY_MAX      = int(os.getenv("MOMENTUM_ENTRY_RETRY_MAX",      "
 MOMENTUM_ENTRY_RETRY_COOLDOWN = float(os.getenv("MOMENTUM_ENTRY_RETRY_COOLDOWN","2.0"))
 MOMENTUM_STOP_LOSS            = int(os.getenv("MOMENTUM_STOP_LOSS",            "60"))
 MOMENTUM_STOP_LOSS_COOLDOWN   = float(os.getenv("MOMENTUM_STOP_LOSS_COOLDOWN", "3.0"))
+MOMENTUM_INSURANCE_THRESHOLD  = int(os.getenv("MOMENTUM_INSURANCE_THRESHOLD",   "5"))
+MOMENTUM_INSURANCE_COUNT      = int(os.getenv("MOMENTUM_INSURANCE_COUNT",        "3"))
+MOMENTUM_INSURANCE_COOLDOWN   = float(os.getenv("MOMENTUM_INSURANCE_COOLDOWN",  "3.0"))
 
 # ── Position book ─────────────────────────────────────────────────────────────
 class PositionBook:
@@ -171,6 +174,8 @@ class MomentumTrader:
         self._hedge_attempted     = False
         self._sl_last_ts          = 0.0
         self._sl_attempted        = False
+        self._insurance_last_ts   = 0.0
+        self._insurance_attempted = False
         self._current_ticker: Optional[str] = None
 
     # ── Public ────────────────────────────────────────────────────────────────
@@ -236,6 +241,13 @@ class MomentumTrader:
                     and now - self._sl_last_ts >= MOMENTUM_STOP_LOSS_COOLDOWN):
                 self._try_stop_loss(snap)
 
+            # Insurance: buy cheap opposite side while holding (any secs_left)
+            pos = self._position
+            if (pos is not None and pos["phase"] == "holding"
+                    and not self._insurance_attempted
+                    and now - self._insurance_last_ts >= MOMENTUM_INSURANCE_COOLDOWN):
+                self._try_insurance_hedge(snap)
+
             # Phase 3: reversal hedge
             pos = self._position
             if (pos is not None and pos["phase"] == "holding"
@@ -274,6 +286,8 @@ class MomentumTrader:
         self._hedge_attempted     = False
         self._sl_last_ts          = 0.0
         self._sl_attempted        = False
+        self._insurance_last_ts   = 0.0
+        self._insurance_attempted = False
 
     def _notify(self):
         self._on_update(self.asset, dict(self._position) if self._position else None)
@@ -668,3 +682,76 @@ class MomentumTrader:
                 ))
         except Exception as e:
             self._on_log("✗", f"STOP LOSS HEDGE error {self.asset}: {e}")
+
+    def _try_insurance_hedge(self, snap):
+        """
+        While in "holding" phase, buy a small number of opposite-side contracts if their
+        implied ask drops to <= MOMENTUM_INSURANCE_THRESHOLD (default 5¢).
+        Cost is ~1–5¢/contract; pays ~95–99¢ if the main side collapses past the SL.
+        One purchase per position, no retry.
+        """
+        self._insurance_last_ts = time.time()
+        pos      = self._position
+        side     = pos["side"]
+        opp_side = "no" if side == "yes" else "yes"
+
+        # Implied opposite ask = 100 - entry-side bid
+        entry_bid = snap.yes_bid if side == "yes" else snap.no_bid
+        if entry_bid is None:
+            return
+        opp_ask = 100 - entry_bid
+
+        if opp_ask > MOMENTUM_INSURANCE_THRESHOLD:
+            return
+
+        n   = MOMENTUM_INSURANCE_COUNT
+        cid = _make_client_id(self.asset, f"mom-ins-{opp_side}")
+
+        self._on_log("🛡", (
+            f"INSURANCE {self.asset} — {opp_side.upper()} ask is {opp_ask}¢  "
+            f"(≤ {MOMENTUM_INSURANCE_THRESHOLD}¢). Buying {n} contracts as cheap insurance."
+        ))
+
+        if DRY_RUN:
+            self._insurance_attempted = True
+            self._position["insurance_price"] = opp_ask
+            self._position["insurance_count"] = n
+            self._on_log("📋", f"[DRY RUN] INSURANCE {self.asset} {opp_side.upper()} {opp_ask}¢ × {n}")
+            self._notify()
+            return
+
+        body = {
+            "ticker":          snap.ticker,
+            "side":            opp_side,
+            "action":          "buy",
+            "count":           n,
+            "time_in_force":   "immediate_or_cancel",
+            "client_order_id": cid,
+        }
+        body["yes_price" if opp_side == "yes" else "no_price"] = opp_ask
+
+        try:
+            resp   = _post_order(body)
+            order  = resp.get("order", {})
+            filled = int(float(order.get("fill_count_fp", "0") or "0"))
+            if filled > 0:
+                self._insurance_attempted = True
+                POSITIONS.record_fill(snap.ticker, opp_side, opp_ask, filled, cid)
+                self._position["insurance_price"] = opp_ask
+                self._position["insurance_count"] = filled
+                _log_trade({
+                    "ts": datetime.now(timezone.utc).isoformat(), "type": "momentum_insurance",
+                    "asset": self.asset, "ticker": snap.ticker,
+                    "insurance_side": opp_side, "insurance_price": opp_ask, "count": filled,
+                })
+                self._on_log("✅", (
+                    f"INSURANCE FILLED {self.asset} bought {opp_side.upper()} "
+                    f"at {opp_ask}¢ × {filled}"
+                ))
+                self._notify()
+            else:
+                self._on_log("⏸", (
+                    f"INSURANCE {self.asset} {opp_side.upper()} {opp_ask}¢ — no fill"
+                ))
+        except Exception as e:
+            self._on_log("✗", f"INSURANCE error {self.asset}: {e}")
