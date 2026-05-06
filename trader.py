@@ -57,7 +57,9 @@ MOMENTUM_STOP_LOSS_COOLDOWN   = float(os.getenv("MOMENTUM_STOP_LOSS_COOLDOWN", "
 MOMENTUM_INSURANCE_THRESHOLD  = int(os.getenv("MOMENTUM_INSURANCE_THRESHOLD",   "5"))
 MOMENTUM_INSURANCE_COUNT      = int(os.getenv("MOMENTUM_INSURANCE_COUNT",        "3"))
 MOMENTUM_INSURANCE_COOLDOWN   = float(os.getenv("MOMENTUM_INSURANCE_COOLDOWN",  "3.0"))
-MOMENTUM_SL_HEDGE_SLIPPAGE    = int(os.getenv("MOMENTUM_SL_HEDGE_SLIPPAGE",      "5"))
+MOMENTUM_WARN_THRESHOLD       = int(os.getenv("MOMENTUM_WARN_THRESHOLD",        "75"))
+MOMENTUM_WARN_COUNT           = int(os.getenv("MOMENTUM_WARN_COUNT",             "5"))
+MOMENTUM_WARN_COOLDOWN        = float(os.getenv("MOMENTUM_WARN_COOLDOWN",        "3.0"))
 MOMENTUM_SL_MIN_AGE           = float(os.getenv("MOMENTUM_SL_MIN_AGE",           "10.0"))
 
 # ── Position book ─────────────────────────────────────────────────────────────
@@ -176,6 +178,8 @@ class MomentumTrader:
         self._hedge_attempted     = False
         self._sl_last_ts          = 0.0
         self._sl_attempted        = False
+        self._warn_last_ts        = 0.0
+        self._warn_attempted      = False
         self._insurance_last_ts   = 0.0
         self._insurance_attempted = False
         self._current_ticker: Optional[str] = None
@@ -244,6 +248,14 @@ class MomentumTrader:
                     and now - self._entry_last_ts >= MOMENTUM_SL_MIN_AGE):
                 self._try_stop_loss(snap)
 
+            # Warning hedge: buy cheap opposite side when bid drops to danger zone (above SL)
+            pos = self._position
+            if (pos is not None and pos["phase"] == "holding"
+                    and not self._warn_attempted
+                    and now - self._warn_last_ts >= MOMENTUM_WARN_COOLDOWN
+                    and now - self._entry_last_ts >= MOMENTUM_SL_MIN_AGE):
+                self._try_warn_hedge(snap)
+
             # Insurance: buy cheap opposite side while holding (any secs_left)
             pos = self._position
             if (pos is not None and pos["phase"] == "holding"
@@ -289,6 +301,8 @@ class MomentumTrader:
         self._hedge_attempted     = False
         self._sl_last_ts          = 0.0
         self._sl_attempted        = False
+        self._warn_last_ts        = 0.0
+        self._warn_attempted      = False
         self._insurance_last_ts   = 0.0
         self._insurance_attempted = False
 
@@ -578,9 +592,8 @@ class MomentumTrader:
     def _try_stop_loss(self, snap):
         """
         Exit when entry-side bid drops to MOMENTUM_STOP_LOSS (60¢).
-        Sells the entry side IOC at current bid, then immediately buys the opposite
-        side at the implied ask (100 - bid = 40¢) to recover via reversal.
-        The sell is mandatory; the hedge buy is best-effort (one attempt, no retry).
+        Sells the entry side IOC at current bid. No chase hedge after exit —
+        the warning hedge at 75¢ already placed cheaper opposite-side coverage.
         """
         self._sl_last_ts = time.time()
         pos         = self._position
@@ -591,17 +604,13 @@ class MomentumTrader:
         if current_bid is None or current_bid > MOMENTUM_STOP_LOSS:
             return
 
-        n          = pos["count"]
-        sl_price   = current_bid
-        loss_est   = (sl_price - entry_price) * n / 100
-        hedge_side = "no"  if side == "yes" else "yes"
-        # Add slippage buffer so the IOC fills even if market moves between SL sell and hedge buy
-        hedge_ask  = min(99, 100 - current_bid + MOMENTUM_SL_HEDGE_SLIPPAGE)
+        n        = pos["count"]
+        sl_price = current_bid
+        loss_est = (sl_price - entry_price) * n / 100
 
         self._on_log("🔴", (
             f"STOP LOSS {self.asset} {side.upper()} bid hit {sl_price}¢  "
-            f"(entry={entry_price}¢  est. loss=~${abs(loss_est):.4f})  "
-            f"Exiting and buying {hedge_side.upper()} at {hedge_ask}¢."
+            f"(entry={entry_price}¢  est. loss=~${abs(loss_est):.4f})  Exiting."
         ))
 
         if DRY_RUN:
@@ -609,15 +618,13 @@ class MomentumTrader:
             POSITIONS.realise_pnl(loss_est)
             self._position["phase"]         = "stop_loss"
             self._position["sl_exit_price"] = sl_price
-            self._position["sl_hedge_price"] = hedge_ask
             self._on_log("📋", (
                 f"[DRY RUN] STOP LOSS {self.asset} sell {side.upper()} {sl_price}¢ × {n}  "
-                f"pnl=${loss_est:.4f}  hedge buy {hedge_side.upper()} {hedge_ask}¢ × {n}"
+                f"pnl=${loss_est:.4f}"
             ))
             self._notify()
             return
 
-        # Step 1: sell the entry side (stop loss exit)
         cid_sl    = _make_client_id(self.asset, f"mom-sl-{side}")
         body_sell = {
             "ticker":          snap.ticker,
@@ -650,8 +657,6 @@ class MomentumTrader:
                     f"(entry={entry_price}¢)  pnl=${pnl:.4f}"
                 ))
                 self._notify()
-                # Step 2: buy the opposite side to recover (best-effort)
-                self._buy_stop_loss_hedge(snap, hedge_side, hedge_ask, filled)
             else:
                 self._on_log("⏸", (
                     f"STOP LOSS {self.asset} sell {side.upper()} at {sl_price}¢ — no fill, retrying."
@@ -659,42 +664,79 @@ class MomentumTrader:
         except Exception as e:
             self._on_log("✗", f"STOP LOSS error {self.asset}: {e}")
 
-    def _buy_stop_loss_hedge(self, snap, hedge_side: str, hedge_ask: int, count: int):
-        """Buy the opposite side after a stop loss exit. Single attempt, no retry."""
-        cid  = _make_client_id(self.asset, f"mom-sl-hedge-{hedge_side}")
+    def _try_warn_hedge(self, snap):
+        """
+        While holding, buy MOMENTUM_WARN_COUNT opposite-side contracts when the
+        entry-side bid drops to MOMENTUM_WARN_THRESHOLD (default 75¢).
+        Cheaper coverage (~25¢/contract) than waiting for the 60¢ SL.
+        Position is NOT exited — this is insurance only, one purchase per trade.
+        """
+        self._warn_last_ts = time.time()
+        pos         = self._position
+        side        = pos["side"]
+        entry_price = pos["entry_price"]
+
+        current_bid = snap.yes_bid if side == "yes" else snap.no_bid
+        if current_bid is None or current_bid > MOMENTUM_WARN_THRESHOLD:
+            return
+
+        # Only fire if bid actually dropped from entry (not at entry with a wide spread)
+        if current_bid >= entry_price:
+            return
+
+        opp_side = "no" if side == "yes" else "yes"
+        opp_ask  = 100 - current_bid
+        n        = MOMENTUM_WARN_COUNT
+        cid      = _make_client_id(self.asset, f"mom-warn-{opp_side}")
+
+        self._on_log("⚠", (
+            f"WARNING HEDGE {self.asset} — {side.upper()} bid dropped to {current_bid}¢  "
+            f"(entry={entry_price}¢). Buying {n} {opp_side.upper()} at {opp_ask}¢ as warning hedge."
+        ))
+
+        if DRY_RUN:
+            self._warn_attempted = True
+            self._position["warn_hedge_price"] = opp_ask
+            self._position["warn_hedge_count"] = n
+            self._on_log("📋", f"[DRY RUN] WARNING HEDGE {self.asset} {opp_side.upper()} {opp_ask}¢ × {n}")
+            self._notify()
+            return
+
         body = {
             "ticker":          snap.ticker,
-            "side":            hedge_side,
+            "side":            opp_side,
             "action":          "buy",
-            "count":           count,
+            "count":           n,
             "time_in_force":   "immediate_or_cancel",
             "client_order_id": cid,
         }
-        body["yes_price" if hedge_side == "yes" else "no_price"] = hedge_ask
+        body["yes_price" if opp_side == "yes" else "no_price"] = opp_ask
 
         try:
             resp   = _post_order(body)
             order  = resp.get("order", {})
             filled = int(float(order.get("fill_count_fp", "0") or "0"))
             if filled > 0:
-                POSITIONS.record_fill(snap.ticker, hedge_side, hedge_ask, filled, cid)
-                self._position["sl_hedge_price"] = hedge_ask
+                self._warn_attempted = True
+                POSITIONS.record_fill(snap.ticker, opp_side, opp_ask, filled, cid)
+                self._position["warn_hedge_price"] = opp_ask
+                self._position["warn_hedge_count"] = filled
                 _log_trade({
-                    "ts": datetime.now(timezone.utc).isoformat(), "type": "momentum_sl_hedge",
+                    "ts": datetime.now(timezone.utc).isoformat(), "type": "momentum_warn_hedge",
                     "asset": self.asset, "ticker": snap.ticker,
-                    "hedge_side": hedge_side, "hedge_price": hedge_ask, "count": filled,
+                    "warn_side": opp_side, "warn_price": opp_ask, "count": filled,
                 })
-                self._on_log("🛡", (
-                    f"STOP LOSS HEDGE FILLED {self.asset} bought {hedge_side.upper()} "
-                    f"at {hedge_ask}¢ × {filled}"
+                self._on_log("✅", (
+                    f"WARNING HEDGE FILLED {self.asset} bought {opp_side.upper()} "
+                    f"at {opp_ask}¢ × {filled}"
                 ))
                 self._notify()
             else:
                 self._on_log("⏸", (
-                    f"STOP LOSS HEDGE {self.asset} {hedge_side.upper()} {hedge_ask}¢ — no fill"
+                    f"WARNING HEDGE {self.asset} {opp_side.upper()} {opp_ask}¢ — no fill"
                 ))
         except Exception as e:
-            self._on_log("✗", f"STOP LOSS HEDGE error {self.asset}: {e}")
+            self._on_log("✗", f"WARNING HEDGE error {self.asset}: {e}")
 
     def _try_insurance_hedge(self, snap):
         """
