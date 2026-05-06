@@ -457,17 +457,26 @@ class MomentumTrader:
             if filled > 0:
                 pnl = (sell_price - pos["entry_price"]) * filled / 100
                 POSITIONS.realise_pnl(pnl)
-                self._position["phase"] = "closed"
                 _log_trade({
                     "ts": datetime.now(timezone.utc).isoformat(), "type": "momentum_tp",
                     "asset": self.asset, "ticker": snap.ticker,
                     "side": side, "sell_price": sell_price,
                     "entry_price": pos["entry_price"], "count": filled, "pnl": pnl,
                 })
-                self._on_log("✅", (
-                    f"{self.asset} — took profit! Sold {side.upper()} at {sell_price}¢ × {filled} "
-                    f"(entry {pos['entry_price']}¢)  pnl=+${pnl:.4f}"
-                ))
+                remaining = pos["count"] - filled
+                if remaining <= 0:
+                    self._position["phase"] = "closed"
+                    self._on_log("✅", (
+                        f"{self.asset} — took profit! Sold {side.upper()} at {sell_price}¢ × {filled} "
+                        f"(entry {pos['entry_price']}¢)  pnl=+${pnl:.4f}"
+                    ))
+                else:
+                    self._position["count"] = remaining
+                    self._on_log("⚡", (
+                        f"{self.asset} — partial TP: sold {filled} of {pos['count'] + filled} "
+                        f"{side.upper()} at {sell_price}¢  pnl=+${pnl:.4f}  "
+                        f"{remaining} contracts remaining, retrying."
+                    ))
                 self._notify()
             else:
                 self._on_log("⏸", f"{self.asset} — TP order at {sell_price}¢ got no fill, will retry.")
