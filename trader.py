@@ -58,6 +58,7 @@ MOMENTUM_INSURANCE_THRESHOLD  = int(os.getenv("MOMENTUM_INSURANCE_THRESHOLD",   
 MOMENTUM_INSURANCE_COUNT      = int(os.getenv("MOMENTUM_INSURANCE_COUNT",        "3"))
 MOMENTUM_INSURANCE_COOLDOWN   = float(os.getenv("MOMENTUM_INSURANCE_COOLDOWN",  "3.0"))
 MOMENTUM_SL_HEDGE_SLIPPAGE    = int(os.getenv("MOMENTUM_SL_HEDGE_SLIPPAGE",      "5"))
+MOMENTUM_SL_MIN_AGE           = float(os.getenv("MOMENTUM_SL_MIN_AGE",           "10.0"))
 
 # ── Position book ─────────────────────────────────────────────────────────────
 class PositionBook:
@@ -239,7 +240,8 @@ class MomentumTrader:
             pos = self._position
             if (pos is not None and pos["phase"] == "holding"
                     and not self._sl_attempted
-                    and now - self._sl_last_ts >= MOMENTUM_STOP_LOSS_COOLDOWN):
+                    and now - self._sl_last_ts >= MOMENTUM_STOP_LOSS_COOLDOWN
+                    and now - self._entry_last_ts >= MOMENTUM_SL_MIN_AGE):
                 self._try_stop_loss(snap)
 
             # Insurance: buy cheap opposite side while holding (any secs_left)
