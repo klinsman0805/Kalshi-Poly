@@ -67,6 +67,7 @@ MOMENTUM_WARN_THRESHOLD       = int(os.getenv("MOMENTUM_WARN_THRESHOLD",        
 MOMENTUM_WARN_COUNT           = int(os.getenv("MOMENTUM_WARN_COUNT",             "5"))
 MOMENTUM_WARN_COOLDOWN        = float(os.getenv("MOMENTUM_WARN_COOLDOWN",        "3.0"))
 MOMENTUM_SL_MIN_AGE           = float(os.getenv("MOMENTUM_SL_MIN_AGE",           "10.0"))
+MOMENTUM_ENTRY_HEDGE_COUNT    = int(os.getenv("MOMENTUM_ENTRY_HEDGE_COUNT",       "3"))
 AI_ADVISOR_ENABLED            = os.getenv("AI_ADVISOR_ENABLED",  "false").lower() == "true"
 AI_ADVISOR_LOOKBACK           = int(os.getenv("AI_ADVISOR_LOOKBACK", "20"))
 AI_ADVISOR_MODEL              = os.getenv("AI_ADVISOR_MODEL", "claude-haiku-4-5-20251001")
@@ -464,6 +465,7 @@ Respond with JSON only, no extra text: {{"decision": "enter", "reason": "one sho
             }
             self._on_log("📋", f"[DRY RUN] MOMENTUM {self.asset} {side.upper()} {price}¢ × {n}")
             self._notify()
+            self._buy_entry_hedge(snap, side)
             return
 
         body = {
@@ -505,6 +507,7 @@ Respond with JSON only, no extra text: {{"decision": "enter", "reason": "one sho
                     f"Holding position. TP window opens in ~{secs_to_tp}s."
                 ))
                 self._notify()
+                self._buy_entry_hedge(snap, side)
             else:
                 retryable  = MOMENTUM_ENTRY_THRESHOLD <= price <= MOMENTUM_ENTRY_RETRY_MAX
                 if not retryable:
@@ -519,6 +522,61 @@ Respond with JSON only, no extra text: {{"decision": "enter", "reason": "one sho
                 ))
         except Exception as e:
             self._on_log("✗", f"MOMENTUM ENTRY error {self.asset}: {e}")
+
+    def _buy_entry_hedge(self, snap, entry_side: str):
+        """
+        Immediately after entry, buy MOMENTUM_ENTRY_HEDGE_COUNT contracts on the
+        opposite side at the implied ask. Covers fast reversals that hit before
+        any other protection layer can activate. Best-effort, no retry.
+        """
+        opp_side  = "no" if entry_side == "yes" else "yes"
+        entry_bid = snap.yes_bid if entry_side == "yes" else snap.no_bid
+        if entry_bid is None:
+            return
+        opp_ask = 100 - entry_bid
+        if opp_ask <= 0 or opp_ask >= 100:
+            return
+
+        n   = MOMENTUM_ENTRY_HEDGE_COUNT
+        cid = _make_client_id(self.asset, f"mom-eh-{opp_side}")
+
+        if DRY_RUN:
+            self._on_log("📋", (
+                f"[DRY RUN] ENTRY HEDGE {self.asset} {opp_side.upper()} {opp_ask}¢ × {n}"
+            ))
+            return
+
+        body = {
+            "ticker":          snap.ticker,
+            "side":            opp_side,
+            "action":          "buy",
+            "count":           n,
+            "time_in_force":   "immediate_or_cancel",
+            "client_order_id": cid,
+        }
+        body["yes_price" if opp_side == "yes" else "no_price"] = opp_ask
+
+        try:
+            resp   = _post_order(body)
+            order  = resp.get("order", {})
+            filled = int(float(order.get("fill_count_fp", "0") or "0"))
+            if filled > 0:
+                POSITIONS.record_fill(snap.ticker, opp_side, opp_ask, filled, cid)
+                _log_trade({
+                    "ts": datetime.now(timezone.utc).isoformat(), "type": "momentum_entry_hedge",
+                    "asset": self.asset, "ticker": snap.ticker,
+                    "hedge_side": opp_side, "hedge_price": opp_ask, "count": filled,
+                })
+                self._on_log("🛡", (
+                    f"ENTRY HEDGE {self.asset} bought {opp_side.upper()} "
+                    f"at {opp_ask}¢ × {filled}"
+                ))
+            else:
+                self._on_log("⏸", (
+                    f"ENTRY HEDGE {self.asset} {opp_side.upper()} {opp_ask}¢ — no fill"
+                ))
+        except Exception as e:
+            self._on_log("✗", f"ENTRY HEDGE error {self.asset}: {e}")
 
     def _try_take_profit(self, snap):
         self._tp_last_ts = time.time()
