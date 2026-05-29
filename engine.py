@@ -340,6 +340,10 @@ class MarketSnapshot:
         self.yes_ask   = book.best_yes_ask()
         self.no_ask    = book.best_no_ask()
         self.mid       = book.mid_cents()
+        # Depth at the top of the implied ask: yes_ask is implied by best no_bid,
+        # so depth at yes_ask = size sitting at best no_bid (and vice versa).
+        self.yes_ask_depth = book.no_bids.get(self.no_bid) if self.no_bid is not None else None
+        self.no_ask_depth  = book.yes_bids.get(self.yes_bid) if self.yes_bid is not None else None
 
     def to_dict(self) -> dict:
         return {
