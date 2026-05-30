@@ -312,6 +312,9 @@ def api_arb():
             "kalshi_slippage":arb_trader.ARB_KALSHI_SLIPPAGE,
             "poly_price_floor": round(arb_trader.ARB_POLY_MIN_ORDER_USD
                                       / max(arb_trader.ARB_TRADE_SIZE, 1) * 100),
+            "strike_buffer_pct": arb_trader.ARB_STRIKE_BUFFER_PCT,
+            "exit_buffer_pct":   arb_trader.ARB_EXIT_BUFFER_PCT,
+            "assets":            arb_trader.ARB_ASSETS,
         },
     })
 
@@ -453,6 +456,12 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'IBM Pl
 .spread-lbl{color:var(--muted);font-size:8px;letter-spacing:.06em}
 .spread-val{font-size:14px;font-weight:600;margin-top:1px}
 .spread.hot{border-color:rgba(0,212,170,.5);background:rgba(0,212,170,.07)}
+/* strike-distance / basis-risk readout */
+.strike-row{font-size:9px;padding:3px 6px;border-radius:3px;margin-top:1px}
+.strike-row.safe{color:var(--ok);background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.25)}
+.strike-row.danger{color:var(--down);background:rgba(255,107,107,.06);border:1px solid rgba(255,107,107,.3)}
+.strike-row.dim{color:var(--muted)}
+.strike-row b{font-weight:600}
 .spread.hot .spread-val{color:var(--accent)}
 .spread .spread-val{color:var(--text)}
 
@@ -852,7 +861,20 @@ function renderAcard(asset) {
       <div class="spread ${hotB?'hot':''}"><div class="spread-lbl">K-NO + P-YES</div>
         <div class="spread-val">${sB!=null?sB+'¢':'—'}</div></div>
     </div>
+    ${strikeRow(L)}
   </div>`;
+}
+
+// Strike-distance / basis-risk readout. Green when safely away from strike,
+// red when inside the danger zone (gate would skip).
+function strikeRow(L) {
+  if (L.dist_pct == null) return '<div class="strike-row dim">strike: waiting…</div>';
+  const buf = (S.arbCfg && S.arbCfg.strike_buffer_pct) || 0.15;
+  const safe = L.dist_pct >= buf;
+  return `<div class="strike-row ${safe?'safe':'danger'}">`
+    + `spot ${L.spot} · strike ${L.strike} · `
+    + `<b>${L.dist_pct}%</b> from strike `
+    + `(${safe?'OK ✓':'DANGER ✗ — gated'}, need ≥${buf}%)</div>`;
 }
 
 // ── Arb decisions (per-window skip-reason breakdown) ─────────────────────────
@@ -865,11 +887,12 @@ const DEC_ORDER = [
   ['kalshi_partial_naked','Partial hedge',      'excess unwound',             'bad'],
 ];
 const SKIP_ORDER = [
-  ['unwind_risk',       'Unwind risk',     'unwind cost &gt; 3× profit'],
-  ['thin_kalshi_depth', 'Thin Kalshi',     'not enough depth'],
-  ['thin_poly_depth',   'Thin Poly',       'not enough depth'],
-  ['below_poly_min',    'Below Poly min',  'leg &lt; $1 order'],
-  ['below_min_profit',  'Below min profit','net &lt; 1¢ after fees'],
+  ['skip_near_strike',     'Near strike',     'basis-risk danger zone'],
+  ['skip_unwind_risk',     'Unwind risk',     'unwind cost &gt; 3× profit'],
+  ['skip_thin_kalshi_depth','Thin Kalshi',    'not enough depth'],
+  ['skip_thin_poly_depth', 'Thin Poly',       'not enough depth'],
+  ['skip_below_poly_min',  'Below Poly min',  'leg &lt; $1 order'],
+  ['skip_below_min_profit','Below min profit','net &lt; 1¢ after fees'],
 ];
 
 function renderArbDecisions() {

@@ -245,6 +245,9 @@ def discover_market(asset: str, on_log: Callable) -> Optional[dict]:
             "no_ask":     (100 - yes_bid) if yes_bid is not None else None,
             "tick_size":  best.get("tick_size", 1),
             "window_ts":  int(best_ct.timestamp()) - WINDOW_SECS,
+            # Kalshi's "to-beat" strike (the prior-window close). Used by the arb
+            # strike-distance gate to avoid the venue-disagreement danger zone.
+            "floor_strike": best.get("floor_strike"),
         }
         on_log("✓", f"{asset} → {ticker}  ({secs_left}s left)  YES_bid={yes_bid}c  NO_bid={no_bid}c")
         return result
@@ -341,11 +344,12 @@ def _cents(val) -> Optional[int]:
 # ── Market snapshot ───────────────────────────────────────────────────────────
 class MarketSnapshot:
     def __init__(self, asset: str, ticker: str, book: LocalBook,
-                 window_ts: int, secs_left: int):
+                 window_ts: int, secs_left: int, floor_strike=None):
         self.asset     = asset
         self.ticker    = ticker
         self.window_ts = window_ts
         self.secs_left = secs_left
+        self.floor_strike = floor_strike   # Kalshi "to-beat" strike (for arb gate)
         self.ts        = datetime.now(timezone.utc)
         self.yes_bid   = book.best_yes_bid()
         self.no_bid    = book.best_no_bid()
@@ -553,7 +557,8 @@ class BotEngine:
                 (datetime.fromisoformat(mkt["close_time"].replace("Z", "+00:00"))
                  - datetime.now(timezone.utc)).total_seconds()
             ))
-            snap = MarketSnapshot(asset, mkt["ticker"], book, mkt["window_ts"], secs_left)
+            snap = MarketSnapshot(asset, mkt["ticker"], book, mkt["window_ts"], secs_left,
+                                  floor_strike=mkt.get("floor_strike"))
             self._snapshots[asset] = snap
             prev    = self._last_pushed.get(asset)
             changed = prev is None or prev[0] != snap.yes_ask or prev[1] != snap.no_ask

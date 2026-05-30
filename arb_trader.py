@@ -114,6 +114,25 @@ ARB_UNWIND_RATIO_MAX = float(os.getenv("ARB_UNWIND_RATIO_MAX", "3.0"))
 # Periodic stats summary: seconds between per-window stats dumps.
 ARB_STATS_INTERVAL   = float(os.getenv("ARB_STATS_INTERVAL",   "60"))
 
+# ── Basis-risk controls (added 2026-05-30 after −$3.63 BTC venue-disagreement) ──
+# Kalshi and Polymarket use DIFFERENT price feeds (Poly=Chainlink) and strikes,
+# so they can resolve oppositely when the price settles near the strike. A
+# 200-window study showed disagreements live within ~0.05% of strike; requiring
+# the price to be farther than that pushed agreement to ~100%.
+#
+# Only trade these assets (BTC excluded for now — costliest miss, widest dead-zone).
+ARB_ASSETS = [a.strip().upper() for a in
+              os.getenv("ARB_ASSETS", "ETH,SOL").split(",") if a.strip()]
+# Entry gate: skip if |spot − Kalshi strike| < this % of spot. Set ABOVE the
+# historical 0.05% because we gate on the ENTRY price, not the final — the price
+# can still drift toward the strike before resolution, so we need headroom.
+ARB_STRIKE_BUFFER_PCT = float(os.getenv("ARB_STRIKE_BUFFER_PCT", "0.15"))
+# Early-exit: in the last N seconds, if price has drifted to within this % of the
+# strike (the danger zone), sell BOTH legs rather than hold into a risky
+# resolution. 0 disables early-exit (hold to resolution).
+ARB_EXIT_BUFFER_PCT   = float(os.getenv("ARB_EXIT_BUFFER_PCT", "0.05"))
+ARB_EXIT_WINDOW_SECS  = float(os.getenv("ARB_EXIT_WINDOW_SECS", "90"))
+
 TRADES_FILE = Path(os.getenv("TRADES_FILE", "trades.jsonl"))
 
 # ── Fee helpers ───────────────────────────────────────────────────────────────
@@ -150,6 +169,36 @@ def _net_profit(k_price: int, p_price: int, poly_fee_bps: int,
     k_fee_per_pair = _kalshi_fee_total(k_price, size) / size
     p_fee_per_pair = _poly_fee_per_contract(p_price, poly_fee_bps)
     return gross_per_pair - k_fee_per_pair - p_fee_per_pair
+
+# ── Spot price (for the strike-distance / basis-risk gate) ──────────────────────
+_SPOT_SYMBOL = {"BTC": "BTC-USD", "ETH": "ETH-USD", "SOL": "SOL-USD"}
+_spot_cache: Dict[str, tuple] = {}   # asset -> (price, ts)
+_SPOT_TTL = 2.0
+
+def get_spot(asset: str) -> Optional[float]:
+    """
+    Current spot price for the strike-distance gate. Cached ~2s. Uses Coinbase
+    spot (fast, no key). Returns None on failure so the gate fails CLOSED (skip).
+    Note: this is a proxy for the venues' own feeds; the gate keeps a wide buffer
+    to absorb the small difference between spot and Kalshi/Chainlink references.
+    """
+    import requests
+    now = time.time()
+    cached = _spot_cache.get(asset)
+    if cached and now - cached[1] < _SPOT_TTL:
+        return cached[0]
+    sym = _SPOT_SYMBOL.get(asset.upper())
+    if not sym:
+        return None
+    try:
+        r = requests.get(f"https://api.coinbase.com/v2/prices/{sym}/spot", timeout=3)
+        r.raise_for_status()
+        px = float(r.json()["data"]["amount"])
+        _spot_cache[asset] = (px, now)
+        return px
+    except Exception as e:
+        log.debug("spot fetch %s: %s", asset, e)
+        return None
 
 # ── Trade log ─────────────────────────────────────────────────────────────────
 
@@ -319,6 +368,7 @@ class ArbTrader:
             "spread_b": None,  # k_no  + p_yes
             "poly_linked": False, "fee_bps": None, "ws_confirmed": False,
             "secs_left": None, "updated_ts": None,
+            "strike": None, "spot": None, "dist_pct": None,
         }
 
     def get_state(self) -> dict:
@@ -484,6 +534,18 @@ class ArbTrader:
         if TRADING_HALTED:
             return
 
+        # Asset filter: only trade configured assets (BTC excluded by default —
+        # widest venue-disagreement dead-zone; see ARB_ASSETS / basis-risk study).
+        if self.asset.upper() not in ARB_ASSETS:
+            return
+
+        # If we already hold a position, the only thing to do is check whether to
+        # EARLY-EXIT it (price drifting into the danger zone near expiry). This
+        # runs before the position short-circuit below.
+        if self._position is not None:
+            self._maybe_early_exit(kalshi_snap)
+            return
+
         with self._lock:
             if self._attempted or self._position is not None:
                 return
@@ -591,6 +653,32 @@ class ArbTrader:
                 f"P YES:{p_yes}¢ NO:{p_no}¢  [{ws_ok}]  "
                 f"spreads: {s1}¢ / {s2}¢  (threshold {ARB_THRESHOLD}¢)"
             ))
+
+        # ── Basis-risk gate: skip if price is near the strike (danger zone) ──
+        # Kalshi & Polymarket use different price feeds, so when the price settles
+        # near the strike they can resolve oppositely → both legs lose. Require
+        # the spot price to be > ARB_STRIKE_BUFFER_PCT away from the Kalshi strike.
+        strike = getattr(kalshi_snap, "floor_strike", None)
+        spot   = get_spot(self.asset)
+        if strike is None or spot is None:
+            # Fail closed: without strike+spot we can't assess basis risk.
+            self._log_skip_throttled("no_strike_or_spot", "🛡", (
+                f"ARB {self.asset}: missing strike({strike}) or spot({spot}) "
+                f"— can't assess basis risk, skipping"
+            ))
+            return
+        dist_pct = abs(spot - float(strike)) / spot * 100.0
+        with self._lock:
+            self._live.update({"strike": float(strike), "spot": spot,
+                               "dist_pct": round(dist_pct, 4)})
+        if dist_pct < ARB_STRIKE_BUFFER_PCT:
+            self._log_skip_throttled("near_strike", "🛡", (
+                f"ARB {self.asset}: price {spot:.4f} only {dist_pct:.3f}% from "
+                f"strike {strike} (< {ARB_STRIKE_BUFFER_PCT}% buffer) — basis-risk "
+                f"danger zone, skipping"
+            ))
+            self._stats["skip_near_strike"] += 1
+            return
 
         # ── Step 3: check both arb legs ──────────────────────────────────────
         # candidate = (kalshi_side, k_price, k_depth, poly_side, p_price, p_depth,
@@ -714,6 +802,83 @@ class ArbTrader:
 
         # End of candidate loop: emit periodic stats summary.
         self._maybe_log_stats()
+
+    # ── Early exit (basis-risk avoidance) ──────────────────────────────────────
+
+    def _maybe_early_exit(self, kalshi_snap: MarketSnapshot):
+        """
+        Called each tick while a position is OPEN. If we're in the last
+        ARB_EXIT_WINDOW_SECS and the price has drifted within ARB_EXIT_BUFFER_PCT
+        of the strike (the venue-disagreement danger zone), SELL BOTH LEGS now
+        rather than hold into a resolution where Kalshi and Polymarket might
+        settle oppositely (which can turn the locked arb into a double loss).
+
+        Disabled when ARB_EXIT_BUFFER_PCT == 0 (hold to resolution).
+        """
+        if ARB_EXIT_BUFFER_PCT <= 0:
+            return
+        pos = self._position
+        if pos is None or pos.phase != "open":
+            return
+        if kalshi_snap.secs_left > ARB_EXIT_WINDOW_SECS:
+            return
+        strike = getattr(kalshi_snap, "floor_strike", None)
+        spot   = get_spot(self.asset)
+        if strike is None or spot is None:
+            return
+        dist_pct = abs(spot - float(strike)) / spot * 100.0
+        if dist_pct >= ARB_EXIT_BUFFER_PCT:
+            return  # safely away from the strike — hold to resolution as normal
+
+        # In the danger zone near expiry → flatten both legs immediately.
+        with self._lock:
+            if pos.phase != "open":
+                return
+            pos.phase = "exiting"
+        self._on_log("🚪", (
+            f"ARB {self.asset} EARLY EXIT: {kalshi_snap.secs_left}s left, price "
+            f"{spot:.4f} only {dist_pct:.3f}% from strike {strike} — flattening "
+            f"both legs to avoid venue-disagreement risk."
+        ))
+        k_side = pos.kalshi_side
+        p_token = pos.poly_token_id
+        p_side  = pos.poly_side
+        n_k = pos.k_filled
+        n_p = pos.p_filled
+        fee_bps = 1000  # gamma default; sells are price-insensitive (FAK @ market)
+        k_sold = {"v": 0.0}
+        p_sold = {"v": 0.0}
+
+        def do_k():
+            k_sold["v"] = _kalshi_ioc_sell(kalshi_snap, k_side, n_k)
+        def do_p():
+            p_sold["v"] = self._poly.place_sell_fok(p_token, n_p, fee_bps)
+
+        threads = [threading.Thread(target=do_k, daemon=True),
+                   threading.Thread(target=do_p, daemon=True)]
+        for t in threads: t.start()
+        for t in threads: t.join(timeout=8.0)
+
+        ok = (k_sold["v"] >= n_k - ARB_DUST_SHARES) and (p_sold["v"] >= int(n_p) - ARB_DUST_SHARES)
+        with self._lock:
+            pos.phase = "closed" if ok else "exit_partial"
+        _log_trade({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "type": "arb_early_exit",
+            "asset": self.asset,
+            "secs_left": kalshi_snap.secs_left,
+            "spot": spot, "strike": strike, "dist_pct": round(dist_pct, 4),
+            "k_side": k_side, "k_filled": n_k, "k_sold": k_sold["v"],
+            "p_side": p_side, "p_filled": n_p, "p_sold": p_sold["v"],
+            "fully_exited": ok,
+        })
+        self._on_log("🚪" if ok else "⚠", (
+            f"ARB {self.asset} early-exit {'done' if ok else 'PARTIAL'}: "
+            f"K sold {k_sold['v']}/{n_k}, P sold {p_sold['v']}/{n_p}"
+        ))
+        if not ok:
+            halt_trading(f"{self.asset} early-exit incomplete — possible residual "
+                         f"position, inspect before restart.")
 
     # ── Unwind ───────────────────────────────────────────────────────────────
 
