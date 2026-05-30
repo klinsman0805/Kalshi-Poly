@@ -4,3 +4,4 @@ cryptography>=42.0.0
 python-dotenv>=1.0.0
 websocket-client>=1.7.0
 eth-account>=0.10.0
+py-clob-client-v2>=1.0.1

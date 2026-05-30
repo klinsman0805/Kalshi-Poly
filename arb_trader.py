@@ -71,10 +71,43 @@ ARB_TOLERANCE    = int(os.getenv("ARB_TOLERANCE",         "2"))
 ARB_TRADE_SIZE   = int(os.getenv("ARB_TRADE_SIZE",         "5"))
 ARB_MIN_PROFIT   = int(os.getenv("ARB_MIN_PROFIT_CENTS",   "1"))
 ARB_ORDER_COOLDOWN = float(os.getenv("ARB_ORDER_COOLDOWN", "30"))
+# Polymarket rejects orders worth < this dollar amount (min order value). Kalshi
+# has no such floor. Arb needs equal share counts on both legs, so we can't pad
+# the Poly leg alone — instead skip when ARB_TRADE_SIZE × poly_price < this.
+ARB_POLY_MIN_ORDER_USD = float(os.getenv("ARB_POLY_MIN_ORDER_USD", "1.0"))
+# Kalshi IOC slippage buffer (cents): the Poly leg fills first (~300-800ms), so
+# by the time the Kalshi IOC fires the ask may have ticked up. Bid this many
+# cents above the detected ask so the IOC still crosses. Bounded — too high and
+# the arb edge is lost (re-validated against combined cost before firing).
+ARB_KALSHI_SLIPPAGE = int(os.getenv("ARB_KALSHI_SLIPPAGE", "2"))
+# Poly limit-BUYs over-fill (the dollar budget buys extra shares at better
+# prices), so the Poly leg fills a fractional count like 5.55 while Kalshi only
+# trades whole contracts. We hedge floor(poly_fill) on Kalshi and accept the
+# sub-share remainder as "dust" — too small to be worth unwinding or halting on.
+ARB_DUST_SHARES = float(os.getenv("ARB_DUST_SHARES", "1.0"))
+
+# ── Global kill-switch ─────────────────────────────────────────────────────────
+# Set True after any failed/partial unwind. While set, NO new arb fires on ANY
+# asset — one unwind bug must not be able to bleed repeatedly. Cleared only by
+# restarting the process (deliberate: a human should inspect the naked position).
+TRADING_HALTED = False
+HALT_REASON    = ""
+
+def halt_trading(reason: str):
+    """Trip the global kill-switch. Idempotent."""
+    global TRADING_HALTED, HALT_REASON
+    if not TRADING_HALTED:
+        TRADING_HALTED = True
+        HALT_REASON    = reason
+        log.critical("ARB TRADING HALTED: %s", reason)
 
 # Phase-2 safety knobs (all in seconds / cents / multiples)
 ARB_K_SNAP_MAX_AGE   = float(os.getenv("ARB_K_SNAP_MAX_AGE",   "1.5"))
 ARB_P_SNAP_MAX_AGE   = float(os.getenv("ARB_P_SNAP_MAX_AGE",   "1.5"))
+# Max age for a REST-only (not WS-confirmed) Poly snapshot. Must exceed the
+# POLY_RESEED_INTERVAL plus network/processing margin so re-seeded markets stay
+# eligible; kept tight enough that genuinely stale prices are still rejected.
+ARB_REST_MAX_AGE     = float(os.getenv("ARB_REST_MAX_AGE",     "4.0"))
 ARB_KALSHI_IOC_TIMEOUT = float(os.getenv("ARB_KALSHI_IOC_TIMEOUT", "3.0"))
 # Unwind cost ceiling: if expected_loss_on_unwind > N × expected_profit, abort.
 ARB_UNWIND_RATIO_MAX = float(os.getenv("ARB_UNWIND_RATIO_MAX", "3.0"))
@@ -269,11 +302,88 @@ class ArbTrader:
         self._market_info: Optional[PolyMarketInfo] = None
         self._lock = threading.Lock()
         self._last_price_log_ts: float = 0.0   # rate-limit combined price log
+        # Throttle repetitive per-tick skip logs (keyed by reason). Every skip is
+        # still recorded to trades.jsonl + stats; only the on-screen line is muted.
+        self._skip_log_ts: Dict[str, float] = {}
+        self._skip_log_interval: float = 30.0
 
         # Phase-3 observability: per-window decision counters + last stats emit.
         self._stats: Counter = Counter()
         self._last_stats_log_ts: float = 0.0
         self._window_start_ts: float = time.time()
+
+        # Latest observed prices for the dashboard (updated each evaluable tick).
+        self._live: dict = {
+            "k_yes": None, "k_no": None, "p_yes": None, "p_no": None,
+            "spread_a": None,  # k_yes + p_no
+            "spread_b": None,  # k_no  + p_yes
+            "poly_linked": False, "fee_bps": None, "ws_confirmed": False,
+            "secs_left": None, "updated_ts": None,
+        }
+
+    def get_state(self) -> dict:
+        """
+        Dashboard snapshot of this asset's arb state. Safe to call from any
+        thread. Returns live prices, per-window stat counters, and any open
+        position — everything the UI needs for arb observability.
+        """
+        with self._lock:
+            pos = self._position.__dict__.copy() if self._position else None
+            stats = dict(self._stats)
+            live = dict(self._live)
+        return {
+            "asset":     self.asset,
+            "live":      live,
+            "stats":     stats,
+            "position":  pos,
+            "attempted": self._attempted,
+            "window_age_s": int(time.time() - self._window_start_ts),
+        }
+
+    def _log_skip_throttled(self, key: str, icon: str, msg: str):
+        """Emit a skip log line at most once per _skip_log_interval seconds per key."""
+        now = time.time()
+        if now - self._skip_log_ts.get(key, 0.0) >= self._skip_log_interval:
+            self._skip_log_ts[key] = now
+            self._on_log(icon, msg)
+
+    def _drift_probe(self, kalshi_snap: MarketSnapshot, k_side: str, p_side: str,
+                     k_price_at_detect: int, p_price_at_detect: int,
+                     detection_ts: float) -> dict:
+        """
+        Observability only — no trading effect. At fire time, re-read the freshest
+        prices for both venues and measure how far they drifted from the values
+        captured at detection. Lets us tell "the +2¢ pad killed it" (drift≈0) apart
+        from "the book moved under us in flight" (drift>0 / book gone).
+
+        Returns a flat dict folded into the fire/miss/abort log records.
+        """
+        probe = {
+            "detect_to_fire_ms": int((time.time() - detection_ts) * 1000),
+            "k_price_at_detect": k_price_at_detect,
+            "p_price_at_detect": p_price_at_detect,
+        }
+        # Fresh Kalshi ask from the snapshot held by the engine (already updated
+        # in-place each tick). Same side we intended to take.
+        k_now = kalshi_snap.yes_ask if k_side == "yes" else kalshi_snap.no_ask
+        probe["k_price_now"]  = k_now
+        probe["k_drift"]      = (None if k_now is None else k_now - k_price_at_detect)
+        k_now_age = (datetime.now(timezone.utc) - kalshi_snap.ts).total_seconds()
+        probe["k_snap_age_ms_now"] = int(k_now_age * 1000)
+
+        # Fresh Polymarket ask for the side we intended to take.
+        p_now = None
+        p_age_now = None
+        info = self._market_info
+        if info is not None:
+            ps = self._poly.snap(info.condition_id)
+            if ps is not None:
+                p_now = ps.yes_ask if p_side == "yes" else ps.no_ask
+                p_age_now = time.time() - ps.ts
+        probe["p_price_now"]  = p_now
+        probe["p_drift"]      = (None if p_now is None else p_now - p_price_at_detect)
+        probe["p_snap_age_ms_now"] = (None if p_age_now is None else int(p_age_now * 1000))
+        return probe
 
     # ── Observability helpers ────────────────────────────────────────────────
 
@@ -346,6 +456,11 @@ class ArbTrader:
             self._stats.clear()
             self._last_stats_log_ts = 0.0
             self._window_start_ts = time.time()
+            self._live.update({
+                "k_yes": None, "k_no": None, "p_yes": None, "p_no": None,
+                "spread_a": None, "spread_b": None, "poly_linked": False,
+                "secs_left": None, "updated_ts": None,
+            })
 
     @property
     def position(self) -> Optional[ArbPosition]:
@@ -364,6 +479,11 @@ class ArbTrader:
         2. Checks both arb combinations against latest Poly prices.
         3. Executes if spread is profitable.
         """
+        # Global kill-switch: a prior unwind left a naked position. Do not place
+        # any new orders on any asset until the process is restarted by a human.
+        if TRADING_HALTED:
+            return
+
         with self._lock:
             if self._attempted or self._position is not None:
                 return
@@ -387,6 +507,25 @@ class ArbTrader:
                 f"cond={info.condition_id[:12]}...  fee={info.fee_bps}bps"
             ))
 
+        # ── Observability: record what we know NOW, before any early-return ──
+        # The card should reflect the Kalshi side + link status even when the
+        # Poly snapshot is missing/stale (e.g. mid-WS-reconnect) — otherwise the
+        # card goes blank and looks "not linked" when it actually is.
+        with self._lock:
+            self._live.update({
+                "poly_linked": True,
+                "fee_bps":     info.fee_bps,
+                "k_yes":       kalshi_snap.yes_ask,
+                "k_no":        kalshi_snap.no_ask,
+                "secs_left":   kalshi_snap.secs_left,
+                "updated_ts":  time.time(),
+            })
+            # Recompute spreads if both sides known, else clear (avoid stale).
+            ky, kn = kalshi_snap.yes_ask, kalshi_snap.no_ask
+            py, pn = self._live.get("p_yes"), self._live.get("p_no")
+            self._live["spread_a"] = (ky + pn) if (ky is not None and pn is not None) else None
+            self._live["spread_b"] = (kn + py) if (kn is not None and py is not None) else None
+
         # ── Step 2: get prices ───────────────────────────────────────────────
         poly_snap = self._poly.snap(info.condition_id)
         if poly_snap is None:
@@ -401,8 +540,10 @@ class ArbTrader:
         p_age = time.time() - poly_snap.ts
         ws_confirmed = getattr(poly_snap, "_ws_confirmed", False)
         if not ws_confirmed:
-            # REST-only seed: give WS 2s to catch up, fail if older than 5s.
-            if p_age < 2.0 or p_age > 5.0:
+            # REST-only feed (WS silent for this market): the periodic re-seed
+            # keeps it fresh, so just require recency. Allow up to the re-seed
+            # interval + network/processing margin; reject if staler.
+            if p_age > ARB_REST_MAX_AGE:
                 return
         else:
             if p_age > ARB_P_SNAP_MAX_AGE:
@@ -413,8 +554,29 @@ class ArbTrader:
         p_yes = poly_snap.yes_ask
         p_no  = poly_snap.no_ask
 
+        # Observability: record Poly prices as soon as we have the snapshot, even
+        # if a price is missing — so the card shows the Poly side independently.
+        with self._lock:
+            self._live.update({
+                "p_yes": p_yes, "p_no": p_no,
+                "ws_confirmed": bool(getattr(poly_snap, "_ws_confirmed", False)),
+                "updated_ts": time.time(),
+            })
+
         if None in (k_yes, k_no, p_yes, p_no):
             return
+
+        # Record live prices for the dashboard (both sides confirmed non-None).
+        with self._lock:
+            self._live.update({
+                "k_yes": k_yes, "k_no": k_no, "p_yes": p_yes, "p_no": p_no,
+                "spread_a": k_yes + p_no, "spread_b": k_no + p_yes,
+                "poly_linked": True,
+                "fee_bps": info.fee_bps,
+                "ws_confirmed": bool(getattr(poly_snap, "_ws_confirmed", False)),
+                "secs_left": kalshi_snap.secs_left,
+                "updated_ts": time.time(),
+            })
 
         # ── Periodic visibility log (both sides confirmed live) ──────────────
         now = time.time()
@@ -467,18 +629,31 @@ class ArbTrader:
 
             # Depth gate.
             if k_depth is None or k_depth < ARB_TRADE_SIZE:
-                self._on_log("📉", (
+                self._log_skip_throttled("thin_kalshi_depth", "📉", (
                     f"ARB {self.asset} {k_side.upper()}: insufficient Kalshi depth "
                     f"({k_depth}) < {ARB_TRADE_SIZE} at top of ask — skipping"
                 ))
                 self._log_attempt(ctx, decision="skip", reason="thin_kalshi_depth")
                 continue
             if p_depth is None or p_depth < ARB_TRADE_SIZE:
-                self._on_log("📉", (
+                self._log_skip_throttled("thin_poly_depth", "📉", (
                     f"ARB {self.asset} {p_side.upper()}: insufficient Poly depth "
                     f"({p_depth}) < {ARB_TRADE_SIZE} at top of ask — skipping"
                 ))
                 self._log_attempt(ctx, decision="skip", reason="thin_poly_depth")
+                continue
+
+            # Polymarket min order value: ARB_TRADE_SIZE × poly_price must clear
+            # $1. Arb requires equal share counts on both legs, so a cheap Poly
+            # leg can't be padded alone — skip instead. (Kalshi has no min.)
+            poly_order_usd = ARB_TRADE_SIZE * p_price / 100.0
+            if poly_order_usd < ARB_POLY_MIN_ORDER_USD:
+                self._log_skip_throttled("below_poly_min", "💵", (
+                    f"ARB {self.asset} {p_side.upper()}: Poly order "
+                    f"{ARB_TRADE_SIZE}×{p_price}¢ = ${poly_order_usd:.2f} "
+                    f"< ${ARB_POLY_MIN_ORDER_USD:.2f} min — skipping"
+                ))
+                self._log_attempt(ctx, decision="skip", reason="below_poly_min")
                 continue
 
             profit = _net_profit(k_price, p_price, info.fee_bps, ARB_TRADE_SIZE)
@@ -498,7 +673,7 @@ class ArbTrader:
             ctx["expected_total_cents"] = round(expected_total, 4)
 
             if expected_total <= 0 or unwind_total > ARB_UNWIND_RATIO_MAX * expected_total:
-                self._on_log("🛡", (
+                self._log_skip_throttled("unwind_risk", "🛡", (
                     f"ARB {self.asset} {k_side.upper()}: unwind risk too high "
                     f"(unwind={unwind_total:.2f}¢, profit={expected_total:.2f}¢, "
                     f"ratio>{ARB_UNWIND_RATIO_MAX}× implied_bid={implied_bid}¢) — skipping"
@@ -507,7 +682,7 @@ class ArbTrader:
                 continue
 
             if profit < ARB_MIN_PROFIT:
-                self._on_log("💡", (
+                self._log_skip_throttled("below_min_profit", "💡", (
                     f"ARB {self.asset}: K-{k_side.upper()}@{k_price}¢ + P-{p_side.upper()}@{p_price}¢ "
                     f"= {combined}¢, net={profit:.2f}¢ < min={ARB_MIN_PROFIT}¢ after fees"
                 ))
@@ -587,12 +762,26 @@ class ArbTrader:
         if p_filled > 0:
             parts.append(f"P-{p_side.upper()} sold={p_sold}/{p_filled}")
 
-        ok = (k_filled == 0 or k_sold == k_filled) and (p_filled == 0 or p_sold == p_filled)
+        # "ok" = remaining unsold exposure on each leg is within dust tolerance.
+        # FAK sells whole shares only, so a fractional remainder ≤ ARB_DUST_SHARES
+        # is expected and acceptable — it must NOT trip the kill-switch.
+        k_remaining = k_filled - k_sold
+        p_remaining = p_filled - p_sold
+        ok = (k_remaining <= ARB_DUST_SHARES) and (p_remaining <= ARB_DUST_SHARES)
         self._on_log(
             "🔄" if ok else "⚠",
             f"ARB {self.asset} UNWIND: {' | '.join(parts)} "
-            f"(unwind_ms={unwind_ms}, naked_ms={naked_ms})"
+            f"(unwind_ms={unwind_ms}, naked_ms={naked_ms}, "
+            f"remaining K={k_remaining:.2f} P={p_remaining:.2f})"
         )
+        if not ok:
+            # A leg could not be fully unwound → real naked exposure remains.
+            # Trip the kill-switch so no further arb fires until a human checks.
+            reason = (f"{self.asset} unwind incomplete — "
+                      f"K sold {k_sold}/{k_filled}, P sold {p_sold}/{p_filled}. "
+                      f"NAKED POSITION LIKELY OPEN — inspect before restart.")
+            halt_trading(reason)
+            self._on_log("🛑", f"TRADING HALTED: {reason}")
 
         # Estimated realized loss in cents: bought poly at poly_buy_price,
         # sold at implied bid (best-effort estimate; actual proceeds will
@@ -642,6 +831,11 @@ class ArbTrader:
         """
         n = ARB_TRADE_SIZE
 
+        # Observability: measure price drift between detection and fire time.
+        # Pure logging — does not affect the EV recheck or order placement.
+        drift = self._drift_probe(kalshi_snap, k_side, p_side,
+                                  k_price, p_price, detection_ts)
+
         # Re-check EV at the prices we're actually about to send. Detection used
         # k_price + p_price; we're firing Poly up to ARB_TOLERANCE¢ worse. If
         # that drift kills the edge, abort before touching either venue.
@@ -664,6 +858,7 @@ class ArbTrader:
                 "detection_net":            round(expected_profit, 4),
                 "execution_net":            round(exec_profit, 4),
                 "fee_bps":     fee_bps, "fee_source": fee_source,
+                **drift,
             })
             with self._lock:
                 self._attempted = False
@@ -696,6 +891,7 @@ class ArbTrader:
                 "poly_latency_ms":  poly_ms,
                 "poly_error":  p_err,
                 "fee_bps":     fee_bps, "fee_source": fee_source,
+                **drift,
             })
             with self._lock:
                 self._attempted = False
@@ -704,15 +900,41 @@ class ArbTrader:
         poly_fill_ts = time.time()
 
         # ── Step 2: Kalshi IOC (only reached if Poly filled) ─────────────────
+        # Hedge the WHOLE-SHARE portion of the actual Poly fill. Poly can over-
+        # fill (e.g. 5.55 shares from a 5-share request) because the dollar
+        # budget buys extra at better prices; Kalshi trades whole contracts only.
+        # Buying floor(p_filled) matches as much as possible; the sub-share
+        # remainder is accepted as dust (see _unwind / kill-switch logic below).
+        k_target = int(p_filled)  # floor → whole contracts to hedge
+        if k_target < 1:
+            # Poly filled less than one whole share — nothing hedgeable on Kalshi.
+            # Treat the tiny fractional Poly position as dust; unwind it.
+            self._on_log("⚠", (
+                f"ARB {self.asset} Poly filled {p_filled} (<1 share) — "
+                f"sub-share dust, unwinding Poly leg."
+            ))
+            threading.Thread(
+                target=self._unwind_naked,
+                args=(kalshi_snap, k_side, 0.0, p_token, p_side, p_filled, fee_bps,
+                      fee_source, poly_order_price, implied_unwind_bid, poly_fill_ts,
+                      None),
+                daemon=True,
+            ).start()
+            return
+
+        # Bid above the detected ask by ARB_KALSHI_SLIPPAGE so the IOC still
+        # crosses if the ask ticked up during the Poly leg. Capped at 99¢. The
+        # arb still profits as long as (k_buy_price + poly_order_price) < 100.
+        k_buy_price = min(k_price + ARB_KALSHI_SLIPPAGE, 99)
         k_ts0 = time.time()
         k_filled: float = 0.0
         k_err: Optional[str] = None
         if DRY_RUN:
-            k_filled = float(n)
+            k_filled = float(k_target)
         else:
             try:
                 k_filled = _kalshi_ioc(
-                    kalshi_snap, k_side, k_price, n,
+                    kalshi_snap, k_side, k_buy_price, k_target,
                     timeout=ARB_KALSHI_IOC_TIMEOUT,
                 )
             except Exception as e:
@@ -721,11 +943,14 @@ class ArbTrader:
         kalshi_ms = int((time.time() - k_ts0) * 1000)
         naked_ms  = int((time.time() - poly_fill_ts) * 1000)
 
+        # Naked exposure = Poly shares not covered by Kalshi contracts.
+        naked_shares = p_filled - k_filled
+
         if k_filled == 0:
-            # Poly filled but Kalshi missed → unwind Poly, lock window.
+            # Poly filled but Kalshi missed entirely → unwind all Poly.
             self._stats["kalshi_miss_naked"] += 1
             self._on_log("⚠", (
-                f"ARB {self.asset} PARTIAL FILL: "
+                f"ARB {self.asset} NAKED: "
                 f"Poly {p_side.upper()}@{poly_order_price}¢ ×{p_filled} FILLED — "
                 f"Kalshi MISSED. Unwinding Poly. Locked for this window."
             ))
@@ -737,6 +962,25 @@ class ArbTrader:
                 daemon=True,
             ).start()
             return
+
+        if naked_shares > ARB_DUST_SHARES:
+            # Kalshi only PARTIALLY hedged (e.g. got 3 of 5 while Poly has 5.55).
+            # The whole-share hedge stays on; unwind only the uncovered Poly
+            # excess so we're not left directionally exposed.
+            self._stats["kalshi_partial_naked"] += 1
+            self._on_log("⚠", (
+                f"ARB {self.asset} PARTIAL HEDGE: Kalshi filled {k_filled}/{k_target}, "
+                f"Poly {p_filled} → {naked_shares:.2f} shares naked. "
+                f"Unwinding the uncovered Poly excess."
+            ))
+            threading.Thread(
+                target=self._unwind_naked,
+                args=(kalshi_snap, k_side, 0.0, p_token, p_side, naked_shares, fee_bps,
+                      fee_source, poly_order_price, implied_unwind_bid, poly_fill_ts,
+                      k_err),
+                daemon=True,
+            ).start()
+            # Fall through: record the hedged portion (k_filled pairs) as a position.
 
         matched   = min(k_filled, p_filled)
         phase     = "open" if (k_filled > 0 and p_filled > 0) else "partial"
@@ -789,6 +1033,7 @@ class ArbTrader:
             "poly_leg_latency_ms":     poly_ms,
             "kalshi_leg_latency_ms":   kalshi_ms,
             "naked_duration_ms":       naked_ms,
+            **drift,
         })
 
         if phase == "open":

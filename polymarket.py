@@ -53,6 +53,24 @@ from typing import Optional, Callable, Dict, List
 import requests
 import websocket
 
+# Force IPv4 — Polymarket is dual-stack (Cloudflare) but this env has no working
+# IPv6 route, so requests AND the websocket hang ~40-100s on IPv6 before falling
+# back. This was the root cause of the dead Poly feed. We patch BOTH urllib3
+# (for requests) and socket.getaddrinfo (for websocket-client, which doesn't use
+# urllib3) to return only IPv4 addresses. (Idempotent with engine.py.)
+import socket as _socket
+try:
+    import urllib3.util.connection as _u3conn
+    _u3conn.allowed_gai_family = lambda: _socket.AF_INET
+except Exception:
+    pass
+if not getattr(_socket, "_ipv4_forced", False):
+    _orig_gai = _socket.getaddrinfo
+    def _gai_ipv4(host, port, family=0, *a, **k):
+        return _orig_gai(host, port, _socket.AF_INET, *a, **k)
+    _socket.getaddrinfo = _gai_ipv4
+    _socket._ipv4_forced = True
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -66,6 +84,11 @@ log = logging.getLogger("kalshi.polymarket")
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 POLY_REST  = "https://clob.polymarket.com"
 POLY_WS    = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+# Seconds between periodic REST re-seeds of each subscribed market (safety net
+# for silent/reconnecting WS feeds). Kept short so re-seeded snapshots stay
+# within the arb staleness gate's acceptance window.
+POLY_RESEED_INTERVAL = float(os.getenv("POLY_RESEED_INTERVAL", "2.0"))
 
 # Polygon mainnet CTF Exchange contract (neg_risk=false markets)
 CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
@@ -331,6 +354,7 @@ class PolyClient:
         self._on_snap = on_snap
         self._snaps:  Dict[str, PolySnap]    = {}   # condition_id → PolySnap
         self._books:  Dict[str, _TokenBook]  = {}   # token_id → _TokenBook
+        self._infos:  Dict[str, "PolyMarketInfo"] = {}  # condition_id → info (for re-seed)
         self._ws:     Optional[websocket.WebSocketApp] = None
         self._subscribed_tokens: List[str]   = []
         self._reconnect = True
@@ -342,16 +366,45 @@ class PolyClient:
         self._api_secret   = os.getenv("POLY_API_SECRET", "")
         self._passphrase   = os.getenv("POLY_API_PASSPHRASE", "")
         self._chain_id     = int(os.getenv("POLY_CHAIN_ID", "137"))
+        # Deposit-wallet (proxy) flow: funder = Polymarket deposit address,
+        # signature_type 1 = Email/Magic proxy, 2 = browser-wallet Gnosis Safe.
+        self._funder         = os.getenv("POLY_FUNDER", "")
+        self._signature_type = int(os.getenv("POLY_SIGNATURE_TYPE", "1"))
         self._address: Optional[str] = None
 
         if self._private_key:
             self._address = self._derive_address()
+
+        # Official CLOB v2 client — order placement only. The legacy hand-rolled
+        # v1 signing was deprecated server-side (CLOB v2 migration, Apr 2026);
+        # the v2 SDK resolves the order schema/version automatically.
+        self._clob = self._build_clob_client()
 
         # Start WS loop
         self._ws_thread = threading.Thread(
             target=self._ws_loop, name="poly-ws", daemon=True
         )
         self._ws_thread.start()
+
+        # Periodic REST re-seed: safety net so a market whose WS feed is silent
+        # (reconnect gap, missed snapshot) doesn't go permanently stale and get
+        # blocked by the arb staleness gate. Refreshes every subscribed market
+        # from REST on a short cadence; WS updates still take precedence.
+        self._reseed_thread = threading.Thread(
+            target=self._reseed_loop, name="poly-reseed", daemon=True
+        )
+        self._reseed_thread.start()
+
+    def _reseed_loop(self):
+        while self._reconnect:
+            time.sleep(POLY_RESEED_INTERVAL)
+            with self._lock:
+                infos = list(self._infos.values())
+            for info in infos:
+                try:
+                    self._seed_rest(info)
+                except Exception as e:
+                    log.debug("Poly re-seed %s: %s", info.condition_id[-8:], e)
 
     # ── Address derivation ───────────────────────────────────────────────────
 
@@ -361,6 +414,42 @@ class PolyClient:
             return Account.from_key(self._private_key).address
         except Exception as e:
             log.warning("Could not derive Polymarket address: %s", e)
+            return None
+
+    def _build_clob_client(self):
+        """
+        Construct the official py-clob-client-v2 ClobClient for order placement.
+        Returns None if creds/funder are missing (DRY_RUN can still run without it).
+        """
+        if not (self._private_key and self._api_key and self._funder):
+            log.warning(
+                "Poly v2 client not built — need POLY_PRIVATE_KEY, POLY_API_KEY, "
+                "and POLY_FUNDER. Order placement will be unavailable."
+            )
+            return None
+        try:
+            from py_clob_client_v2.client import ClobClient
+            from py_clob_client_v2.clob_types import ApiCreds
+        except ImportError:
+            log.error("py-clob-client-v2 not installed: pip install py-clob-client-v2")
+            return None
+        try:
+            creds = ApiCreds(self._api_key, self._api_secret, self._passphrase)
+            client = ClobClient(
+                POLY_REST,
+                chain_id=self._chain_id,
+                key=self._private_key,
+                creds=creds,
+                signature_type=self._signature_type,
+                funder=self._funder,
+            )
+            log.info(
+                "Poly v2 client ready — funder=%s sigType=%d",
+                self._funder, self._signature_type,
+            )
+            return client
+        except Exception as e:
+            log.error("Failed to build Poly v2 client: %s", e)
             return None
 
     # ── L1 auth headers ──────────────────────────────────────────────────────
@@ -374,15 +463,20 @@ class PolyClient:
         import base64
         ts          = str(int(time.time()))
         msg         = ts + method.upper() + path + body
-        secret_bytes = base64.b64decode(self._api_secret)
+        # Polymarket issues the API secret as URL-safe base64 (contains - and _).
+        # Standard b64decode throws "Incorrect padding" on those chars; the
+        # signature must also be URL-safe base64 to match their L2 HMAC spec.
+        secret_bytes = base64.urlsafe_b64decode(self._api_secret)
         raw_sig     = hmac.new(secret_bytes, msg.encode(), hashlib.sha256).digest()
-        sig         = base64.b64encode(raw_sig).decode()
+        sig         = base64.urlsafe_b64encode(raw_sig).decode()
+        # Polymarket L2 header keys use UNDERSCORES, not hyphens (per the official
+        # py-clob-client headers.py). Hyphens → server sees no api key → HTTP 401.
         return {
-            "POLY-ADDRESS":    self._address or "",
-            "POLY-SIGNATURE":  sig,
-            "POLY-TIMESTAMP":  ts,
-            "POLY-API-KEY":    self._api_key,
-            "POLY-PASSPHRASE": self._passphrase,
+            "POLY_ADDRESS":    self._address or "",
+            "POLY_SIGNATURE":  sig,
+            "POLY_TIMESTAMP":  ts,
+            "POLY_API_KEY":    self._api_key,
+            "POLY_PASSPHRASE": self._passphrase,
             "Content-Type":    "application/json",
         }
 
@@ -431,25 +525,65 @@ class PolyClient:
                 message_data=order_msg,
             )
 
-            # API expects string-serialised uint256 fields
-            return {
-                "order": {
-                    **{k: str(v) for k, v in order_msg.items()},
-                    "signature": signed.signature.hex(),
-                },
-                "owner":     account.address,
-                "orderType": "FOK",
-            }
+            return self._order_to_json(order_msg, signed.signature.hex(), "BUY")
         except Exception as e:
             log.error("Order signing failed: %s", e)
             return None
 
+    def _order_to_json(self, order_msg: dict, signature_hex: str,
+                       side_str: str, order_type: str = "FOK") -> dict:
+        """
+        Convert a signed EIP-712 order struct into the JSON body POST /order
+        expects. The signed struct uses numeric side/salt; the JSON body uses
+        string amounts, numeric salt, the "BUY"/"SELL" side string, and `owner`
+        = API key UUID (matches the official py-clob-client order_to_json).
+        """
+        sig_hex = signature_hex if signature_hex.startswith("0x") else "0x" + signature_hex
+        return {
+            "order": {
+                "salt":          order_msg["salt"],          # number
+                "maker":         order_msg["maker"],
+                "signer":        order_msg["signer"],
+                "taker":         order_msg["taker"],
+                "tokenId":       str(order_msg["tokenId"]),
+                "makerAmount":   str(order_msg["makerAmount"]),
+                "takerAmount":   str(order_msg["takerAmount"]),
+                "expiration":    str(order_msg["expiration"]),
+                "nonce":         str(order_msg["nonce"]),
+                "feeRateBps":    str(order_msg["feeRateBps"]),
+                "side":          side_str,                    # "BUY" / "SELL"
+                "signatureType": order_msg["signatureType"], # number
+                "signature":     sig_hex,
+            },
+            "owner":     self._api_key,                       # API key UUID
+            "orderType": order_type,
+        }
+
     # ── Order placement ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _filled_shares(resp: dict, fallback_size: float) -> float:
+        """
+        Extract filled share count from a v2 post_order response. A FOK that
+        fully fills returns status=matched with takingAmount = shares received;
+        a kill returns status=live/unmatched with empty amounts.
+        """
+        status = (resp.get("status") or "").lower()
+        taking = resp.get("takingAmount", "")
+        if taking not in ("", None):
+            try:
+                return float(taking)
+            except (TypeError, ValueError):
+                pass
+        # No explicit amount — infer from status (matched → full, else 0).
+        if status == "matched":
+            return float(fallback_size)
+        return 0.0
 
     def place_fok(self, token_id: str, price_cents: int,
                   size: int, fee_bps: int) -> float:
         """
-        Place a FOK buy order for `size` shares at `price_cents`.
+        Place a FOK buy order for `size` shares at `price_cents` via CLOB v2.
         Returns filled share count as float (simulates full fill in DRY_RUN).
         """
         if DRY_RUN:
@@ -459,27 +593,23 @@ class PolyClient:
             )
             return float(size)
 
-        body = self._sign_order(token_id, price_cents, size, fee_bps)
-        if body is None:
+        if self._clob is None:
+            log.error("Poly v2 client unavailable — cannot place FOK buy")
             return 0.0
 
-        body_str = json.dumps(body)
-        headers  = self._l1_headers("POST", "/order", body_str)
         try:
-            r = requests.post(
-                f"{POLY_REST}/order",
-                data=body_str,
-                headers=headers,
-                timeout=5,
-            )
-            if not r.ok:
-                log.error(
-                    "Poly FOK HTTP %d token=...%s price=%dc: %s",
-                    r.status_code, token_id[-6:], price_cents, r.text[:300],
-                )
-                return 0.0
-            resp   = r.json()
-            filled = float(resp.get("size_matched", 0) or 0)
+            from py_clob_client_v2.clob_types import OrderArgs, OrderType
+            from py_clob_client_v2.order_builder.constants import BUY
+        except ImportError:
+            log.error("py-clob-client-v2 not installed")
+            return 0.0
+
+        try:
+            args   = OrderArgs(price=price_cents / 100.0, size=size,
+                               side=BUY, token_id=token_id)
+            signed = self._clob.create_order(args)
+            resp   = self._clob.post_order(signed, OrderType.FOK)
+            filled = self._filled_shares(resp, size)
             if filled == 0:
                 log.warning(
                     "Poly FOK not filled token=...%s price=%dc x%d — resp: %s",
@@ -492,80 +622,63 @@ class PolyClient:
                 )
             return filled
         except Exception as e:
-            log.error("Poly FOK POST error: %s", e)
+            log.error("Poly FOK buy error token=...%s price=%dc: %s",
+                      token_id[-6:], price_cents, e)
             return 0.0
 
     def place_sell_fok(self, token_id: str, size: float, fee_bps: int) -> float:
         """
-        Emergency market-sell: FOK sell `size` shares at any available bid.
-        takerAmount=1 micro-USDC means "accept any bid" — the CLOB fills at
-        best available bid regardless of level.  Used for naked-leg unwind.
-        Returns sold share count as float.
+        Emergency unwind sell of `size` shares at any available bid via CLOB v2.
+
+        CRITICAL: uses FAK (Fill-And-Kill), NOT FOK. A naked-leg unwind must take
+        whatever liquidity exists right now — FOK's all-or-nothing means a thin
+        book sells ZERO and leaves the position fully naked (this cost a real
+        $2.60 loss on 2026-05-29). The order is a SELL limit at 1¢ so it crosses
+        any bid; FAK fills what it can immediately and kills the remainder.
+
+        Returns sold share count (may be partial). Caller must check < size.
         """
         if DRY_RUN:
-            log.info("[DRY RUN] Poly FOK sell token=...%s x%s", token_id[-6:], size)
+            log.info("[DRY RUN] Poly FAK sell token=...%s x%s", token_id[-6:], size)
             return float(size)
 
-        if not self._private_key or not self._address:
-            log.error("Polymarket private key not configured — cannot sell")
+        if self._clob is None:
+            log.error("Poly v2 client unavailable — cannot unwind (naked leg!)")
             return 0.0
+
         try:
-            from eth_account import Account
+            from py_clob_client_v2.clob_types import OrderArgs, OrderType
+            from py_clob_client_v2.order_builder.constants import SELL
         except ImportError:
-            log.error("eth-account not installed")
+            log.error("py-clob-client-v2 not installed")
+            return 0.0
+
+        # Polymarket order size is whole shares; round DOWN so we never try to
+        # sell more than we hold (a 5.55 fill means 5 sellable whole shares).
+        sell_size = int(size)
+        if sell_size <= 0:
+            log.warning("Poly unwind: size %.4f rounds to 0 shares — nothing to sell", size)
             return 0.0
 
         try:
-            account      = Account.from_key(self._private_key)
-            maker_amount = int(size * DECIMALS)   # shares in
-            taker_amount = 1                       # accept any USDC amount (market sell)
-            salt         = int(time.time() * 1000) & 0xFFFFFFFFFFFFFFFF
-
-            order_msg = {
-                "salt":          salt,
-                "maker":         account.address,
-                "signer":        account.address,
-                "taker":         "0x0000000000000000000000000000000000000000",
-                "tokenId":       int(token_id),
-                "makerAmount":   maker_amount,
-                "takerAmount":   taker_amount,
-                "expiration":    0,
-                "nonce":         0,
-                "feeRateBps":    fee_bps,
-                "side":          1,    # SELL
-                "signatureType": 0,    # EOA
-            }
-
-            signed = account.sign_typed_data(
-                domain_data=_EIP712_DOMAIN,
-                message_types={"Order": _ORDER_TYPE_FIELDS},
-                message_data=order_msg,
-            )
-
-            body = {
-                "order": {
-                    **{k: str(v) for k, v in order_msg.items()},
-                    "signature": signed.signature.hex(),
-                },
-                "owner":     account.address,
-                "orderType": "FOK",
-            }
-
-            body_str = json.dumps(body)
-            headers  = self._l1_headers("POST", "/order", body_str)
-            r = requests.post(
-                f"{POLY_REST}/order",
-                data=body_str,
-                headers=headers,
-                timeout=5,
-            )
-            r.raise_for_status()
-            resp = r.json()
-            sold = float(resp.get("size_matched", 0) or 0)
-            log.info("Poly FOK sell token=...%s x%s → sold=%s", token_id[-6:], size, sold)
+            # SELL limit @1¢ + FAK: crosses any bid, takes all available now,
+            # kills the rest. Never all-or-nothing.
+            args   = OrderArgs(price=0.01, size=sell_size, side=SELL, token_id=token_id)
+            signed = self._clob.create_order(args)
+            resp   = self._clob.post_order(signed, OrderType.FAK)
+            sold   = self._filled_shares(resp, sell_size)
+            if sold < sell_size:
+                log.error(
+                    "Poly UNWIND PARTIAL token=...%s sold=%s/%s — STILL NAKED on remainder!",
+                    token_id[-6:], sold, sell_size,
+                )
+            else:
+                log.info("Poly unwind sell token=...%s x%s → sold=%s",
+                         token_id[-6:], sell_size, sold)
             return sold
         except Exception as e:
-            log.error("Poly FOK sell error: %s", e)
+            log.error("Poly unwind sell error token=...%s x%s: %s — POSITION STILL NAKED",
+                      token_id[-6:], sell_size, e)
             return 0.0
 
     # ── Market data ──────────────────────────────────────────────────────────
@@ -591,6 +704,7 @@ class PolyClient:
             for tok in (info.yes_token_id, info.no_token_id):
                 if tok not in self._subscribed_tokens:
                     self._subscribed_tokens.append(tok)
+            self._infos[info.condition_id] = info
 
         # Seed from REST before WS catches up
         self._seed_rest(info)
@@ -644,10 +758,28 @@ class PolyClient:
                 time.sleep(5)
 
     def _connect_ws(self):
+        # Per-connection flag so the keepalive thread stops when this socket dies.
+        ka_stop = threading.Event()
+
         def on_open(ws):
             self._ws_subscribe(ws)
+            # Polymarket's Market channel requires an APPLICATION-LEVEL "PING"
+            # text frame every ≤10s (protocol ping frames are NOT enough — the
+            # server drops idle connections on a ~80s timer, which is what we
+            # were seeing). Send "PING" every 5s on a dedicated thread.
+            def _keepalive():
+                while not ka_stop.wait(5.0):
+                    try:
+                        ws.send("PING")
+                    except Exception:
+                        break
+            threading.Thread(target=_keepalive, name="poly-ws-ping",
+                             daemon=True).start()
 
         def on_message(ws, raw):
+            # Server may reply "PONG" to our PING — ignore non-JSON frames.
+            if raw == "PONG" or not raw:
+                return
             try:
                 data = json.loads(raw)
                 msgs = data if isinstance(data, list) else [data]
@@ -660,6 +792,7 @@ class PolyClient:
             log.warning("Poly WS error: %s", err)
 
         def on_close(ws, *args):
+            ka_stop.set()
             log.info("Poly WS closed")
 
         self._ws = websocket.WebSocketApp(
@@ -669,14 +802,19 @@ class PolyClient:
             on_error=on_error,
             on_close=on_close,
         )
+        # Keep protocol-level ping too as a secondary heartbeat.
         self._ws.run_forever(ping_interval=20, ping_timeout=10)
+        ka_stop.set()
 
     def _ws_subscribe(self, ws):
         with self._lock:
             tokens = list(self._subscribed_tokens)
         if not tokens:
             return
-        msg = {"auth": {}, "type": "Market", "assets_ids": tokens}
+        # Market channel subscribe (current spec): type MUST be lowercase
+        # "market" — the old "Market" (capital M) was silently ignored by the
+        # server, so it accepted the socket but streamed no book data.
+        msg = {"assets_ids": tokens, "type": "market", "custom_feature_enabled": True}
         try:
             ws.send(json.dumps(msg))
             log.info("Poly WS subscribed to %d tokens", len(tokens))

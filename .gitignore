@@ -6,6 +6,7 @@
 # Runtime data
 positions.json
 *.jsonl
+*.log
 __pycache__/
 *.pyc
 .pytest_cache/

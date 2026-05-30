@@ -31,6 +31,13 @@ except ImportError:
 import engine
 import trader
 
+# Strategy selector: "arb" (cross-venue Kalshi×Polymarket) or "momentum".
+STRATEGY = os.getenv("STRATEGY", "momentum").strip().lower()
+
+if STRATEGY == "arb":
+    import polymarket
+    import arb_trader
+
 from flask import Flask, Response, jsonify, render_template_string, request
 
 app = Flask(__name__)
@@ -39,6 +46,9 @@ app.config["SECRET_KEY"] = os.urandom(24)
 # ── Shared state ──────────────────────────────────────────────────────────────
 _bot: engine.BotEngine = None
 _momentum_traders: dict = {}
+_arb_traders: dict = {}
+_poly_client = None
+_arb_windows: dict = {}          # asset → last seen window_ts (for per-window reset)
 _event_queue: queue.Queue = queue.Queue(maxsize=500)
 _bot_lock = threading.Lock()
 
@@ -84,12 +94,20 @@ def _on_momentum_update(asset: str, position):
     BOT_STATE["momentum_positions"][asset] = position
     _push("momentum_update", {"asset": asset, "position": position})
 
-for _a in engine.ASSETS:
-    _momentum_traders[_a] = trader.MomentumTrader(
-        _a,
+if STRATEGY == "arb":
+    _poly_client = polymarket.PolyClient()
+    _arb_traders = arb_trader.build_arb_traders(
+        list(engine.ASSETS),
+        _poly_client,
         on_log=lambda ic, msg: _add_log(ic, msg),
-        on_update=_on_momentum_update,
     )
+else:
+    for _a in engine.ASSETS:
+        _momentum_traders[_a] = trader.MomentumTrader(
+            _a,
+            on_log=lambda ic, msg: _add_log(ic, msg),
+            on_update=_on_momentum_update,
+        )
 
 def _on_prices(markets: dict, snapshots: dict):
     BOT_STATE["markets"]   = markets
@@ -102,7 +120,18 @@ def _on_prices(markets: dict, snapshots: dict):
         for asset in BOT_STATE["enabled_assets"]:
             snap = _bot.get_snapshot(asset)
             mkt  = markets.get(asset)
-            if snap and mkt:
+            if not (snap and mkt):
+                continue
+            if STRATEGY == "arb":
+                arb = _arb_traders.get(asset)
+                if arb is None:
+                    continue
+                # Arb engine has no internal window detection — reset on new window.
+                if _arb_windows.get(asset) != snap.window_ts:
+                    _arb_windows[asset] = snap.window_ts
+                    arb.reset()
+                arb.update(snap)
+            else:
                 _momentum_traders[asset].update(snap, mkt)
 
 def _on_status(status: str):
@@ -118,6 +147,12 @@ def _start_bot():
         engine.DRY_RUN  = BOT_STATE["dry_run"]
         trader.DRY_RUN  = BOT_STATE["dry_run"]
         engine.USE_DEMO = BOT_STATE["demo"]
+        if STRATEGY == "arb":
+            # arb_trader imported DRY_RUN by value at module load — re-bind it
+            # (and polymarket's) so the live/dry toggle actually reaches them.
+            arb_trader.DRY_RUN = BOT_STATE["dry_run"]
+            if hasattr(polymarket, "DRY_RUN"):
+                polymarket.DRY_RUN = BOT_STATE["dry_run"]
         _bot = engine.BotEngine(
             on_log    = _on_log,
             on_prices = _on_prices,
@@ -222,22 +257,75 @@ def api_positions():
     with trader.POSITIONS._lock:
         return jsonify(dict(trader.POSITIONS._data))
 
+# Decision-logging rows that flood trades.jsonl but aren't real trades.
+_NOISY_TRADE_TYPES = {"arb_attempt", "arb_ev_abort", "arb_poly_miss"}
+
 @app.route("/api/trades")
 def api_trades():
+    """Return recent trade-log rows. By default hides the repetitive decision
+    rows (arb_attempt/ev_abort/poly_miss) so the panel shows only real trades
+    (entries, unwinds). Pass ?all=1 to include everything."""
+    show_all = request.args.get("all") == "1"
     try:
         tf = trader.TRADES_FILE
         if Path(tf).exists():
-            lines  = Path(tf).read_text().strip().splitlines()
-            trades = [json.loads(l) for l in lines[-100:] if l.strip()]
-            return jsonify({"trades": list(reversed(trades))})
+            lines = Path(tf).read_text().strip().splitlines()
+            rows  = []
+            # scan from the end so we keep the most recent meaningful rows
+            for l in reversed(lines):
+                if not l.strip():
+                    continue
+                try:
+                    r = json.loads(l)
+                except Exception:
+                    continue
+                if not show_all and r.get("type") in _NOISY_TRADE_TYPES:
+                    continue
+                rows.append(r)
+                if len(rows) >= 100:
+                    break
+            return jsonify({"trades": rows})
     except Exception:
         pass
     return jsonify({"trades": []})
 
+@app.route("/api/arb")
+def api_arb():
+    """Full arb observability snapshot: per-asset live prices/spreads/stats/
+    positions, the global kill-switch state, and the config thresholds the UI
+    needs to render gates (combined threshold, min profit, poly min order, etc.)."""
+    if STRATEGY != "arb":
+        return jsonify({"strategy": STRATEGY, "arb_enabled": False})
+    assets = {a: t.get_state() for a, t in _arb_traders.items()}
+    return jsonify({
+        "strategy":      "arb",
+        "arb_enabled":   True,
+        "halted":        arb_trader.TRADING_HALTED,
+        "halt_reason":   arb_trader.HALT_REASON,
+        "assets":        assets,
+        "config": {
+            "threshold":      arb_trader.ARB_THRESHOLD,
+            "tolerance":      arb_trader.ARB_TOLERANCE,
+            "trade_size":     arb_trader.ARB_TRADE_SIZE,
+            "min_profit":     arb_trader.ARB_MIN_PROFIT,
+            "poly_min_usd":   arb_trader.ARB_POLY_MIN_ORDER_USD,
+            "kalshi_slippage":arb_trader.ARB_KALSHI_SLIPPAGE,
+            "poly_price_floor": round(arb_trader.ARB_POLY_MIN_ORDER_USD
+                                      / max(arb_trader.ARB_TRADE_SIZE, 1) * 100),
+        },
+    })
+
 @app.route("/api/momentum_positions")
 def api_momentum_positions():
+    if STRATEGY == "arb":
+        positions = {}
+        for a in engine.ASSETS:
+            t = _arb_traders.get(a)
+            pos = t.position if t else None
+            positions[a] = (pos.__dict__ if pos else None)
+        return jsonify({"strategy": "arb", "momentum_positions": positions})
     positions = {a: _momentum_traders[a].get_position() for a in engine.ASSETS}
-    return jsonify({"momentum_positions": positions})
+    return jsonify({"strategy": "momentum", "momentum_positions": positions})
 
 # ── Dashboard HTML ────────────────────────────────────────────────────────────
 DASHBOARD_HTML = r"""<!DOCTYPE html>
@@ -245,7 +333,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Kalshi Momentum Bot</title>
+<title>Kalshi × Polymarket Arb Bot</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
@@ -328,6 +416,65 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'IBM Pl
 .sw input{display:none}
 .sw input:checked + .sw-track{background:rgba(0,212,170,.35)}
 .sw input:checked + .sw-track::after{transform:translateX(12px);background:var(--accent)}
+
+/* ── Halt banner ── */
+#halt-banner{background:rgba(255,107,107,.12);border-bottom:2px solid var(--down);
+  color:var(--down);padding:8px 18px;font-size:11px;font-weight:600;letter-spacing:.06em;
+  flex-shrink:0;display:flex;align-items:center;gap:10px}
+#halt-banner::before{content:'\1F6D1';font-size:14px}
+
+/* ── Arb config strip ── */
+#arb-cfg-strip{display:flex;align-items:center;gap:14px;padding:5px 18px;background:var(--surf2);
+  border-bottom:1px solid var(--border);flex-shrink:0;font-size:9px;color:var(--muted);flex-wrap:wrap}
+#arb-cfg-strip .cfg-label{letter-spacing:.16em;text-transform:uppercase;color:var(--dim)}
+#arb-cfg-strip b{color:var(--text);font-weight:500}
+#arb-cfg-items{display:flex;gap:14px;flex-wrap:wrap}
+
+/* ── Arb market cards ── */
+.acard{background:var(--surf);padding:10px 14px;display:flex;flex-direction:column;gap:8px}
+.acard+.acard{border-left:1px solid var(--border)}
+.acard-top{display:flex;align-items:center;gap:8px}
+.acard-asset{font-size:16px;font-weight:600;color:var(--accent)}
+.acard-link{font-size:8px;padding:1px 6px;border-radius:3px;letter-spacing:.08em;text-transform:uppercase}
+.acard-link.on{color:var(--ok);border:1px solid rgba(34,197,94,.4);background:rgba(34,197,94,.06)}
+.acard-link.off{color:var(--muted);border:1px solid var(--border2)}
+.acard-timer{font-size:10px;color:var(--muted);margin-left:auto}
+/* venue price grid */
+.acard-venues{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.venue{border:1px solid var(--border);border-radius:4px;padding:5px 8px}
+.venue-name{font-size:8px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:3px}
+.venue-row{display:flex;justify-content:space-between;font-size:11px}
+.venue-row b{font-weight:500}
+.yes-c{color:var(--up)}
+.no-c{color:var(--down)}
+/* spread readout */
+.acard-spreads{display:flex;gap:8px}
+.spread{flex:1;border:1px solid var(--border);border-radius:4px;padding:4px 8px;font-size:9px}
+.spread-lbl{color:var(--muted);font-size:8px;letter-spacing:.06em}
+.spread-val{font-size:14px;font-weight:600;margin-top:1px}
+.spread.hot{border-color:rgba(0,212,170,.5);background:rgba(0,212,170,.07)}
+.spread.hot .spread-val{color:var(--accent)}
+.spread .spread-val{color:var(--text)}
+
+/* ── Arb decisions (skip breakdown) ── */
+.dec-grid{display:flex;flex-direction:column;gap:5px}
+.dec-row{display:flex;align-items:center;gap:10px;padding:5px 9px;border-radius:4px;
+  background:var(--surf);border:1px solid var(--border)}
+.dec-row.good{border-color:rgba(34,197,94,.35)}
+.dec-row.bad{border-color:rgba(255,107,107,.35)}
+.dec-name{font-size:10px;flex:1}
+.dec-name small{color:var(--muted);font-size:9px}
+.dec-count{font-size:15px;font-weight:600;min-width:42px;text-align:right}
+.dec-count.good{color:var(--ok)}
+.dec-count.bad{color:var(--down)}
+.dec-count.zero{color:var(--dim)}
+.dec-count.neutral{color:var(--text)}
+.dec-section-lbl{font-size:8px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim);
+  margin:8px 0 2px}
+/* open arb position chip */
+.apos{border:1px solid rgba(0,212,170,.4);background:rgba(0,212,170,.05);border-radius:4px;
+  padding:7px 10px;font-size:10px;margin-bottom:6px}
+.apos b{color:var(--accent)}
 
 /* ── Momentum positions row ── */
 #momentum-row{border-bottom:1px solid var(--border);background:var(--surf);
@@ -475,37 +622,31 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'IBM Pl
   </div>
 </div>
 
-<!-- MARKETS ROW -->
-<div class="markets-row" id="markets-row"></div>
+<!-- HALT BANNER (hidden unless kill-switch tripped) -->
+<div id="halt-banner" style="display:none"></div>
 
-<!-- MOMENTUM POSITIONS ROW -->
-<div id="momentum-row">
-  <div class="mom-row-inner">
-    <span class="mom-label">Momentum</span>
-    <div class="mom-cards" id="mom-cards"></div>
-    <div class="mom-cfg">
-      Entry&nbsp;<b style="color:var(--text)">85–94¢</b>
-      &nbsp;·&nbsp;
-      TP&nbsp;<b style="color:var(--ok)">≥95¢</b>
-      &nbsp;·&nbsp;
-      Window&nbsp;<b style="color:var(--text)">13:00–14:00</b>
-    </div>
-  </div>
+<!-- ARB CONFIG STRIP -->
+<div id="arb-cfg-strip">
+  <span class="cfg-label">ARB CONFIG</span>
+  <span id="arb-cfg-items"></span>
 </div>
+
+<!-- ARB MARKET CARDS (per-asset, both venues + spreads) -->
+<div class="markets-row" id="arb-cards"></div>
 
 <!-- MAIN AREA -->
 <div class="main-area">
   <div class="content-cols">
 
-    <!-- MOMENTUM STATUS -->
+    <!-- ARB DECISIONS (per-window skip-reason breakdown) -->
     <div class="panel">
       <div class="ph">
-        <div class="pt">Momentum Status</div>
+        <div class="pt">Arb Decisions <span style="color:var(--muted)">· this window</span></div>
         <div class="spacer"></div>
-        <span style="font-size:9px;color:var(--muted)">Entry&nbsp;<b style="color:var(--text)">≥85¢&nbsp;&lt;95¢</b>&nbsp;·&nbsp;TP&nbsp;<b style="color:var(--ok)">max(95¢,&nbsp;entry+1¢)</b></span>
+        <span id="arb-window-age" style="font-size:9px;color:var(--muted)"></span>
       </div>
-      <div class="pb" id="ms-body">
-        <div class="no-data">Waiting for market data…</div>
+      <div class="pb" id="arb-decisions-body">
+        <div class="no-data">Waiting for arb evaluations…</div>
       </div>
     </div>
 
@@ -513,6 +654,8 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'IBM Pl
     <div class="panel">
       <div class="ph">
         <div class="pt">Trade History</div>
+        <button class="log-toggle" id="trades-toggle-btn" onclick="toggleTradesAll()"
+          title="Show/hide repetitive skip & decision rows">Show skips</button>
         <div class="spacer"></div>
         <div style="display:flex;gap:16px;font-size:9px;color:var(--muted)">
           <span>P&amp;L:&nbsp;<b id="h-pnl" style="color:var(--ok)">+$0.0000</b></span>
@@ -536,6 +679,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);font-family:'IBM Pl
         <div class="data-dot" id="conn-dot"></div>
         <span id="conn-label" style="font-size:9px;color:var(--muted)">Disconnected</span>
       </div>
+      <button class="log-toggle" id="log-clear-btn" onclick="clearLog()" title="Clear the on-screen log (server keeps full history)">Clear</button>
       <button class="log-toggle" id="log-toggle-btn" onclick="toggleLog()">Expand</button>
     </div>
     <div id="log-body"></div>
@@ -549,7 +693,8 @@ const S = {
   botRunning:false, dryRun:true, demo:false,
   enabledAssets:['BTC','ETH','SOL'],
   snapshots:{},
-  momentumPositions:{BTC:null,ETH:null,SOL:null},
+  arb:{}, arbCfg:null, arbHalted:false, arbHaltReason:'',
+  tradesShowAll:false,
   sessionPnl:0, sessionTrades:0, sessionWins:0,
   startedAt:null, lastPriceTs:0, assetTimers:{},
   logExpanded:false, logHeight:220,
@@ -583,23 +728,15 @@ function handleMsg(msg) {
     S.sessionTrades = msg.session_trades || 0;
     S.sessionWins   = msg.session_wins   || 0;
     S.startedAt     = msg.started_at     || null;
-    if (msg.momentum_positions) S.momentumPositions = msg.momentum_positions;
     updateMode(); updateStatus(msg.status);
     S.snapshots = msg.snapshots || {};
-    renderMarkets(); renderMomentumRow(); renderMomentumStatus(); updateStats();
+    updateStats(); refreshArb();
     (msg.log || []).forEach(addLog);
   } else if (t === 'prices') {
     S.snapshots   = msg.snapshots || {};
     S.lastPriceTs = Date.now();
-    ['BTC','ETH','SOL'].forEach(a => {
-      const s = S.snapshots[a];
-      if (s && s.secs_left != null)
-        S.assetTimers[a] = { secsLeft: s.secs_left, capturedAt: performance.now() };
-    });
-    renderMarkets(); renderMomentumStatus();
   } else if (t === 'momentum_update') {
-    S.momentumPositions[msg.asset] = msg.position;
-    renderMomentumRow(); renderMomentumStatus();
+    // arb mode: momentum updates ignored
   } else if (t === 'log') {
     addLog(msg);
   } else if (t === 'status') {
@@ -610,7 +747,7 @@ function handleMsg(msg) {
     S.sessionWins   = msg.session_wins;
     updateStats();
   } else if (t === 'config') {
-    if (msg.enabled_assets) { S.enabledAssets = msg.enabled_assets; renderMarkets(); }
+    if (msg.enabled_assets) { S.enabledAssets = msg.enabled_assets; }
     if (msg.dry_run !== undefined) { S.dryRun = !!msg.dry_run; updateMode(); }
   } else if (t === 'order_result') {
     refreshTrades();
@@ -646,206 +783,146 @@ async function setMode(monitorMode) {
   });
 }
 
-// ── Momentum positions strip ───────────────────────────────────────────────
-function renderMomentumRow() {
-  document.getElementById('mom-cards').innerHTML =
-    ['BTC','ETH','SOL'].map(renderMomCard).join('');
+// ── Arb config strip ───────────────────────────────────────────────────────
+function renderArbConfig() {
+  const c = S.arbCfg; if (!c) return;
+  document.getElementById('arb-cfg-items').innerHTML = [
+    `Combined&nbsp;<b>&lt;${c.threshold}¢</b>`,
+    `Min&nbsp;profit&nbsp;<b>${c.min_profit}¢</b>`,
+    `Size&nbsp;<b>${c.trade_size}</b>`,
+    `Poly&nbsp;floor&nbsp;<b>≥${c.poly_price_floor}¢</b>`,
+    `K&nbsp;slippage&nbsp;<b>+${c.kalshi_slippage}¢</b>`,
+    `Tolerance&nbsp;<b>+${c.tolerance}¢</b>`,
+  ].join('');
 }
 
-function renderMomCard(asset) {
-  const pos  = S.momentumPositions[asset];
-  const snap = S.snapshots[asset];
-  if (!pos) {
-    const secsLeft = snap?.secs_left ?? null;
-    const elapsed  = secsLeft != null ? 900 - secsLeft : null;
-    let statusTxt  = 'waiting…';
-    if (elapsed != null) {
-      if (elapsed < 780) {
-        const rem = 780 - elapsed;
-        statusTxt = `entry in ${Math.floor(rem/60)}m${Math.floor(rem%60)}s`;
-      } else if (elapsed <= 840) {
-        statusTxt = 'watching 14th min…';
-      } else {
-        statusTxt = 'window passed';
-      }
-    }
-    return `<div class="mom-card"><span style="color:var(--accent)">${asset}</span>`
-         + `<span style="color:var(--muted);margin-left:4px">${statusTxt}</span></div>`;
-  }
-  const currentBid = pos.side === 'yes' ? snap?.yes_bid : snap?.no_bid;
-  const unreal     = (currentBid != null && pos.phase === 'holding')
-    ? (currentBid - pos.entry_price) * pos.count / 100 : null;
-  const pnlStr   = unreal != null
-    ? `<span style="color:${unreal>=0?'var(--ok)':'var(--down)'};margin-left:3px">`
-      + `${unreal>=0?'+':''}$${Math.abs(unreal).toFixed(4)}</span>` : '';
-  const nowStr   = currentBid != null
-    ? `<span style="color:var(--text);margin-left:3px">→${currentBid}¢</span>` : '';
-  const hedgeStr = pos.hedge_price != null
-    ? `<span style="color:var(--up);margin-left:3px">`
-      + `+${pos.side==='yes'?'NO':'YES'}@${pos.hedge_price}¢</span>` : '';
-  return `<div class="mom-card ${pos.phase}">`
-       + `<span style="color:var(--accent)">${asset}</span>`
-       + `<span style="color:var(--warn);margin-left:4px">`
-       + `${pos.side.toUpperCase()}@${pos.entry_price}¢×${pos.count}</span>`
-       + nowStr + pnlStr + hedgeStr
-       + `<span style="font-size:8px;color:var(--muted);margin-left:4px">${pos.phase}</span>`
-       + `</div>`;
+// ── Halt banner ──────────────────────────────────────────────────────────────
+function renderHalt() {
+  const b = document.getElementById('halt-banner');
+  if (S.arbHalted) { b.style.display = 'flex'; b.textContent = 'TRADING HALTED — ' + (S.arbHaltReason || 'inspect naked position, restart to clear'); }
+  else b.style.display = 'none';
 }
 
-// ── Momentum status panel ─────────────────────────────────────────────────────
-function renderMomentumStatus() {
-  const body = document.getElementById('ms-body');
-  if (!body) return;
-  const cards = ['BTC','ETH','SOL'].map(renderMsCard).join('');
-  body.innerHTML = cards || '<div class="no-data">Waiting for market data…</div>';
+// ── Arb market cards (per-asset, both venues + spreads) ──────────────────────
+function renderArbCards() {
+  document.getElementById('arb-cards').innerHTML =
+    ['BTC','ETH','SOL'].map(renderAcard).join('');
 }
 
-function renderMsCard(asset) {
-  const s   = S.snapshots[asset];
-  const pos = S.momentumPositions[asset];
-  const chk = S.enabledAssets.includes(asset) ? 'checked' : '';
-
-  const t = S.assetTimers[asset];
-  const rawSecs = t
-    ? Math.max(0, t.secsLeft - (performance.now() - t.capturedAt)/1000)
-    : (s?.secs_left ?? null);
-  const elapsed = rawSecs != null ? 900 - rawSecs : null;
-
-  let timerLabel = '—', timerCls = '';
-  if (rawSecs != null) {
-    if (rawSecs >= 3600) timerLabel = Math.floor(rawSecs/3600)+'h '+Math.floor(rawSecs%3600/60)+'m';
-    else if (rawSecs >= 60) timerLabel = Math.floor(rawSecs/60)+'m '+Math.floor(rawSecs%60)+'s';
-    else { timerLabel = Math.floor(rawSecs)+'s'; timerCls = rawSecs < 10 ? ' crit' : ' warn'; }
+function renderAcard(asset) {
+  const st = S.arb[asset];
+  if (!st) return `<div class="acard"><div class="acard-top">
+    <span class="acard-asset">${asset}</span>
+    <span class="acard-link off">no data</span></div>
+    <div style="font-size:10px;color:var(--muted)">Waiting…</div></div>`;
+  const L = st.live || {};
+  const linked = L.poly_linked;
+  const thr = S.arbCfg ? S.arbCfg.threshold : 99;
+  const floor = S.arbCfg ? S.arbCfg.poly_price_floor : 20;
+  // timer
+  let timer = '—';
+  if (L.secs_left != null) {
+    const s = L.secs_left;
+    timer = s >= 60 ? Math.floor(s/60)+'m '+(s%60)+'s' : s+'s';
   }
+  const cell = (v) => v == null ? '—' : v + '¢';
+  // spread A = K_yes + P_no ; spread B = K_no + P_yes
+  const sA = L.spread_a, sB = L.spread_b;
+  const hotA = sA != null && sA < thr && (L.p_no   == null || L.p_no   >= floor);
+  const hotB = sB != null && sB < thr && (L.p_yes  == null || L.p_yes  >= floor);
+  return `<div class="acard">
+    <div class="acard-top">
+      <span class="acard-asset">${asset}</span>
+      <span class="acard-link ${linked?'on':'off'}">${linked?'linked':'no link'}</span>
+      <span class="acard-timer">${timer} ${L.ws_confirmed?'·WS':(linked?'·seed':'')}</span>
+    </div>
+    <div class="acard-venues">
+      <div class="venue"><div class="venue-name">Kalshi ask</div>
+        <div class="venue-row"><span class="yes-c">YES</span><b>${cell(L.k_yes)}</b></div>
+        <div class="venue-row"><span class="no-c">NO</span><b>${cell(L.k_no)}</b></div>
+      </div>
+      <div class="venue"><div class="venue-name">Polymarket ask</div>
+        <div class="venue-row"><span class="yes-c">YES</span><b>${cell(L.p_yes)}</b></div>
+        <div class="venue-row"><span class="no-c">NO</span><b>${cell(L.p_no)}</b></div>
+      </div>
+    </div>
+    <div class="acard-spreads">
+      <div class="spread ${hotA?'hot':''}"><div class="spread-lbl">K-YES + P-NO</div>
+        <div class="spread-val">${sA!=null?sA+'¢':'—'}</div></div>
+      <div class="spread ${hotB?'hot':''}"><div class="spread-lbl">K-NO + P-YES</div>
+        <div class="spread-val">${sB!=null?sB+'¢':'—'}</div></div>
+    </div>
+  </div>`;
+}
 
-  // Phase detection
-  let phase = 'WAITING', phaseClass = 'dim', cardCls = '';
-  if (pos) {
-    phase     = pos.phase.toUpperCase();
-    phaseClass = pos.phase === 'holding' ? 'warn' : pos.phase === 'hedged' ? 'up' : pos.phase === 'closed' ? 'ok' : 'dim';
-    cardCls   = pos.phase;
-  } else if (elapsed != null) {
-    if (elapsed >= 780 && elapsed <= 840) { phase = 'WATCHING'; phaseClass = 'warn'; cardCls = 'watching'; }
-    else if (elapsed > 840) { phase = 'PASSED'; phaseClass = 'dim'; }
-  }
+// ── Arb decisions (per-window skip-reason breakdown) ─────────────────────────
+const DEC_ORDER = [
+  ['entries',             'Entered',            'both legs filled',           'good'],
+  ['qualified',           'Qualified',          'passed combined gate',       'neutral'],
+  ['poly_miss',           'Poly miss',          'Poly FOK didn’t fill',  'neutral'],
+  ['skip_ev_recheck',     'EV abort',           'edge gone at exec price',    'neutral'],
+  ['kalshi_miss_naked',   'Kalshi miss',        'naked → unwound',       'bad'],
+  ['kalshi_partial_naked','Partial hedge',      'excess unwound',             'bad'],
+];
+const SKIP_ORDER = [
+  ['unwind_risk',       'Unwind risk',     'unwind cost &gt; 3× profit'],
+  ['thin_kalshi_depth', 'Thin Kalshi',     'not enough depth'],
+  ['thin_poly_depth',   'Thin Poly',       'not enough depth'],
+  ['below_poly_min',    'Below Poly min',  'leg &lt; $1 order'],
+  ['below_min_profit',  'Below min profit','net &lt; 1¢ after fees'],
+];
 
-  const swHtml = `<label class="sw" onclick="event.stopPropagation()">
-    <input type="checkbox" ${chk} onchange="toggleAsset('${asset}',this.checked)">
-    <div class="sw-track"></div>
-  </label>`;
+function renderArbDecisions() {
+  // aggregate stats across all assets for the current window
+  const agg = {};
+  let anyData = false, maxAge = 0;
+  ['BTC','ETH','SOL'].forEach(a => {
+    const st = S.arb[a]; if (!st) return;
+    if (st.window_age_s != null) maxAge = Math.max(maxAge, st.window_age_s);
+    const s = st.stats || {};
+    Object.keys(s).forEach(k => { agg[k] = (agg[k]||0) + s[k]; anyData = true; });
+  });
+  document.getElementById('arb-window-age').textContent =
+    anyData ? ('window age ' + maxAge + 's') : '';
+  const body = document.getElementById('arb-decisions-body');
 
-  const yA = s?.yes_ask, nA = s?.no_ask, yB = s?.yes_bid, nB = s?.no_bid;
-  const yHot = yA != null && yA >= 85 && yA < 95;
-  const nHot = nA != null && nA >= 85 && nA < 95;
-
-  let phaseNote = '';
-  if (!pos && elapsed != null && elapsed < 780) {
-    const rem = 780 - elapsed;
-    phaseNote = `entry in ${Math.floor(rem/60)}m ${Math.floor(rem%60)}s`;
-  }
-
+  // open positions first
   let posHtml = '';
-  if (pos) {
-    const currentBid = pos.side === 'yes' ? yB : nB;
-    const tp_target  = Math.max(85, pos.entry_price + 1);  // visual only; real is max(95, entry+1)
-    const tpReal     = Math.max(95, pos.entry_price + 1);
-    const unreal     = currentBid != null && pos.phase === 'holding'
-      ? (currentBid - pos.entry_price) * pos.count / 100 : null;
-    const distToTp   = currentBid != null ? tpReal - currentBid : null;
-    posHtml = `<div class="ms-pos">
-      <span class="ms-pos-side ${pos.side==='yes'?'up':'dn'}">${pos.side.toUpperCase()}@${pos.entry_price}¢×${pos.count}</span>
-      ${currentBid!=null?`<span class="ms-pos-bid">bid&nbsp;${currentBid}¢</span>`:''}
-      ${unreal!=null?`<span class="ms-pos-pnl ${unreal>=0?'pos':'neg'}">${unreal>=0?'+':''}$${Math.abs(unreal).toFixed(4)}</span>`:''}
-      ${distToTp!=null&&pos.phase==='holding'?`<span class="ms-pos-tp ${distToTp<=0?'ok':''}">TP@${tpReal}¢${distToTp>0?' ('+distToTp+'¢ away)':' ✓'}</span>`:''}
-      ${pos.hedge_price?`<span class="ms-pos-hedge">hedge&nbsp;${pos.side==='yes'?'NO':'YES'}@${pos.hedge_price}¢</span>`:''}
-    </div>`;
-  }
+  ['BTC','ETH','SOL'].forEach(a => {
+    const p = S.arb[a] && S.arb[a].position;
+    if (p) posHtml += `<div class="apos">${a} OPEN — <b>K ${p.kalshi_side?.toUpperCase()}@${p.kalshi_price}¢</b> + <b>P ${p.poly_side?.toUpperCase()}@${p.poly_price}¢</b> × ${(p.count||0).toFixed?p.count.toFixed(2):p.count} · exp ~${(p.expected_profit||0).toFixed(2)}¢/ct · ${p.phase}</div>`;
+  });
 
-  return `<div class="ms-card ${cardCls}">
-    <div class="ms-head">
-      ${swHtml}
-      <span class="ms-asset">${asset}</span>
-      <span class="ms-ticker">${(s?.ticker||'waiting…').slice(-22)}</span>
-      <span class="ms-timer${timerCls}">${timerLabel}</span>
-      <span class="ms-phase ${phaseClass}">${phase}</span>
-    </div>
-    <div class="ms-prices">
-      <div class="ms-pcol">
-        <div class="ms-plbl">YES ask</div>
-        <div class="ms-pval ${yHot?'hot':'up'}">${yA??'—'}<span style="font-size:10px;opacity:.45">¢</span></div>
-        <div class="ms-psub">bid&nbsp;<b>${yB!=null?yB+'¢':'—'}</b></div>
-      </div>
-      <div class="ms-pcol">
-        <div class="ms-plbl">NO ask</div>
-        <div class="ms-pval ${nHot?'hot':'dn'}">${nA??'—'}<span style="font-size:10px;opacity:.45">¢</span></div>
-        <div class="ms-psub">bid&nbsp;<b>${nB!=null?nB+'¢':'—'}</b></div>
-      </div>
-      <div class="ms-pcol">
-        <div class="ms-plbl">${phaseNote?'Entry':'Threshold'}</div>
-        <div class="ms-pval dim" style="font-size:12px">${phaseNote||'≥85¢ &lt;95¢'}</div>
-        <div class="ms-psub">TP&nbsp;<b>≥95¢</b></div>
-      </div>
-    </div>
-    ${posHtml}
-  </div>`;
+  if (!anyData && !posHtml) { body.innerHTML = '<div class="no-data">Waiting for arb evaluations…</div>'; return; }
+
+  const row = (key, name, sub, cls) => {
+    const v = agg[key] || 0;
+    const cc = v === 0 ? 'zero' : cls;
+    return `<div class="dec-row ${cls}"><div class="dec-name">${name} <small>${sub}</small></div>
+      <div class="dec-count ${cc}">${v}</div></div>`;
+  };
+  let html = posHtml;
+  html += '<div class="dec-section-lbl">Outcomes</div><div class="dec-grid">';
+  DEC_ORDER.forEach(([k,n,s,c]) => html += row(k,n,s,c));
+  html += '</div><div class="dec-section-lbl">Skips (why no trade)</div><div class="dec-grid">';
+  SKIP_ORDER.forEach(([k,n,s]) => html += row(k,n,s,'neutral'));
+  html += '</div>';
+  body.innerHTML = html;
 }
 
-// ── Markets row ───────────────────────────────────────────────────────────────
-function renderMarkets() {
-  document.getElementById('markets-row').innerHTML =
-    ['BTC','ETH','SOL'].map(renderMcard).join('');
-}
-
-function renderMcard(asset) {
-  const s   = S.snapshots[asset];
-  const chk = S.enabledAssets.includes(asset) ? 'checked' : '';
-  const t   = S.assetTimers[asset];
-  const rawSecs = t
-    ? Math.max(0, t.secsLeft - (performance.now() - t.capturedAt)/1000)
-    : (s?.secs_left ?? null);
-  let timerLabel = s ? 'No mkt' : '—', timerCls = '';
-  if (rawSecs != null) {
-    if (rawSecs >= 3600) timerLabel = Math.floor(rawSecs/3600)+'h '+Math.floor(rawSecs%3600/60)+'m';
-    else if (rawSecs >= 60) timerLabel = Math.floor(rawSecs/60)+'m '+Math.floor(rawSecs%60)+'s';
-    else { timerLabel = Math.floor(rawSecs)+'s'; timerCls = rawSecs < 10 ? ' crit' : ' warn'; }
-  }
-  const swHtml = `<label class="sw" onclick="event.stopPropagation()">
-    <input type="checkbox" ${chk} onchange="toggleAsset('${asset}',this.checked)">
-    <div class="sw-track"></div>
-  </label>`;
-  if (!s) return `<div class="mcard"><div class="mcard-top">${swHtml}
-    <span class="masset">${asset}</span><span class="mticker">Waiting…</span>
-    <span class="mtimer${timerCls}" id="mtimer-${asset}">${timerLabel}</span></div>
-    <div style="font-size:10px;color:var(--muted)">No market data</div></div>`;
-  const yA = s.yes_ask, nA = s.no_ask, yB = s.yes_bid, nB = s.no_bid;
-  const elapsed = rawSecs != null ? 900 - rawSecs : null;
-  const inWindow = elapsed != null && elapsed >= 780 && elapsed <= 840;
-  const yHot = inWindow && yA != null && yA >= 85 && yA < 95;
-  const nHot = inWindow && nA != null && nA >= 85 && nA < 95;
-  return `<div class="mcard" id="mcard-${asset}">
-    <div class="mcard-top">${swHtml}
-      <span class="masset">${asset}</span>
-      <span class="mticker">${(s.ticker||'').slice(-22)}</span>
-      <span class="mtimer${timerCls}" id="mtimer-${asset}">${timerLabel}</span>
-    </div>
-    <div class="mcard-prices">
-      <div class="mprice-col">
-        <div class="mprice-lbl">YES ask</div>
-        <div class="mprice-ask ${yHot?'hot':'up'}">${yA??'—'}<span style="font-size:11px;opacity:.45">¢</span></div>
-        <div class="mprice-sub">bid <b>${yB!=null?yB+'¢':'—'}</b></div>
-      </div>
-      <div class="mprice-col">
-        <div class="mprice-lbl">NO ask</div>
-        <div class="mprice-ask ${nHot?'hot':'dn'}">${nA??'—'}<span style="font-size:11px;opacity:.45">¢</span></div>
-        <div class="mprice-sub">bid <b>${nB!=null?nB+'¢':'—'}</b></div>
-      </div>
-      <div class="mprice-col">
-        <div class="mprice-lbl">Mid</div>
-        <div class="mprice-ask up">${s.mid!=null?s.mid.toFixed(1):'—'}<span style="font-size:11px;opacity:.45">¢</span></div>
-        <div class="mprice-sub">window <b>${elapsed!=null?Math.floor(elapsed/60)+'m '+Math.floor(elapsed%60)+'s':'—'}</b></div>
-      </div>
-    </div>
-  </div>`;
+// poll arb state (arb data isn't on the SSE stream)
+async function refreshArb() {
+  try {
+    const r = await fetch('/api/arb');
+    const d = await r.json();
+    if (!d.arb_enabled) return;
+    S.arb = d.assets || {};
+    S.arbCfg = d.config;
+    S.arbHalted = d.halted;
+    S.arbHaltReason = d.halt_reason;
+    S.lastPriceTs = Date.now();
+    renderArbConfig(); renderHalt(); renderArbCards(); renderArbDecisions();
+  } catch(e) {}
 }
 
 async function toggleAsset(asset, enabled) {
@@ -856,6 +933,7 @@ async function toggleAsset(asset, enabled) {
     body: JSON.stringify({asset, enabled})
   });
 }
+
 
 // ── Stats bar ─────────────────────────────────────────────────────────────────
 function updateStats() {
@@ -882,26 +960,10 @@ setInterval(() => {
   document.getElementById('data-label').textContent = fresh ? 'Live' : 'No data';
 }, 1000);
 
-setInterval(() => {
-  ['BTC','ETH','SOL'].forEach(a => {
-    const t  = S.assetTimers[a];
-    if (!t) return;
-    const secs = Math.max(0, t.secsLeft - (performance.now() - t.capturedAt) / 1000);
-    const el   = document.getElementById('mtimer-' + a);
-    if (!el) return;
-    let label = '', cls = '';
-    if      (secs >= 3600) { label = Math.floor(secs/3600)+'h '+Math.floor(secs%3600/60)+'m'; }
-    else if (secs >=   60) { label = Math.floor(secs/60)+'m '+Math.floor(secs%60)+'s'; }
-    else if (secs >    0)  { label = Math.floor(secs)+'s'; cls = secs < 10 ? ' crit' : ' warn'; }
-    else                   { label = 'Expired'; cls = ' crit'; }
-    el.textContent = label;
-    el.className   = 'mtimer' + cls;
-  });
-}, 100);
-
 // ── Trade history ─────────────────────────────────────────────────────────────
 async function refreshTrades() {
-  const d   = await fetch('/api/trades').then(r => r.json()).catch(() => ({trades:[]}));
+  const url = '/api/trades' + (S.tradesShowAll ? '?all=1' : '');
+  const d   = await fetch(url).then(r => r.json()).catch(() => ({trades:[]}));
   const pos = await fetch('/api/positions').then(r => r.json()).catch(() => ({}));
   renderTrades(d.trades || []);
   const pnl = pos.realised_pnl || 0;
@@ -910,21 +972,42 @@ async function refreshTrades() {
   document.getElementById('h-fills').textContent = pos.total_fills || 0;
 }
 
+function toggleTradesAll() {
+  S.tradesShowAll = !S.tradesShowAll;
+  document.getElementById('trades-toggle-btn').textContent =
+    S.tradesShowAll ? 'Hide skips' : 'Show skips';
+  refreshTrades();
+}
+
 function renderTrades(trades) {
   const body = document.getElementById('trades-body');
-  if (!trades.length) { body.innerHTML = '<div class="no-data">No trades yet</div>'; return; }
-  body.innerHTML = trades.slice(0, 60).map(t => {
-    const isEntry  = t.type === 'momentum_entry';
-    const isTP     = t.type === 'momentum_tp';
-    const isHedge  = t.type === 'momentum_hedge';
-    const isDry    = t.dry_run;
-    const bc       = isDry ? 'dry' : (isTP ? 'live' : (isHedge ? 'live' : 'live'));
-    const lbl      = isDry ? 'DRY' : (isEntry ? 'ENTRY' : isTP ? 'TP' : isHedge ? 'HEDGE' : 'TRADE');
-    let det = '';
-    if (isEntry) det = `${t.asset} ${(t.side||'').toUpperCase()} @ ${t.price}¢ × ${t.count}`;
-    else if (isTP) det = `${t.asset} SOLD ${(t.side||'').toUpperCase()} @ ${t.sell_price}¢ (entry ${t.entry_price}¢)`;
-    else if (isHedge) det = `${t.asset} HEDGE ${(t.hedge_side||'').toUpperCase()} @ ${t.hedge_price}¢`;
-    else det = `${t.asset||''} ${JSON.stringify(t).slice(0,60)}`;
+  if (!trades.length) {
+    body.innerHTML = '<div class="no-data">' +
+      (S.tradesShowAll ? 'No trade-log rows yet' : 'No trades yet (skips hidden — toggle ALL to see decisions)') +
+      '</div>';
+    return;
+  }
+  body.innerHTML = trades.slice(0, 80).map(t => {
+    const ty = t.type || '';
+    let bc = 'live', lbl = 'TRADE', det = '';
+    if (ty === 'arb_entry') {
+      bc = 'ok'; lbl = 'ENTER';
+      det = `${t.asset} K-${(t.kalshi_side||'').toUpperCase()}@${t.kalshi_price}¢ + P-${(t.poly_side||'').toUpperCase()}@${t.poly_price}¢ ×${t.count} · comb ${t.combined_cost}¢`;
+    } else if (ty === 'arb_unwind') {
+      bc = t.fully_unwound ? 'warn' : 'err'; lbl = 'UNWIND';
+      det = `${t.asset} ${t.fully_unwound?'flat':'PARTIAL'} · P sold ${t.poly_sold}/${t.poly_filled}` + (t.kalshi_filled ? ` · K sold ${t.kalshi_sold}/${t.kalshi_filled}` : '');
+    } else if (ty === 'arb_poly_miss') {
+      bc = 'dry'; lbl = 'P-MISS';
+      det = `${t.asset} P-${(t.p_side||'').toUpperCase()}@${t.poly_order_price}¢ no fill · ${t.poly_latency_ms}ms`;
+    } else if (ty === 'arb_ev_abort') {
+      bc = 'dry'; lbl = 'EV-ABORT';
+      det = `${t.asset} edge gone · det ${t.detection_net}¢ → exec ${t.execution_net}¢`;
+    } else if (ty === 'arb_attempt') {
+      bc = 'dry'; lbl = 'SKIP';
+      det = `${t.asset} ${(t.reason||'').replace(/_/g,' ')} · K-${(t.k_side||'').toUpperCase()}@${t.k_price}¢ + P@${t.p_price}¢`;
+    } else {
+      det = `${t.asset||''} ${ty}`;
+    }
     const pnlStr = t.pnl != null
       ? `<span class="trade-pnl">${t.pnl>=0?'+':''}$${Math.abs(t.pnl).toFixed(4)}</span>` : '';
     return `<div class="trade-row">
@@ -947,6 +1030,13 @@ function addLog(e) {
     + `<span class="le-msg ${cls}">${esc(e.msg||'')}</span>`;
   body.insertBefore(d, body.firstChild);
   while (body.children.length > 150) body.removeChild(body.lastChild);
+}
+
+function clearLog() {
+  // Wipe the on-screen event log only. The server keeps the full history in
+  // bot_run.log / trades.jsonl — this just declutters the live view.
+  const body = document.getElementById('log-body');
+  if (body) body.innerHTML = '';
 }
 
 function toggleLog() {
@@ -1012,11 +1102,10 @@ function esc(s) {
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 updateMode();
-renderMarkets();
-renderMomentumRow();
-renderMomentumStatus();
+refreshArb();
 connectSSE();
 setInterval(refreshTrades, 5000);
+setInterval(refreshArb, 1500);   // arb state isn't on the SSE stream — poll it
 </script>
 </body>
 </html>"""
@@ -1044,6 +1133,7 @@ if __name__ == "__main__":
         BOT_STATE["demo"]    = True
 
     print(f"  Dashboard → http://localhost:5001")
+    print(f"  Strategy: {STRATEGY.upper()}")
     print(f"  Mode: {'DEMO' if BOT_STATE['demo'] else 'LIVE'}  |  {'DRY RUN' if BOT_STATE['dry_run'] else 'REAL ORDERS'}\n")
 
     _start_bot()

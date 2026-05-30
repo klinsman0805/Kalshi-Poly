@@ -23,6 +23,18 @@ import requests
 from requests.adapters import HTTPAdapter
 import websocket
 
+# Force IPv4 for all outbound HTTP. Polymarket resolves to both IPv4 and IPv6
+# (Cloudflare); this environment has no working IPv6 route, so requests/urllib3
+# try IPv6 first and HANG ~40-100s until timeout before falling back. This was
+# the true cause of the "Poly feed dead / WS silent / no arb fills" symptoms —
+# curl was fast (Happy Eyeballs) while Python stalled. Pinning AF_INET fixes it.
+import socket as _socket
+try:
+    import urllib3.util.connection as _u3conn
+    _u3conn.allowed_gai_family = lambda: _socket.AF_INET
+except Exception:
+    pass
+
 try:
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding
