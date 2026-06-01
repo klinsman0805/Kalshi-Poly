@@ -130,7 +130,14 @@ ARB_STRIKE_BUFFER_PCT = float(os.getenv("ARB_STRIKE_BUFFER_PCT", "0.15"))
 # Early-exit: in the last N seconds, if price has drifted to within this % of the
 # strike (the danger zone), sell BOTH legs rather than hold into a risky
 # resolution. 0 disables early-exit (hold to resolution).
-ARB_EXIT_BUFFER_PCT   = float(os.getenv("ARB_EXIT_BUFFER_PCT", "0.05"))
+#
+# DISABLED by default (2026-06-01): early-exit must sell into the SAME thin
+# near-expiry liquidity it's trying to escape, so the Poly FAK sell often only
+# partially fills — leaving a worse-hedged residual tail than just holding, plus
+# tripping the kill-switch. Decision: once both legs are filled, HOLD to
+# resolution. The strike-distance ENTRY gate already keeps us out of the
+# danger zone in the first place; that's where basis risk is controlled.
+ARB_EXIT_BUFFER_PCT   = float(os.getenv("ARB_EXIT_BUFFER_PCT", "0"))
 ARB_EXIT_WINDOW_SECS  = float(os.getenv("ARB_EXIT_WINDOW_SECS", "90"))
 
 TRADES_FILE = Path(os.getenv("TRADES_FILE", "trades.jsonl"))

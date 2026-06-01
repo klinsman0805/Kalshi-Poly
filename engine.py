@@ -400,6 +400,7 @@ class BotEngine:
         self._ws: Optional[websocket.WebSocketApp] = None
         self._ws_msg_id  = 0
         self.update_count = 0
+        self._strike_refetch_ts: dict = {}   # asset -> last strike refetch attempt
 
     # ── Public ────────────────────────────────────────────────────────────────
 
@@ -547,6 +548,28 @@ class BotEngine:
         if asset:
             self._compute_and_push(asset)
 
+    def _refetch_strike(self, asset: str, ticker: str):
+        """
+        Fetch floor_strike for one market and cache it back into self.markets.
+        Throttled to once / 5s per asset so a persistently-null strike doesn't
+        hammer the API. No-op once the strike is populated.
+        """
+        now = time.time()
+        if now - self._strike_refetch_ts.get(asset, 0.0) < 5.0:
+            return
+        self._strike_refetch_ts[asset] = now
+        try:
+            data = kalshi_get_public(f"/markets/{ticker}")
+            strike = (data.get("market") or {}).get("floor_strike")
+            if strike is not None:
+                with self._lock:
+                    mkt = self.markets.get(asset)
+                    if mkt and mkt["ticker"] == ticker:
+                        mkt["floor_strike"] = strike
+                self.on_log("✓", f"{asset} floor_strike backfilled: {strike}")
+        except Exception as e:
+            log.debug("strike refetch %s: %s", asset, e)
+
     def _compute_and_push(self, asset: str):
         with self._lock:
             mkt  = self.markets.get(asset)
@@ -557,7 +580,18 @@ class BotEngine:
                 (datetime.fromisoformat(mkt["close_time"].replace("Z", "+00:00"))
                  - datetime.now(timezone.utc)).total_seconds()
             ))
-            snap = MarketSnapshot(asset, mkt["ticker"], book, mkt["window_ts"], secs_left,
+            ticker = mkt["ticker"]
+        # Lazily backfill floor_strike: Kalshi leaves it null while a market is
+        # "initialized" and only sets it once active, so a market discovered
+        # pre-open caches strike=None and the arb gate fails closed forever.
+        # Re-fetch (throttled, outside the lock) until we have it.
+        if mkt.get("floor_strike") is None:
+            self._refetch_strike(asset, ticker)
+        with self._lock:
+            mkt = self.markets.get(asset)  # re-read (may have been updated)
+            if not mkt or mkt["ticker"] != ticker:
+                return
+            snap = MarketSnapshot(asset, ticker, book, mkt["window_ts"], secs_left,
                                   floor_strike=mkt.get("floor_strike"))
             self._snapshots[asset] = snap
             prev    = self._last_pushed.get(asset)
