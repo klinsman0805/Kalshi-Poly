@@ -647,7 +647,9 @@ class PolyClient:
             return 0.0
 
         try:
-            from py_clob_client_v2.clob_types import OrderArgs, OrderType
+            from py_clob_client_v2.clob_types import (
+                OrderArgs, OrderType, BalanceAllowanceParams, AssetType,
+            )
             from py_clob_client_v2.order_builder.constants import SELL
         except ImportError:
             log.error("py-clob-client-v2 not installed")
@@ -660,26 +662,60 @@ class PolyClient:
             log.warning("Poly unwind: size %.4f rounds to 0 shares — nothing to sell", size)
             return 0.0
 
-        try:
-            # SELL limit @1¢ + FAK: crosses any bid, takes all available now,
-            # kills the rest. Never all-or-nothing.
+        def _submit_sell():
             args   = OrderArgs(price=0.01, size=sell_size, side=SELL, token_id=token_id)
             signed = self._clob.create_order(args)
             resp   = self._clob.post_order(signed, OrderType.FAK)
-            sold   = self._filled_shares(resp, sell_size)
-            if sold < sell_size:
-                log.error(
-                    "Poly UNWIND PARTIAL token=...%s sold=%s/%s — STILL NAKED on remainder!",
-                    token_id[-6:], sold, sell_size,
-                )
-            else:
-                log.info("Poly unwind sell token=...%s x%s → sold=%s",
-                         token_id[-6:], sell_size, sold)
-            return sold
+            return self._filled_shares(resp, sell_size)
+
+        try:
+            # SELL limit @1¢ + FAK: crosses any bid, takes all available now,
+            # kills the rest. Never all-or-nothing.
+            sold = _submit_sell()
         except Exception as e:
-            log.error("Poly unwind sell error token=...%s x%s: %s — POSITION STILL NAKED",
-                      token_id[-6:], sell_size, e)
-            return 0.0
+            # The CLOB's balance ledger can lag a successful FOK buy by 1–3 s
+            # (matching engine confirms fill instantly; ERC-1155 transfer + indexer
+            # take a few seconds). The unwind path always fires inside this gap.
+            # Distinguish race from real failure by polling the balance directly —
+            # only retry if/when the ledger confirms the shares are actually there.
+            # Real config/allowance/settlement failures keep balance at 0 across
+            # all probes and fall through to the halt below.
+            need_units = sell_size * 1_000_000  # shares → 6-dec units
+            sold = 0.0
+            for wait in (0.5, 1.0, 2.0):  # total ≤3.5 s before giving up
+                time.sleep(wait)
+                try:
+                    bal = self._clob.get_balance_allowance(
+                        BalanceAllowanceParams(
+                            asset_type=AssetType.CONDITIONAL, token_id=token_id,
+                        )
+                    )
+                    if int(bal.get("balance", 0)) < need_units:
+                        continue
+                    sold = _submit_sell()
+                    log.warning(
+                        "Poly unwind retry succeeded after %.1fs ledger lag — "
+                        "token=...%s sold=%s", wait, token_id[-6:], sold,
+                    )
+                    break
+                except Exception as e2:
+                    log.debug("Unwind retry probe failed: %s", e2)
+            if sold == 0.0:
+                log.error(
+                    "Poly unwind sell error token=...%s x%s: %s — POSITION STILL NAKED",
+                    token_id[-6:], sell_size, e,
+                )
+                return 0.0
+
+        if sold < sell_size:
+            log.error(
+                "Poly UNWIND PARTIAL token=...%s sold=%s/%s — STILL NAKED on remainder!",
+                token_id[-6:], sold, sell_size,
+            )
+        else:
+            log.info("Poly unwind sell token=...%s x%s → sold=%s",
+                     token_id[-6:], sell_size, sold)
+        return sold
 
     # ── Market data ──────────────────────────────────────────────────────────
 
