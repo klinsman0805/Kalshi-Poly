@@ -86,6 +86,15 @@ ARB_KALSHI_SLIPPAGE = int(os.getenv("ARB_KALSHI_SLIPPAGE", "2"))
 # sub-share remainder as "dust" — too small to be worth unwinding or halting on.
 ARB_DUST_SHARES = float(os.getenv("ARB_DUST_SHARES", "1.0"))
 
+# Naked Poly exposure ≤ this USD amount is HELD to resolution instead of being
+# sold via FAK. Auto-redeems on market settlement. Trades selling complexity
+# (race vs. balance ledger, thin-book partials, CRITICAL halts) for bounded
+# directional risk over a ≤15-min window. Two 2026-06-02 incidents (~$1–$3
+# each) cost more in halts than the held variance would have. Set to 0 to
+# always sell (legacy behavior). Threshold is on the buy-side cost basis,
+# not mark-to-market, so it never depends on a live quote at unwind time.
+ARB_POLY_HOLD_NAKED_USD = float(os.getenv("ARB_POLY_HOLD_NAKED_USD", "10"))
+
 # ── Global kill-switch ─────────────────────────────────────────────────────────
 # Set True after any failed/partial unwind. While set, NO new arb fires on ANY
 # asset — one unwind bug must not be able to bleed repeatedly. Cleared only by
@@ -904,6 +913,16 @@ class ArbTrader:
         unwind_start = time.time()
         k_sold: float = 0.0
         p_sold: float = 0.0
+        poly_held: bool = False
+
+        # Hold-to-resolution check: small naked Poly legs auto-redeem at market
+        # settlement; selling them via FAK introduces failure modes (ledger
+        # race, thin-book partials) that have cost more than the held
+        # directional risk would have over a ≤15-min window.
+        poly_exposure_usd = (p_filled * (poly_buy_price or 0)) / 100.0
+        if (p_filled > 0 and poly_buy_price is not None
+                and poly_exposure_usd <= ARB_POLY_HOLD_NAKED_USD):
+            poly_held = True
 
         def do_k_sell():
             nonlocal k_sold
@@ -916,7 +935,7 @@ class ArbTrader:
         threads = []
         if k_filled > 0:
             threads.append(threading.Thread(target=do_k_sell, daemon=True))
-        if p_filled > 0:
+        if p_filled > 0 and not poly_held:
             threads.append(threading.Thread(target=do_p_sell, daemon=True))
 
         for t in threads:
@@ -932,14 +951,22 @@ class ArbTrader:
         if k_filled > 0:
             parts.append(f"K-{k_side.upper()} sold={k_sold}/{k_filled}")
         if p_filled > 0:
-            parts.append(f"P-{p_side.upper()} sold={p_sold}/{p_filled}")
+            if poly_held:
+                parts.append(f"P-{p_side.upper()} HELD={p_filled} "
+                             f"(${poly_exposure_usd:.2f} ≤ ${ARB_POLY_HOLD_NAKED_USD:.2f})")
+            else:
+                parts.append(f"P-{p_side.upper()} sold={p_sold}/{p_filled}")
 
         # "ok" = remaining unsold exposure on each leg is within dust tolerance.
         # FAK sells whole shares only, so a fractional remainder ≤ ARB_DUST_SHARES
-        # is expected and acceptable — it must NOT trip the kill-switch.
+        # is expected and acceptable — it must NOT trip the kill-switch. A leg
+        # we intentionally HELD to resolution is also acceptable (the position
+        # auto-redeems at market close).
         k_remaining = k_filled - k_sold
         p_remaining = p_filled - p_sold
-        ok = (k_remaining <= ARB_DUST_SHARES) and (p_remaining <= ARB_DUST_SHARES)
+        ok = (k_remaining <= ARB_DUST_SHARES) and (
+            poly_held or p_remaining <= ARB_DUST_SHARES
+        )
         self._on_log(
             "🔄" if ok else "⚠",
             f"ARB {self.asset} UNWIND: {' | '.join(parts)} "
@@ -977,6 +1004,8 @@ class ArbTrader:
             "poly_token_id": p_token,
             "poly_filled":   p_filled,
             "poly_sold":     p_sold,
+            "poly_held_to_resolution": poly_held,
+            "poly_exposure_usd": round(poly_exposure_usd, 4),
             "poly_buy_price": poly_buy_price,
             "implied_unwind_bid": implied_unwind_bid,
             "fee_bps":       fee_bps,
