@@ -132,10 +132,24 @@ ARB_STATS_INTERVAL   = float(os.getenv("ARB_STATS_INTERVAL",   "60"))
 # Only trade these assets (BTC excluded for now — costliest miss, widest dead-zone).
 ARB_ASSETS = [a.strip().upper() for a in
               os.getenv("ARB_ASSETS", "ETH,SOL").split(",") if a.strip()]
-# Entry gate: skip if |spot − Kalshi strike| < this % of spot. Set ABOVE the
-# historical 0.05% because we gate on the ENTRY price, not the final — the price
-# can still drift toward the strike before resolution, so we need headroom.
-ARB_STRIKE_BUFFER_PCT = float(os.getenv("ARB_STRIKE_BUFFER_PCT", "0.15"))
+# Entry gate: skip if |spot − Kalshi strike| < this % of spot.
+#
+# This is the percentage safeguard against the venue-disagreement / opposite-
+# resolution risk. The two venues use DIFFERENT "price to beat" strikes and feeds:
+# Kalshi publishes floor_strike; Polymarket's strike is the underlying captured at
+# window open from Chainlink — a number Poly NEVER sends over its feed (we only
+# receive odds), so we cannot read Poly's strike to measure the cross-venue gap
+# directly. Instead we gate on distance from the strike we DO trust (Kalshi's): if
+# spot is within X% of it, the resolution price could plausibly land between the
+# two strikes (which differ by the cross-feed offset, ~$0.30 on ETH) and resolve
+# the legs oppositely → total loss on both.
+#
+# The % auto-scales per asset, which matters: at 0.20%, ETH≈$3.57 but SOL≈$0.28 —
+# SOL is the tightest because of its low price, so the % must stay safe for SOL.
+# Raised 0.15→0.20 (2026-06-04) after repeated near-strike opposite-resolution
+# losses; gated on ENTRY only (no early-exit), so headroom also absorbs post-entry
+# drift toward the strike before resolution.
+ARB_STRIKE_BUFFER_PCT = float(os.getenv("ARB_STRIKE_BUFFER_PCT", "0.20"))
 # Early-exit: in the last N seconds, if price has drifted to within this % of the
 # strike (the danger zone), sell BOTH legs rather than hold into a risky
 # resolution. 0 disables early-exit (hold to resolution).
@@ -362,6 +376,9 @@ class ArbTrader:
         self._on_log = on_log or (lambda ic, msg: log.info("[%s] %s", ic, msg))
 
         self._position: Optional[ArbPosition] = None
+        # In-flight guard: True only while an _execute() thread is running, so two
+        # ticks can't fire concurrently. Cleared after each entry/abort/miss so the
+        # trader can place MULTIPLE orders within one window (re-arm).
         self._attempted  = False
         self._last_attempt_ts: float = 0.0
         self._market_info: Optional[PolyMarketInfo] = None
@@ -555,15 +572,19 @@ class ArbTrader:
         if self.asset.upper() not in ARB_ASSETS:
             return
 
-        # If we already hold a position, the only thing to do is check whether to
-        # EARLY-EXIT it (price drifting into the danger zone near expiry). This
-        # runs before the position short-circuit below.
+        # If we already hold a position, first check whether to EARLY-EXIT it
+        # (price drifting into the danger zone near expiry). Unlike before, we do
+        # NOT return here: multiple orders per window are allowed, so after an
+        # entry the trader may fire AGAIN if a fresh arb appears. The previously
+        # filled legs are held to resolution (see light multi-order scope).
         if self._position is not None:
             self._maybe_early_exit(kalshi_snap)
-            return
 
         with self._lock:
-            if self._attempted or self._position is not None:
+            # In-flight guard only: block while an _execute() thread is running so
+            # two ticks can't fire concurrently. It is cleared after each
+            # entry/abort/miss, so this no longer locks out the rest of the window.
+            if self._attempted:
                 return
             if time.time() - self._last_attempt_ts < ARB_ORDER_COOLDOWN:
                 return
@@ -1204,6 +1225,12 @@ class ArbTrader:
         )
         with self._lock:
             self._position = pos
+            # Re-arm: clear the in-flight guard so the trader can place ANOTHER
+            # order later in this window if a fresh arb appears (multiple orders
+            # per window). The previously filled legs are held to resolution; a
+            # new entry overwrites self._position (light multi-order scope).
+            self._attempted = False
+            self._last_attempt_ts = time.time()
         self._stats["entries"] += 1
 
         _log_trade({
