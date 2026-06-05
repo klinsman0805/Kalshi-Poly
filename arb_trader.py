@@ -61,7 +61,10 @@ from typing import Optional, Dict, List
 from engine import (
     MarketSnapshot, _auth_headers, API_BASE, SESSION, ORDER_TIMEOUT, DRY_RUN,
 )
-from polymarket import PolyClient, PolySnap, PolyMarketInfo, get_market_for_window
+from polymarket import (
+    PolyClient, PolySnap, PolyMarketInfo, get_market_for_window,
+    _UNWIND_MAX_ATTEMPTS, _UNWIND_ATTEMPT_DELAY,
+)
 
 log = logging.getLogger("kalshi.arb")
 
@@ -108,16 +111,11 @@ ARB_DUST_SHARES = float(os.getenv("ARB_DUST_SHARES", "1.0"))
 #
 # DEFAULT 0 (2026-06-05, by user decision): ALWAYS unwind a naked Poly leg when
 # Kalshi misses — never hold a directional position to resolution. We accept the
-# sell-side risks (ledger race, thin-book partials) the hold policy avoided;
-# partial unwinds now RETRY (ARB_UNWIND_RETRIES) and then log+continue rather
-# than halt. Set >0 to re-enable holding small legs.
+# sell-side risks (ledger race, thin-book partials) the hold policy avoided. The
+# unwind sell itself is balance-aware and retries internally (see place_sell_fok
+# / POLY_UNWIND_MAX_ATTEMPTS); an incomplete unwind logs + continues (no halt).
+# Set >0 to re-enable holding small legs.
 ARB_POLY_HOLD_NAKED_USD = float(os.getenv("ARB_POLY_HOLD_NAKED_USD", "0"))
-# How many extra times to retry selling a naked Poly leg that only PARTIALLY
-# unwound (thin near-expiry book). Each retry re-sends a FAK sell for the
-# remaining shares. After the last retry, residual dust is logged and trading
-# CONTINUES (no kill-switch halt) — by user decision 2026-06-05.
-ARB_UNWIND_RETRIES = int(os.getenv("ARB_UNWIND_RETRIES", "3"))
-ARB_UNWIND_RETRY_DELAY = float(os.getenv("ARB_UNWIND_RETRY_DELAY", "1.0"))
 
 # ── Global kill-switch ─────────────────────────────────────────────────────────
 # Set True after any failed/partial unwind. While set, NO new arb fires on ANY
@@ -1091,27 +1089,14 @@ class ArbTrader:
 
         for t in threads:
             t.start()
+        # place_sell_fok runs a balance-aware retry loop internally (re-reads held
+        # shares each attempt, absorbing ledger-lag / thin-book partials / settling
+        # locks), so give it enough time to finish rather than retrying here too —
+        # double-retry caused the 400-thrash where we sold a 'remainder' the
+        # exchange still had locked as matched.
+        unwind_join_timeout = 5.0 + _UNWIND_MAX_ATTEMPTS * _UNWIND_ATTEMPT_DELAY
         for t in threads:
-            t.join(timeout=5.0)
-
-        # Retry partial Poly unwinds: place_sell_fok already handles the ledger-lag
-        # race internally, but a thin near-expiry book can leave the sell only
-        # partially filled (sold < held) with no error. Re-send a FAK sell for the
-        # remaining whole shares a few times before giving up. (Always-unwind policy
-        # by user decision — we never hold a naked directional leg to resolution.)
-        if p_filled > 0 and not poly_held:
-            for attempt in range(1, ARB_UNWIND_RETRIES + 1):
-                p_remaining_now = p_filled - p_sold
-                if p_remaining_now <= ARB_DUST_SHARES:
-                    break
-                time.sleep(ARB_UNWIND_RETRY_DELAY)
-                more = self._poly.place_sell_fok(p_token, p_remaining_now, fee_bps)
-                p_sold += more
-                self._on_log("🔁", (
-                    f"ARB {self.asset} naked-unwind retry {attempt}/"
-                    f"{ARB_UNWIND_RETRIES}: sold {more} more "
-                    f"({p_filled - p_sold:.2f} still naked)"
-                ))
+            t.join(timeout=unwind_join_timeout)
 
         unwind_ms = int((time.time() - unwind_start) * 1000)
         naked_ms  = (int((time.time() - naked_since_ts) * 1000)
@@ -1150,8 +1135,8 @@ class ArbTrader:
             # at resolution and shouldn't stop the bot. The residual is recorded in
             # the arb_unwind trade-log row (fully_unwound=false) for manual review.
             self._on_log("⚠", (
-                f"ARB {self.asset} unwind INCOMPLETE after {ARB_UNWIND_RETRIES} "
-                f"retries — K sold {k_sold}/{k_filled}, P sold {p_sold}/{p_filled}. "
+                f"ARB {self.asset} unwind INCOMPLETE after balance-aware retries "
+                f"— K sold {k_sold}/{k_filled}, P sold {p_sold}/{p_filled}. "
                 f"Residual naked ~{p_remaining:.2f} shares left to resolution; "
                 f"NOT halting (inspect/redeem manually)."
             ))

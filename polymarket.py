@@ -90,6 +90,13 @@ POLY_WS    = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 # within the arb staleness gate's acceptance window.
 POLY_RESEED_INTERVAL = float(os.getenv("POLY_RESEED_INTERVAL", "2.0"))
 
+# Naked-leg unwind: balance-aware FAK sell. Each attempt re-reads the actual held
+# balance and sells exactly that, so it absorbs ledger-lag (held grows once the
+# buy settles), thin-book partials (sell the true remainder), and matched/settling
+# locks (stop when held hits 0). Total wall time ≈ MAX_ATTEMPTS × ATTEMPT_DELAY.
+_UNWIND_MAX_ATTEMPTS = int(os.getenv("POLY_UNWIND_MAX_ATTEMPTS", "5"))
+_UNWIND_ATTEMPT_DELAY = float(os.getenv("POLY_UNWIND_ATTEMPT_DELAY", "1.0"))
+
 # Polygon mainnet CTF Exchange contract (neg_risk=false markets)
 CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 
@@ -657,6 +664,29 @@ class PolyClient:
                       token_id[-6:], price_cents, e)
             return 0.0
 
+    def _held_shares(self, token_id: str) -> Optional[float]:
+        """
+        Actual conditional-token balance we hold for `token_id`, in whole shares
+        (Poly reports 6-decimal units). Returns None if the balance can't be read
+        (so the caller can fall back rather than assume zero). This is the source
+        of truth for how many shares are ACTUALLY sellable right now — avoids the
+        retry-thrash where we try to sell a 'remainder' the exchange still has
+        locked as matched/settling from a prior sell.
+        """
+        if self._clob is None:
+            return None
+        try:
+            from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+            bal = self._clob.get_balance_allowance(
+                BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL, token_id=token_id,
+                )
+            )
+            return int(bal.get("balance", 0)) / 1_000_000.0
+        except Exception as e:
+            log.debug("balance read failed token=...%s: %s", token_id[-6:], e)
+            return None
+
     def place_sell_fok(self, token_id: str, size: float, fee_bps: int) -> float:
         """
         Emergency unwind sell of `size` shares at any available bid via CLOB v2.
@@ -678,9 +708,7 @@ class PolyClient:
             return 0.0
 
         try:
-            from py_clob_client_v2.clob_types import (
-                OrderArgs, OrderType, BalanceAllowanceParams, AssetType,
-            )
+            from py_clob_client_v2.clob_types import OrderArgs, OrderType
             from py_clob_client_v2.order_builder.constants import SELL
         except ImportError:
             log.error("py-clob-client-v2 not installed")
@@ -688,64 +716,82 @@ class PolyClient:
 
         # Polymarket order size is whole shares; round DOWN so we never try to
         # sell more than we hold (a 5.55 fill means 5 sellable whole shares).
-        sell_size = int(size)
-        if sell_size <= 0:
+        want = int(size)
+        if want <= 0:
             log.warning("Poly unwind: size %.4f rounds to 0 shares — nothing to sell", size)
             return 0.0
 
-        def _submit_sell():
-            args   = OrderArgs(price=0.01, size=sell_size, side=SELL, token_id=token_id)
+        def _submit_sell(sz: int) -> float:
+            args   = OrderArgs(price=0.01, size=sz, side=SELL, token_id=token_id)
             signed = self._clob.create_order(args)
             resp   = self._clob.post_order(signed, OrderType.FAK)
-            return self._filled_shares(resp, sell_size)
+            return self._filled_shares(resp, sz)
 
-        try:
-            # SELL limit @1¢ + FAK: crosses any bid, takes all available now,
-            # kills the rest. Never all-or-nothing.
-            sold = _submit_sell()
-        except Exception as e:
-            # The CLOB's balance ledger can lag a successful FOK buy by 1–3 s
-            # (matching engine confirms fill instantly; ERC-1155 transfer + indexer
-            # take a few seconds). The unwind path always fires inside this gap.
-            # Distinguish race from real failure by polling the balance directly —
-            # only retry if/when the ledger confirms the shares are actually there.
-            # Real config/allowance/settlement failures keep balance at 0 across
-            # all probes and fall through to the halt below.
-            need_units = sell_size * 1_000_000  # shares → 6-dec units
-            sold = 0.0
-            for wait in (0.5, 1.0, 2.0):  # total ≤3.5 s before giving up
-                time.sleep(wait)
-                try:
-                    bal = self._clob.get_balance_allowance(
-                        BalanceAllowanceParams(
-                            asset_type=AssetType.CONDITIONAL, token_id=token_id,
-                        )
-                    )
-                    if int(bal.get("balance", 0)) < need_units:
-                        continue
-                    sold = _submit_sell()
-                    log.warning(
-                        "Poly unwind retry succeeded after %.1fs ledger lag — "
-                        "token=...%s sold=%s", wait, token_id[-6:], sold,
-                    )
-                    break
-                except Exception as e2:
-                    log.debug("Unwind retry probe failed: %s", e2)
-            if sold == 0.0:
-                log.error(
-                    "Poly unwind sell error token=...%s x%s: %s — POSITION STILL NAKED",
-                    token_id[-6:], sell_size, e,
-                )
-                return 0.0
+        # Balance-aware unwind loop. Each attempt asks Poly how many shares we
+        # ACTUALLY hold right now, then sells exactly that (capped at `want`).
+        # This is the source of truth — it correctly handles all three races that
+        # previously caused 400-thrash and false "STILL NAKED":
+        #   • ledger-lag after the buy: held=0 at first, grows once settled → wait+retry
+        #   • thin-book partial fill: held drops by what sold; sell the true remainder
+        #   • matched/settling lock: 'sum of matched orders' rejections vanish because
+        #     we re-read held and stop once it reaches 0 (position already cleared).
+        sold = 0.0
+        for attempt in range(1, _UNWIND_MAX_ATTEMPTS + 1):
+            held = self._held_shares(token_id)
+            if held is None:
+                # Couldn't read balance — best-effort blind sell of the remainder.
+                to_sell = want - int(sold)
+            else:
+                # Sell only what we actually still hold (and still owe to unwind).
+                to_sell = min(int(held + 1e-6), want - int(sold))
+                if int(held + 1e-6) <= 0:
+                    if sold > 0:
+                        # We sold shares and the balance is now 0 → fully cleared.
+                        log.info("Poly unwind token=...%s: balance 0 after selling "
+                                 "%s/%s — position cleared", token_id[-6:], sold, want)
+                        return sold
+                    # held=0 but we haven't sold anything yet → the BUY is still
+                    # settling (ledger lag). Wait and re-read rather than declaring
+                    # done; the shares will appear within a few seconds.
+                    log.debug("Poly unwind token=...%s: balance 0, nothing sold yet "
+                              "— ledger lag, waiting (attempt %d)", token_id[-6:], attempt)
+                    if attempt < _UNWIND_MAX_ATTEMPTS:
+                        time.sleep(_UNWIND_ATTEMPT_DELAY)
+                    continue
+            if to_sell <= 0:
+                break
+            try:
+                got = _submit_sell(to_sell)
+                sold += got
+                if got > 0:
+                    log.info("Poly unwind sell token=...%s x%s → sold=%s "
+                             "(attempt %d, total %s/%s)",
+                             token_id[-6:], to_sell, got, attempt, sold, want)
+            except Exception as e:
+                # 'not enough balance / sum of matched orders' = the prior sell is
+                # still settling and holds the shares; wait and re-read rather than
+                # hammering. A real failure keeps balance flat across attempts.
+                log.debug("Poly unwind attempt %d token=...%s x%s failed: %s",
+                          attempt, token_id[-6:], to_sell, e)
+            if sold >= want - 1e-6:
+                break
+            if attempt < _UNWIND_MAX_ATTEMPTS:
+                time.sleep(_UNWIND_ATTEMPT_DELAY)
 
-        if sold < sell_size:
+        if sold < want - 1e-6:
+            # Confirm against the real balance before declaring naked: the sells
+            # may have settled even if our per-attempt accounting missed some.
+            held_final = self._held_shares(token_id)
+            if held_final is not None and held_final < 1.0:
+                log.info("Poly unwind token=...%s: residual balance %.4f < 1 share "
+                         "— treating as cleared", token_id[-6:], held_final)
+                return float(want)
             log.error(
-                "Poly UNWIND PARTIAL token=...%s sold=%s/%s — STILL NAKED on remainder!",
-                token_id[-6:], sold, sell_size,
+                "Poly UNWIND INCOMPLETE token=...%s sold=%s/%s (held≈%s) — "
+                "STILL NAKED on remainder!",
+                token_id[-6:], sold, want,
+                "?" if held_final is None else f"{held_final:.2f}",
             )
-        else:
-            log.info("Poly unwind sell token=...%s x%s → sold=%s",
-                     token_id[-6:], sell_size, sold)
         return sold
 
     # ── Market data ──────────────────────────────────────────────────────────
