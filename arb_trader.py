@@ -55,7 +55,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
 from engine import (
     MarketSnapshot, _auth_headers, API_BASE, SESSION, ORDER_TIMEOUT, DRY_RUN,
@@ -71,6 +71,13 @@ ARB_TOLERANCE    = int(os.getenv("ARB_TOLERANCE",         "2"))
 ARB_TRADE_SIZE   = int(os.getenv("ARB_TRADE_SIZE",         "5"))
 ARB_MIN_PROFIT   = int(os.getenv("ARB_MIN_PROFIT_CENTS",   "1"))
 ARB_ORDER_COOLDOWN = float(os.getenv("ARB_ORDER_COOLDOWN", "30"))
+# Max arb ENTRIES per asset per 15-min window. Multiple orders/window are allowed
+# (same or opposite side) to capture more opportunities, but each entry stacks the
+# SAME venue-disagreement basis risk: if the window resolves oppositely, you lose
+# ~N× a single arb. This cap is the per-window exposure ceiling — total worst-case
+# loss ≈ cap × single-arb loss. Spacing is enforced by ARB_ORDER_COOLDOWN.
+# (Added 2026-06-04 after an uncapped re-arm placed 9 stacked SOL-UP buys.)
+ARB_MAX_WINDOW_ENTRIES = int(os.getenv("ARB_MAX_WINDOW_ENTRIES", "2"))
 # Polymarket rejects orders worth < this dollar amount (min order value). Kalshi
 # has no such floor. Arb needs equal share counts on both legs, so we can't pad
 # the Poly leg alone — instead skip when ARB_TRADE_SIZE × poly_price < this.
@@ -375,10 +382,14 @@ class ArbTrader:
         self._poly   = poly_client
         self._on_log = on_log or (lambda ic, msg: log.info("[%s] %s", ic, msg))
 
-        self._position: Optional[ArbPosition] = None
+        # All positions opened THIS window (multiple entries per window allowed,
+        # capped by ARB_MAX_WINDOW_ENTRIES). Every leg is tracked here so none is
+        # orphaned/unhedged — the single-_position overwrite caused exactly that
+        # (8 untracked SOL legs, 2026-06-04). reset() clears it each window.
+        self._positions: List[ArbPosition] = []
         # In-flight guard: True only while an _execute() thread is running, so two
         # ticks can't fire concurrently. Cleared after each entry/abort/miss so the
-        # trader can place MULTIPLE orders within one window (re-arm).
+        # trader can place MULTIPLE orders within one window (re-arm), up to the cap.
         self._attempted  = False
         self._last_attempt_ts: float = 0.0
         self._market_info: Optional[PolyMarketInfo] = None
@@ -411,7 +422,13 @@ class ArbTrader:
         position — everything the UI needs for arb observability.
         """
         with self._lock:
-            pos = self._position.__dict__.copy() if self._position else None
+            all_pos = [p.__dict__.copy() for p in self._positions]
+            # Representative position for the existing single-position UI: most
+            # recent open one, else most recent of any.
+            pos = None
+            if self._positions:
+                pos = next((p.__dict__.copy() for p in reversed(self._positions)
+                            if p.phase == "open"), self._positions[-1].__dict__.copy())
             stats = dict(self._stats)
             live = dict(self._live)
         return {
@@ -419,6 +436,9 @@ class ArbTrader:
             "live":      live,
             "stats":     stats,
             "position":  pos,
+            "positions": all_pos,
+            "entries_this_window": len(all_pos),
+            "max_window_entries":  ARB_MAX_WINDOW_ENTRIES,
             "attempted": self._attempted,
             "window_age_s": int(time.time() - self._window_start_ts),
         }
@@ -532,7 +552,7 @@ class ArbTrader:
     def reset(self):
         """Call at the start of each new 15-min window."""
         with self._lock:
-            self._position      = None
+            self._positions     = []
             self._attempted     = False
             self._last_attempt_ts = 0.0
             self._market_info   = None
@@ -546,8 +566,22 @@ class ArbTrader:
             })
 
     @property
+    def positions(self) -> List[ArbPosition]:
+        """All positions opened this window."""
+        with self._lock:
+            return list(self._positions)
+
+    @property
     def position(self) -> Optional[ArbPosition]:
-        return self._position
+        """Representative single position (back-compat): the most recent open one,
+        else the most recent of any. None if no entries yet this window."""
+        with self._lock:
+            if not self._positions:
+                return None
+            for pos in reversed(self._positions):
+                if pos.phase == "open":
+                    return pos
+            return self._positions[-1]
 
     @property
     def attempted(self) -> bool:
@@ -572,20 +606,30 @@ class ArbTrader:
         if self.asset.upper() not in ARB_ASSETS:
             return
 
-        # If we already hold a position, first check whether to EARLY-EXIT it
-        # (price drifting into the danger zone near expiry). Unlike before, we do
-        # NOT return here: multiple orders per window are allowed, so after an
-        # entry the trader may fire AGAIN if a fresh arb appears. The previously
-        # filled legs are held to resolution (see light multi-order scope).
-        if self._position is not None:
+        # Run early-exit on every OPEN position held this window (price drifting
+        # into the danger zone near expiry). We do NOT return here: multiple orders
+        # per window are allowed, so the trader may fire again if a fresh arb
+        # appears — up to ARB_MAX_WINDOW_ENTRIES. Every leg stays tracked in
+        # self._positions so none is orphaned/unhedged.
+        if self._positions:
             self._maybe_early_exit(kalshi_snap)
 
         with self._lock:
-            # In-flight guard only: block while an _execute() thread is running so
-            # two ticks can't fire concurrently. It is cleared after each
-            # entry/abort/miss, so this no longer locks out the rest of the window.
+            # In-flight guard: block while an _execute() thread is running so two
+            # ticks can't fire concurrently. Cleared after each entry/abort/miss.
             if self._attempted:
                 return
+            # Per-window exposure cap: stop entering once we've hit the max number
+            # of entries. This bounds worst-case opposite-resolution loss to
+            # ~cap × single-arb loss (the uncapped re-arm lost far more by stacking
+            # the same SOL-UP arb 9×).
+            if len(self._positions) >= ARB_MAX_WINDOW_ENTRIES:
+                self._log_skip_throttled("window_cap", "🧯", (
+                    f"ARB {self.asset}: hit {ARB_MAX_WINDOW_ENTRIES}-entry cap for "
+                    f"this window — no more orders until next window"
+                ))
+                return
+            # Cooldown between entries (prevents rapid same-arb repeats).
             if time.time() - self._last_attempt_ts < ARB_ORDER_COOLDOWN:
                 return
 
@@ -844,18 +888,15 @@ class ArbTrader:
 
     def _maybe_early_exit(self, kalshi_snap: MarketSnapshot):
         """
-        Called each tick while a position is OPEN. If we're in the last
-        ARB_EXIT_WINDOW_SECS and the price has drifted within ARB_EXIT_BUFFER_PCT
-        of the strike (the venue-disagreement danger zone), SELL BOTH LEGS now
-        rather than hold into a resolution where Kalshi and Polymarket might
-        settle oppositely (which can turn the locked arb into a double loss).
+        Called each tick. If we're in the last ARB_EXIT_WINDOW_SECS and the price
+        has drifted within ARB_EXIT_BUFFER_PCT of the strike (the venue-
+        disagreement danger zone), SELL BOTH LEGS of EVERY open position now rather
+        than hold into a resolution where Kalshi and Polymarket might settle
+        oppositely (which can turn the locked arb into a double loss).
 
         Disabled when ARB_EXIT_BUFFER_PCT == 0 (hold to resolution).
         """
         if ARB_EXIT_BUFFER_PCT <= 0:
-            return
-        pos = self._position
-        if pos is None or pos.phase != "open":
             return
         if kalshi_snap.secs_left > ARB_EXIT_WINDOW_SECS:
             return
@@ -867,7 +908,15 @@ class ArbTrader:
         if dist_pct >= ARB_EXIT_BUFFER_PCT:
             return  # safely away from the strike — hold to resolution as normal
 
-        # In the danger zone near expiry → flatten both legs immediately.
+        # In the danger zone near expiry → flatten every open position. Snapshot
+        # the list under lock; _early_exit_one re-checks each position's phase.
+        for pos in self.positions:
+            if pos.phase == "open":
+                self._early_exit_one(pos, kalshi_snap, spot, strike, dist_pct)
+
+    def _early_exit_one(self, pos: "ArbPosition", kalshi_snap: MarketSnapshot,
+                        spot: float, strike, dist_pct: float):
+        """Flatten both legs of a single open position (see _maybe_early_exit)."""
         with self._lock:
             if pos.phase != "open":
                 return
@@ -1224,11 +1273,13 @@ class ArbTrader:
             phase=phase,
         )
         with self._lock:
-            self._position = pos
+            # APPEND (never overwrite): every leg stays tracked so none is
+            # orphaned/unhedged. The window-entry cap in update() bounds how many
+            # accumulate.
+            self._positions.append(pos)
             # Re-arm: clear the in-flight guard so the trader can place ANOTHER
-            # order later in this window if a fresh arb appears (multiple orders
-            # per window). The previously filled legs are held to resolution; a
-            # new entry overwrites self._position (light multi-order scope).
+            # order later this window if a fresh arb appears. Spacing is enforced
+            # by ARB_ORDER_COOLDOWN; total entries by ARB_MAX_WINDOW_ENTRIES.
             self._attempted = False
             self._last_attempt_ts = time.time()
         self._stats["entries"] += 1
