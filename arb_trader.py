@@ -1021,7 +1021,11 @@ class ArbTrader:
         threads = [threading.Thread(target=do_k, daemon=True),
                    threading.Thread(target=do_p, daemon=True)]
         for t in threads: t.start()
-        for t in threads: t.join(timeout=8.0)
+        # The Poly sell (place_sell_fok) runs a balance-aware retry loop internally,
+        # so allow enough time for it to finish — an 8s cap could time out mid-retry
+        # and record a false partial. Mirror the unwind path's timeout.
+        exit_join_timeout = 5.0 + _UNWIND_MAX_ATTEMPTS * _UNWIND_ATTEMPT_DELAY
+        for t in threads: t.join(timeout=exit_join_timeout)
 
         ok = (k_sold["v"] >= n_k - ARB_DUST_SHARES) and (p_sold["v"] >= int(n_p) - ARB_DUST_SHARES)
         with self._lock:
