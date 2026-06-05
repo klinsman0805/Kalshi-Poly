@@ -46,6 +46,7 @@ EXECUTION:
 """
 
 import os
+import csv
 import json
 import math
 import time
@@ -78,6 +79,13 @@ ARB_ORDER_COOLDOWN = float(os.getenv("ARB_ORDER_COOLDOWN", "30"))
 # loss ≈ cap × single-arb loss. Spacing is enforced by ARB_ORDER_COOLDOWN.
 # (Added 2026-06-04 after an uncapped re-arm placed 9 stacked SOL-UP buys.)
 ARB_MAX_WINDOW_ENTRIES = int(os.getenv("ARB_MAX_WINDOW_ENTRIES", "2"))
+# Multi-order toggle (for A/B testing two ways to deploy size in a window):
+#   true  → up to ARB_MAX_WINDOW_ENTRIES entries/window, each ARB_TRADE_SIZE.
+#   false → exactly ONE entry/asset/window, sized ARB_SINGLE_ORDER_SIZE (lets you
+#           test "one bigger trade" vs "several small trades"). Defaults to
+#           ARB_TRADE_SIZE when unset.
+ARB_MULTI_ORDER = os.getenv("ARB_MULTI_ORDER", "true").lower() != "false"
+ARB_SINGLE_ORDER_SIZE = int(os.getenv("ARB_SINGLE_ORDER_SIZE", str(ARB_TRADE_SIZE)))
 # Polymarket rejects orders worth < this dollar amount (min order value). Kalshi
 # has no such floor. Arb needs equal share counts on both legs, so we can't pad
 # the Poly leg alone — instead skip when ARB_TRADE_SIZE × poly_price < this.
@@ -171,6 +179,10 @@ ARB_EXIT_BUFFER_PCT   = float(os.getenv("ARB_EXIT_BUFFER_PCT", "0"))
 ARB_EXIT_WINDOW_SECS  = float(os.getenv("ARB_EXIT_WINDOW_SECS", "90"))
 
 TRADES_FILE = Path(os.getenv("TRADES_FILE", "trades.jsonl"))
+# Clean, separate CSV of SUCCESSFUL trades only (entries + exits/resolutions),
+# for easy review/debugging alongside the Polymarket export. trades.jsonl stays
+# the full firehose (attempts, skips, misses, aborts); this is the signal.
+ARB_TRADES_CSV = Path(os.getenv("ARB_TRADES_CSV", "arb_trades.csv"))
 
 # ── Fee helpers ───────────────────────────────────────────────────────────────
 #
@@ -245,6 +257,35 @@ def _log_trade(record: dict):
             f.write(json.dumps(record) + "\n")
     except Exception as e:
         log.error("arb trade log: %s", e)
+
+# Fixed column order for the clean success CSV. Entries and exits share one schema;
+# fields irrelevant to a row are left blank. Append-only; header written once.
+_ARB_CSV_COLUMNS = [
+    "ts", "event", "asset", "window_ts", "kalshi_ticker", "secs_left",
+    "kalshi_side", "kalshi_price", "kalshi_filled",
+    "poly_side", "poly_order_price", "poly_fill_price", "poly_filled",
+    "count", "combined_cost",
+    "net_profit_per_contract", "exec_profit_per_contract",
+    "fully_exited", "k_sold", "p_sold", "spot", "strike",
+]
+_arb_csv_lock = threading.Lock()
+
+def _log_success_csv(row: dict):
+    """
+    Append one successful-trade row (event='entry' or 'exit') to ARB_TRADES_CSV.
+    Writes the header on first use. Only confirmed fills land here — this is the
+    clean signal, separate from the trades.jsonl firehose. Never raises.
+    """
+    try:
+        with _arb_csv_lock:
+            new_file = not ARB_TRADES_CSV.exists() or ARB_TRADES_CSV.stat().st_size == 0
+            with ARB_TRADES_CSV.open("a", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=_ARB_CSV_COLUMNS, extrasaction="ignore")
+                if new_file:
+                    w.writeheader()
+                w.writerow(row)
+    except Exception as e:
+        log.error("arb success CSV log: %s", e)
 
 # ── Kalshi order placement ────────────────────────────────────────────────────
 
@@ -359,11 +400,12 @@ class ArbPosition:
     kalshi_price:   int
     poly_token_id:  str
     poly_side:      str
-    poly_price:     int
+    poly_price:     int                 # limit price we SENT on the Poly leg (¢)
     count:          float               # matched contracts (min of both fills)
     k_filled:       float               # actual Kalshi fill
     p_filled:       float               # actual Polymarket fill
     expected_profit: float              # ¢ per contract after fees
+    poly_fill_price: Optional[float] = None  # actual avg Poly fill (¢), if reported
     ts:    str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     phase: str = "open"                 # open | partial | resolved
 
@@ -622,11 +664,13 @@ class ArbTrader:
             # Per-window exposure cap: stop entering once we've hit the max number
             # of entries. This bounds worst-case opposite-resolution loss to
             # ~cap × single-arb loss (the uncapped re-arm lost far more by stacking
-            # the same SOL-UP arb 9×).
-            if len(self._positions) >= ARB_MAX_WINDOW_ENTRIES:
+            # the same SOL-UP arb 9×). Single-order mode caps at exactly 1.
+            entry_cap = ARB_MAX_WINDOW_ENTRIES if ARB_MULTI_ORDER else 1
+            if len(self._positions) >= entry_cap:
                 self._log_skip_throttled("window_cap", "🧯", (
-                    f"ARB {self.asset}: hit {ARB_MAX_WINDOW_ENTRIES}-entry cap for "
-                    f"this window — no more orders until next window"
+                    f"ARB {self.asset}: hit {entry_cap}-entry cap for this window "
+                    f"({'multi' if ARB_MULTI_ORDER else 'single'}-order mode) "
+                    f"— no more orders until next window"
                 ))
                 return
             # Cooldown between entries (prevents rapid same-arb repeats).
@@ -761,6 +805,12 @@ class ArbTrader:
             self._stats["skip_near_strike"] += 1
             return
 
+        # Order size for this evaluation: single-order mode uses a (possibly
+        # larger) dedicated size; multi-order mode uses the standard per-entry size.
+        # Both legs use the same count (arb requires equal shares). Poly's 5-share
+        # minimum still applies, so this is clamped to >= 5.
+        trade_size = max(5, ARB_SINGLE_ORDER_SIZE if not ARB_MULTI_ORDER else ARB_TRADE_SIZE)
+
         # ── Step 3: check both arb legs ──────────────────────────────────────
         # candidate = (kalshi_side, k_price, k_depth, poly_side, p_price, p_depth,
         #              p_token_id, p_opposite_ask_for_implied_bid)
@@ -797,35 +847,35 @@ class ArbTrader:
             }
 
             # Depth gate.
-            if k_depth is None or k_depth < ARB_TRADE_SIZE:
+            if k_depth is None or k_depth < trade_size:
                 self._log_skip_throttled("thin_kalshi_depth", "📉", (
                     f"ARB {self.asset} {k_side.upper()}: insufficient Kalshi depth "
-                    f"({k_depth}) < {ARB_TRADE_SIZE} at top of ask — skipping"
+                    f"({k_depth}) < {trade_size} at top of ask — skipping"
                 ))
                 self._log_attempt(ctx, decision="skip", reason="thin_kalshi_depth")
                 continue
-            if p_depth is None or p_depth < ARB_TRADE_SIZE:
+            if p_depth is None or p_depth < trade_size:
                 self._log_skip_throttled("thin_poly_depth", "📉", (
                     f"ARB {self.asset} {p_side.upper()}: insufficient Poly depth "
-                    f"({p_depth}) < {ARB_TRADE_SIZE} at top of ask — skipping"
+                    f"({p_depth}) < {trade_size} at top of ask — skipping"
                 ))
                 self._log_attempt(ctx, decision="skip", reason="thin_poly_depth")
                 continue
 
-            # Polymarket min order value: ARB_TRADE_SIZE × poly_price must clear
+            # Polymarket min order value: trade_size × poly_price must clear
             # $1. Arb requires equal share counts on both legs, so a cheap Poly
             # leg can't be padded alone — skip instead. (Kalshi has no min.)
-            poly_order_usd = ARB_TRADE_SIZE * p_price / 100.0
+            poly_order_usd = trade_size * p_price / 100.0
             if poly_order_usd < ARB_POLY_MIN_ORDER_USD:
                 self._log_skip_throttled("below_poly_min", "💵", (
                     f"ARB {self.asset} {p_side.upper()}: Poly order "
-                    f"{ARB_TRADE_SIZE}×{p_price}¢ = ${poly_order_usd:.2f} "
+                    f"{trade_size}×{p_price}¢ = ${poly_order_usd:.2f} "
                     f"< ${ARB_POLY_MIN_ORDER_USD:.2f} min — skipping"
                 ))
                 self._log_attempt(ctx, decision="skip", reason="below_poly_min")
                 continue
 
-            profit = _net_profit(k_price, p_price, info.fee_bps, ARB_TRADE_SIZE)
+            profit = _net_profit(k_price, p_price, info.fee_bps, trade_size)
             ctx["net_profit_per_contract"] = round(profit, 4)
 
             # Bounded unwind cost.
@@ -834,8 +884,8 @@ class ArbTrader:
             unwind_slip      = max(0, poly_order_price - implied_bid)
             unwind_fee       = _poly_fee_per_contract(max(implied_bid, 1), info.fee_bps)
             unwind_cost_per  = unwind_slip + unwind_fee
-            expected_total   = profit * ARB_TRADE_SIZE
-            unwind_total     = unwind_cost_per * ARB_TRADE_SIZE
+            expected_total   = profit * trade_size
+            unwind_total     = unwind_cost_per * trade_size
             ctx["poly_order_price"] = poly_order_price
             ctx["implied_unwind_bid"] = implied_bid
             ctx["unwind_cost_total_cents"] = round(unwind_total, 4)
@@ -876,7 +926,7 @@ class ArbTrader:
                 target=self._execute,
                 args=(kalshi_snap, k_side, k_price, p_side, p_token, p_price,
                       info.fee_bps, info.fee_source, profit, detection_ts,
-                      poly_order_price, implied_bid, k_age, p_age),
+                      poly_order_price, implied_bid, k_age, p_age, trade_size),
                 daemon=True,
             ).start()
             return
@@ -962,6 +1012,15 @@ class ArbTrader:
             f"ARB {self.asset} early-exit {'done' if ok else 'PARTIAL'}: "
             f"K sold {k_sold['v']}/{n_k}, P sold {p_sold['v']}/{n_p}"
         ))
+        # Clean success-CSV row for this exit.
+        _log_success_csv({
+            "ts": datetime.now(timezone.utc).isoformat(), "event": "exit",
+            "asset": self.asset, "kalshi_ticker": kalshi_snap.ticker,
+            "secs_left": kalshi_snap.secs_left,
+            "kalshi_side": k_side, "kalshi_filled": n_k, "k_sold": k_sold["v"],
+            "poly_side": p_side, "poly_filled": n_p, "p_sold": p_sold["v"],
+            "fully_exited": ok, "spot": spot, "strike": strike,
+        })
         if not ok:
             halt_trading(f"{self.asset} early-exit incomplete — possible residual "
                          f"position, inspect before restart.")
@@ -1094,13 +1153,13 @@ class ArbTrader:
                  fee_bps: int, fee_source: str, expected_profit: float,
                  detection_ts: float, poly_order_price: int,
                  implied_unwind_bid: int, k_age_at_detect: float,
-                 p_age_at_detect: float):
+                 p_age_at_detect: float, trade_size: int = ARB_TRADE_SIZE):
         """
         Sequential two-leg execution: Poly FOK first, Kalshi IOC only if Poly fills.
         If Poly misses → nothing was touched on Kalshi → zero loss, allow retry.
         If Poly fills but Kalshi misses → unwind Poly, lock window.
         """
-        n = ARB_TRADE_SIZE
+        n = trade_size
 
         # Observability: measure price drift between detection and fire time.
         # Pure logging — does not affect the EV recheck or order placement.
@@ -1139,8 +1198,12 @@ class ArbTrader:
         poly_ts0 = time.time()
         p_filled: float = 0.0
         p_err: Optional[str] = None
+        p_fill_price: Optional[float] = None  # actual avg fill cents (vs the limit)
         try:
             p_filled = self._poly.place_fok(p_token, poly_order_price, n, fee_bps)
+            # Actual average fill price Poly reported — usually better than the
+            # limit (poly_order_price) we sent, since FOK fills at the resting ask.
+            p_fill_price = getattr(self._poly, "_last_fill_price_cents", None)
         except Exception as e:
             p_err = str(e)
             self._on_log("✗", f"ARB {self.asset} Poly leg error: {e}")
@@ -1270,6 +1333,7 @@ class ArbTrader:
             k_filled=k_filled,
             p_filled=p_filled,
             expected_profit=expected_profit,
+            poly_fill_price=p_fill_price,
             phase=phase,
         )
         with self._lock:
@@ -1298,6 +1362,7 @@ class ArbTrader:
             "poly_token_id": p_token,
             "poly_price":    p_price,
             "poly_order_price": poly_order_price,
+            "poly_fill_price":  round(p_fill_price, 2) if p_fill_price is not None else None,
             "poly_filled":   p_filled,
             "count":         matched,
             "combined_cost": combined,
@@ -1313,6 +1378,19 @@ class ArbTrader:
             "kalshi_leg_latency_ms":   kalshi_ms,
             "naked_duration_ms":       naked_ms,
             **drift,
+        })
+
+        # Clean success-CSV row for this entry (both legs filled / hedged).
+        _log_success_csv({
+            "ts": pos.ts, "event": "entry", "asset": self.asset,
+            "window_ts": kalshi_snap.window_ts,
+            "kalshi_ticker": kalshi_snap.ticker, "secs_left": kalshi_snap.secs_left,
+            "kalshi_side": k_side, "kalshi_price": k_price, "kalshi_filled": k_filled,
+            "poly_side": p_side, "poly_order_price": poly_order_price,
+            "poly_fill_price": round(p_fill_price, 2) if p_fill_price is not None else "",
+            "poly_filled": p_filled, "count": matched, "combined_cost": combined,
+            "net_profit_per_contract": round(expected_profit, 4),
+            "exec_profit_per_contract": round(exec_profit, 4),
         })
 
         if phase == "open":

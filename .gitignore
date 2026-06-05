@@ -6,6 +6,7 @@
 # Runtime data
 positions.json
 *.jsonl
+arb_trades.csv
 *.log
 __pycache__/
 *.pyc

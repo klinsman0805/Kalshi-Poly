@@ -380,6 +380,11 @@ class PolyClient:
         # the v2 SDK resolves the order schema/version automatically.
         self._clob = self._build_clob_client()
 
+        # Actual average fill price (cents) of the most recent place_fok BUY, or
+        # None if it didn't fill / Poly returned no amounts. Read by the arb trader
+        # right after the call to record the real fill vs the limit price we sent.
+        self._last_fill_price_cents: Optional[float] = None
+
         # Start WS loop
         self._ws_thread = threading.Thread(
             target=self._ws_loop, name="poly-ws", daemon=True
@@ -580,17 +585,40 @@ class PolyClient:
             return float(fallback_size)
         return 0.0
 
+    @staticmethod
+    def _filled_price_cents(resp: dict) -> Optional[float]:
+        """
+        Actual average fill price in cents from a v2 post_order response.
+
+        A matched FOK BUY returns makingAmount = USDC spent and takingAmount =
+        shares received, so avg price = makingAmount / takingAmount (in dollars,
+        ×100 → cents). The order's LIMIT price (what we sent) is usually worse
+        than this — Poly fills at the resting ask, which can be better. Returns
+        None if the response lacks the amounts.
+        """
+        try:
+            making = float(resp.get("makingAmount", "") or "")  # USDC spent
+            taking = float(resp.get("takingAmount", "") or "")  # shares received
+        except (TypeError, ValueError):
+            return None
+        if taking <= 0:
+            return None
+        return (making / taking) * 100.0
+
     def place_fok(self, token_id: str, price_cents: int,
                   size: int, fee_bps: int) -> float:
         """
         Place a FOK buy order for `size` shares at `price_cents` via CLOB v2.
         Returns filled share count as float (simulates full fill in DRY_RUN).
         """
+        self._last_fill_price_cents = None
         if DRY_RUN:
             log.info(
                 "[DRY RUN] Poly FOK buy token=...%s price=%dc x%d",
                 token_id[-6:], price_cents, size,
             )
+            # In DRY_RUN we have no real fill — assume we'd fill at the limit price.
+            self._last_fill_price_cents = float(price_cents)
             return float(size)
 
         if self._clob is None:
@@ -610,15 +638,18 @@ class PolyClient:
             signed = self._clob.create_order(args)
             resp   = self._clob.post_order(signed, OrderType.FOK)
             filled = self._filled_shares(resp, size)
+            self._last_fill_price_cents = self._filled_price_cents(resp)
             if filled == 0:
                 log.warning(
                     "Poly FOK not filled token=...%s price=%dc x%d — resp: %s",
                     token_id[-6:], price_cents, size, str(resp)[:300],
                 )
             else:
+                fp = self._last_fill_price_cents
                 log.info(
-                    "Poly FOK token=...%s price=%dc x%d → filled=%s",
+                    "Poly FOK token=...%s limit=%dc x%d → filled=%s @ %s",
                     token_id[-6:], price_cents, size, filled,
+                    f"{fp:.2f}c" if fp is not None else "?",
                 )
             return filled
         except Exception as e:
