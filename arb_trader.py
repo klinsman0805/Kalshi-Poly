@@ -377,24 +377,32 @@ def _kalshi_ioc_sell(snap: MarketSnapshot, side: str, size: float) -> float:
     (accept any bid).  Used for naked-leg unwind after a partial arb fill.
     Returns sold count as float.
     """
+    # Kalshi trades WHOLE contracts and the API requires an integer `count`;
+    # passing a float (e.g. 5.0) is rejected as 400 Bad Request. Round DOWN so we
+    # never try to sell more than we hold.
+    sell_count = int(size)
     if DRY_RUN:
-        log.info("[DRY RUN] Kalshi IOC sell %s x%s", side.upper(), size)
-        return float(size)
+        log.info("[DRY RUN] Kalshi IOC sell %s x%d", side.upper(), sell_count)
+        return float(sell_count)
+    if sell_count <= 0:
+        log.warning("Kalshi IOC sell %s: size %.4f rounds to 0 contracts — skipping",
+                    side, size)
+        return 0.0
 
     cid  = f"arb-k-unwind-{side}-{int(time.time() * 1000)}"
     body = {
         "ticker":          snap.ticker,
         "side":            side,
         "action":          "sell",
-        "count":           size,
+        "count":           sell_count,
         "time_in_force":   "immediate_or_cancel",
         "client_order_id": cid,
     }
     # price=1 means accept any bid ≥ 1¢ — guarantees execution
     body["yes_price" if side == "yes" else "no_price"] = 1
 
-    log.info("Kalshi IOC sell %s x%s ticker=%s — placing (unwind)",
-             side.upper(), size, snap.ticker)
+    log.info("Kalshi IOC sell %s x%d ticker=%s — placing (unwind)",
+             side.upper(), sell_count, snap.ticker)
     path    = "/trade-api/v2/portfolio/orders"
     headers = _auth_headers("POST", path)
     url     = API_BASE + "/portfolio/orders"
@@ -403,11 +411,11 @@ def _kalshi_ioc_sell(snap: MarketSnapshot, side: str, size: float) -> float:
         r.raise_for_status()
         order = r.json().get("order", {})
         sold = float(order.get("fill_count_fp", "0") or "0")
-        log.info("Kalshi IOC sell %s x%s → sold=%s", side.upper(), size, sold)
+        log.info("Kalshi IOC sell %s x%d → sold=%s", side.upper(), sell_count, sold)
         return sold
     except Exception as e:
-        log.error("Kalshi IOC sell error (size=%s): %s — reconciling cid=%s",
-                  size, e, cid)
+        log.error("Kalshi IOC sell error (size=%s, count=%d): %s — reconciling cid=%s",
+                  size, sell_count, e, cid)
         return _reconcile_kalshi_fill(cid)
 
 # ── Position ──────────────────────────────────────────────────────────────────
