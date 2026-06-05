@@ -350,6 +350,8 @@ def _kalshi_ioc(snap: MarketSnapshot, side: str, price: int, size: int,
     }
     body["yes_price" if side == "yes" else "no_price"] = price
 
+    log.info("Kalshi IOC buy %s @%dc x%d ticker=%s — placing",
+             side.upper(), price, size, snap.ticker)
     path    = "/trade-api/v2/portfolio/orders"
     headers = _auth_headers("POST", path)
     url     = API_BASE + "/portfolio/orders"
@@ -357,7 +359,14 @@ def _kalshi_ioc(snap: MarketSnapshot, side: str, price: int, size: int,
         r = SESSION.post(url, json=body, headers=headers, timeout=timeout)
         r.raise_for_status()
         order = r.json().get("order", {})
-        return float(order.get("fill_count_fp", "0") or "0")
+        filled = float(order.get("fill_count_fp", "0") or "0")
+        if filled == 0:
+            log.warning("Kalshi IOC buy %s @%dc x%d → NOT FILLED (status=%s)",
+                        side.upper(), price, size, order.get("status"))
+        else:
+            log.info("Kalshi IOC buy %s @%dc x%d → filled=%s",
+                     side.upper(), price, size, filled)
+        return filled
     except Exception as e:
         log.warning("Kalshi IOC %s POST failed (%s) — reconciling cid=%s",
                     side, e, cid)
@@ -386,6 +395,8 @@ def _kalshi_ioc_sell(snap: MarketSnapshot, side: str, size: float) -> float:
     # price=1 means accept any bid ≥ 1¢ — guarantees execution
     body["yes_price" if side == "yes" else "no_price"] = 1
 
+    log.info("Kalshi IOC sell %s x%s ticker=%s — placing (unwind)",
+             side.upper(), size, snap.ticker)
     path    = "/trade-api/v2/portfolio/orders"
     headers = _auth_headers("POST", path)
     url     = API_BASE + "/portfolio/orders"
@@ -393,7 +404,9 @@ def _kalshi_ioc_sell(snap: MarketSnapshot, side: str, size: float) -> float:
         r = SESSION.post(url, json=body, headers=headers, timeout=ORDER_TIMEOUT)
         r.raise_for_status()
         order = r.json().get("order", {})
-        return float(order.get("fill_count_fp", "0") or "0")
+        sold = float(order.get("fill_count_fp", "0") or "0")
+        log.info("Kalshi IOC sell %s x%s → sold=%s", side.upper(), size, sold)
+        return sold
     except Exception as e:
         log.error("Kalshi IOC sell error (size=%s): %s — reconciling cid=%s",
                   size, e, cid)
@@ -1308,6 +1321,14 @@ class ArbTrader:
                 self._on_log("✗", f"ARB {self.asset} Kalshi leg error: {e}")
         kalshi_ms = int((time.time() - k_ts0) * 1000)
         naked_ms  = int((time.time() - poly_fill_ts) * 1000)
+
+        # Surface the Kalshi leg result on the dashboard/terminal channel so it's
+        # visible alongside the Poly lines (file logs alone weren't showing it).
+        self._on_log(
+            "🟢" if k_filled >= k_target else ("🟡" if k_filled > 0 else "🔴"),
+            f"ARB {self.asset} Kalshi {k_side.upper()} buy @≤{k_buy_price}¢ "
+            f"x{k_target} → filled {k_filled} ({kalshi_ms}ms)"
+        )
 
         # Naked exposure = Poly shares not covered by Kalshi contracts.
         naked_shares = p_filled - k_filled
