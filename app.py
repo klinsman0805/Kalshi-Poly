@@ -1141,6 +1141,13 @@ if __name__ == "__main__":
         format="%(asctime)s  %(name)-16s  %(levelname)-7s  %(message)s",
         datefmt="%H:%M:%S",
     )
+    # Quiet noisy third-party loggers. The CLOB SDK's http_helpers logs every 400
+    # at ERROR — including the EXPECTED "FOK couldn't be fully filled" kill, which
+    # our place_fok already handles and logs cleanly at INFO. httpx logs every
+    # request line. Both flood the console without adding signal; raise their
+    # threshold so our own kalshi.* loggers carry the real story.
+    logging.getLogger("py_clob_client_v2.http_helpers.helpers").setLevel(logging.CRITICAL)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     creds_ok = bool(engine.KALSHI_KEY_ID and Path(engine.KALSHI_KEY_FILE).exists())
     if not creds_ok:

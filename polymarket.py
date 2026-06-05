@@ -660,6 +660,20 @@ class PolyClient:
                 )
             return filled
         except Exception as e:
+            # An FOK that can't be fully filled is KILLED by the matching engine
+            # and surfaced as a 400 "order couldn't be fully filled". This is the
+            # EXPECTED safe outcome — nothing bought, no exposure, the arb just
+            # skips and retries. Log it as INFO so it doesn't look like a failure.
+            # Anything else (auth, balance, network) stays ERROR.
+            msg = str(e).lower()
+            if "couldn't be fully filled" in msg or "fully filled or killed" in msg:
+                log.info(
+                    "Poly FOK buy not filled (book too thin for x%d @%dc) "
+                    "token=...%s — skipping, no exposure",
+                    size, price_cents, token_id[-6:],
+                )
+                self._last_fill_price_cents = None
+                return 0.0
             log.error("Poly FOK buy error token=...%s price=%dc: %s",
                       token_id[-6:], price_cents, e)
             return 0.0
