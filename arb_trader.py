@@ -102,13 +102,22 @@ ARB_KALSHI_SLIPPAGE = int(os.getenv("ARB_KALSHI_SLIPPAGE", "2"))
 ARB_DUST_SHARES = float(os.getenv("ARB_DUST_SHARES", "1.0"))
 
 # Naked Poly exposure ≤ this USD amount is HELD to resolution instead of being
-# sold via FAK. Auto-redeems on market settlement. Trades selling complexity
-# (race vs. balance ledger, thin-book partials, CRITICAL halts) for bounded
-# directional risk over a ≤15-min window. Two 2026-06-02 incidents (~$1–$3
-# each) cost more in halts than the held variance would have. Set to 0 to
-# always sell (legacy behavior). Threshold is on the buy-side cost basis,
-# not mark-to-market, so it never depends on a live quote at unwind time.
-ARB_POLY_HOLD_NAKED_USD = float(os.getenv("ARB_POLY_HOLD_NAKED_USD", "10"))
+# sold via FAK. Auto-redeems on market settlement. Threshold is on the buy-side
+# cost basis, not mark-to-market, so it never depends on a live quote at unwind
+# time.
+#
+# DEFAULT 0 (2026-06-05, by user decision): ALWAYS unwind a naked Poly leg when
+# Kalshi misses — never hold a directional position to resolution. We accept the
+# sell-side risks (ledger race, thin-book partials) the hold policy avoided;
+# partial unwinds now RETRY (ARB_UNWIND_RETRIES) and then log+continue rather
+# than halt. Set >0 to re-enable holding small legs.
+ARB_POLY_HOLD_NAKED_USD = float(os.getenv("ARB_POLY_HOLD_NAKED_USD", "0"))
+# How many extra times to retry selling a naked Poly leg that only PARTIALLY
+# unwound (thin near-expiry book). Each retry re-sends a FAK sell for the
+# remaining shares. After the last retry, residual dust is logged and trading
+# CONTINUES (no kill-switch halt) — by user decision 2026-06-05.
+ARB_UNWIND_RETRIES = int(os.getenv("ARB_UNWIND_RETRIES", "3"))
+ARB_UNWIND_RETRY_DELAY = float(os.getenv("ARB_UNWIND_RETRY_DELAY", "1.0"))
 
 # ── Global kill-switch ─────────────────────────────────────────────────────────
 # Set True after any failed/partial unwind. While set, NO new arb fires on ANY
@@ -1072,6 +1081,25 @@ class ArbTrader:
         for t in threads:
             t.join(timeout=5.0)
 
+        # Retry partial Poly unwinds: place_sell_fok already handles the ledger-lag
+        # race internally, but a thin near-expiry book can leave the sell only
+        # partially filled (sold < held) with no error. Re-send a FAK sell for the
+        # remaining whole shares a few times before giving up. (Always-unwind policy
+        # by user decision — we never hold a naked directional leg to resolution.)
+        if p_filled > 0 and not poly_held:
+            for attempt in range(1, ARB_UNWIND_RETRIES + 1):
+                p_remaining_now = p_filled - p_sold
+                if p_remaining_now <= ARB_DUST_SHARES:
+                    break
+                time.sleep(ARB_UNWIND_RETRY_DELAY)
+                more = self._poly.place_sell_fok(p_token, p_remaining_now, fee_bps)
+                p_sold += more
+                self._on_log("🔁", (
+                    f"ARB {self.asset} naked-unwind retry {attempt}/"
+                    f"{ARB_UNWIND_RETRIES}: sold {more} more "
+                    f"({p_filled - p_sold:.2f} still naked)"
+                ))
+
         unwind_ms = int((time.time() - unwind_start) * 1000)
         naked_ms  = (int((time.time() - naked_since_ts) * 1000)
                      if naked_since_ts is not None else None)
@@ -1103,13 +1131,17 @@ class ArbTrader:
             f"remaining K={k_remaining:.2f} P={p_remaining:.2f})"
         )
         if not ok:
-            # A leg could not be fully unwound → real naked exposure remains.
-            # Trip the kill-switch so no further arb fires until a human checks.
-            reason = (f"{self.asset} unwind incomplete — "
-                      f"K sold {k_sold}/{k_filled}, P sold {p_sold}/{p_filled}. "
-                      f"NAKED POSITION LIKELY OPEN — inspect before restart.")
-            halt_trading(reason)
-            self._on_log("🛑", f"TRADING HALTED: {reason}")
+            # A leg could not be fully unwound even after retries → residual naked
+            # exposure remains. By user decision (2026-06-05) we LOG and CONTINUE
+            # rather than tripping the kill-switch: a small residual auto-redeems
+            # at resolution and shouldn't stop the bot. The residual is recorded in
+            # the arb_unwind trade-log row (fully_unwound=false) for manual review.
+            self._on_log("⚠", (
+                f"ARB {self.asset} unwind INCOMPLETE after {ARB_UNWIND_RETRIES} "
+                f"retries — K sold {k_sold}/{k_filled}, P sold {p_sold}/{p_filled}. "
+                f"Residual naked ~{p_remaining:.2f} shares left to resolution; "
+                f"NOT halting (inspect/redeem manually)."
+            ))
 
         # Estimated realized loss in cents: bought poly at poly_buy_price,
         # sold at implied bid (best-effort estimate; actual proceeds will
