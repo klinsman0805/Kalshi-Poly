@@ -1,10 +1,24 @@
 # Kalshi 15-min Crypto Market-Making Bot
 
 ## Files
-- `engine.py`          — Market discovery, WebSocket feed, orderbook, arb detection
-- `trader.py`          — Order execution, quote manager, position tracking
-- `test_kalshi_bot.py` — 52-test suite (52/52 passing)
+
+### Live runtime (loaded by `app.py`)
+- `app.py`             — Flask entry point + bot lifecycle (run via systemd; see `kalshi-bot.service`)
+- `engine.py`          — Kalshi market discovery, WebSocket feed, orderbook, auth
+- `trader.py`          — Momentum strategy + maker quote manager
+- `arb_trader.py`      — Cross-venue (Kalshi×Polymarket) arb taker strategy
+- `polymarket.py`      — Polymarket CLOB client (orders, fills, WS feed)
+
+### Tools (standalone scripts)
+- `preflight.py`       — Pre-launch readiness check for a new device
+- `pnl_report.py`      — Realized P&L per arb, reconciled from Kalshi + Polymarket APIs
+- `arb_report.py`      — Activity summary from `trades.jsonl`
+- `simulate.py`        — Momentum strategy scenario simulator (tuning aid)
+- `test_kalshi_bot.py` — Pytest suite for `engine` + `trader`
+
+### Config
 - `.env.example`       — Config template
+- `kalshi-bot.service` — systemd unit
 
 ## Install
 ```bash
@@ -24,36 +38,25 @@ python -m pytest test_kalshi_bot.py -v
 python -m unittest test_kalshi_bot -v
 ```
 
-## Usage (integrate into your app)
+## Run
 
-```python
-from engine import BotEngine
-from trader import QuoteManager, execute_arb
+```bash
+# 1. Verify the environment is ready (config, keys, venue connectivity)
+python preflight.py
 
-quote_managers = {a: QuoteManager(a) for a in ["BTC", "ETH", "SOL"]}
+# 2. Start the bot (Flask UI on :5000 + bot threads)
+python app.py
+```
 
-def on_prices(markets, snapshots):
-    for asset, snap_dict in snapshots.items():
-        if snap_dict:
-            mkt = markets.get(asset)
-            snap = ...  # your snapshot object
-            quote_managers[asset].update(snap, mkt)
+Or install as a service: copy `kalshi-bot.service` to `/etc/systemd/system/` and
+`systemctl enable --now kalshi-bot`.
 
-def on_arb(snap):
-    # Fires when taker-profitable gap detected
-    mkt = bot.markets[snap.asset]
-    execute_arb(snap, mkt, bot)
+## Reporting
 
-def on_log(icon, msg):
-    print(f"{icon} {msg}")
-
-bot = BotEngine(
-    on_log=on_log,
-    on_prices=on_prices,
-    on_arb=on_arb,
-    on_status=lambda s: print(f"Status: {s}"),
-)
-bot.start()
+```bash
+python arb_report.py            # activity summary from trades.jsonl
+python pnl_report.py            # realized P&L reconciled from venue APIs
+python simulate.py --help       # momentum strategy scenario sweeps
 ```
 
 ## Key design decisions vs Polymarket bot
