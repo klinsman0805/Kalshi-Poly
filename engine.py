@@ -372,6 +372,7 @@ class MarketSnapshot:
             "yes_ask":   self.yes_ask,
             "no_ask":    self.no_ask,
             "mid":       self.mid,
+            "floor_strike": self.floor_strike,
         }
 
 # ── Bot engine ────────────────────────────────────────────────────────────────
