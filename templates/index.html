@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Scalping × Soccer Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body>
+<div class="shell">
+
+  <!-- TOPBAR -->
+  <div class="topbar">
+    <div class="logo">EDGE<em>/</em>DESK</div>
+    <div class="sdot" id="sdot"></div>
+    <span id="slabel">STOPPED</span>
+    <div class="tabs">
+      <button class="tab active" id="tab-scalp"  onclick="showTab('scalp')">Scalping</button>
+      <button class="tab"        id="tab-soccer" onclick="showTab('soccer')">Soccer</button>
+      <button class="tab"        id="tab-copy"   onclick="showTab('copy')" style="display:none">Copy-Trade</button>
+    </div>
+    <div class="spacer"></div>
+    <span class="dry-pill" id="dry-pill">Dry-run · paper</span>
+    <div class="data-dot-wrap">
+      <div class="data-dot" id="data-dot"></div>
+      <span id="data-label">No data</span>
+    </div>
+    <button class="btn"          id="btn-start" onclick="startBot()">&#9654; Start</button>
+    <button class="btn btn-stop" id="btn-stop"  onclick="stopBot()" style="display:none">&#9632; Stop</button>
+  </div>
+
+  <!-- MODULES -->
+  <div class="main">
+
+    <!-- SCALPING -->
+    <div class="view active" id="view-scalp">
+      <div class="section-lbl" id="scalp-summary">Crypto scalping · Kalshi 15-min up/down vs live spot</div>
+      <div class="scalp-grid" id="scalp-grid">
+        <div class="no-data">Waiting for market data…</div>
+      </div>
+    </div>
+
+    <!-- SOCCER -->
+    <div class="view" id="view-soccer">
+      <div class="section-lbl" id="soccer-summary">World Cup · Kalshi vs Polymarket cross-venue</div>
+
+      <!-- Execution bar -->
+      <div class="exec-bar" id="exec-bar">
+        <span class="exec-lbl">Execution</span>
+        <div class="exec-toggle">
+          <button class="exec-btn active" id="exec-paper" onclick="setExecMode('paper')">Paper</button>
+          <button class="exec-btn" id="exec-live" onclick="setExecMode('live')">Live</button>
+        </div>
+        <span class="exec-arm" id="exec-arm"></span>
+        <span class="exec-stake">Stake $<input type="number" id="exec-stake" min="1" step="1" value="5" onchange="setStake()"></span>
+        <div class="spacer"></div>
+        <span class="exec-stat">Open <b id="exec-open">0</b></span>
+        <span class="exec-stat">Placed <b id="exec-placed">0</b></span>
+        <span class="exec-stat">Staked <b id="exec-staked">$0</b></span>
+      </div>
+      <div class="exec-pos" id="exec-pos"></div>
+
+      <table class="soccer-tbl">
+        <thead>
+          <tr>
+            <th class="l">Match</th>
+            <th>Home (K / P)</th>
+            <th>Draw (K / P)</th>
+            <th>Away (K / P)</th>
+            <th>Signal</th>
+          </tr>
+        </thead>
+        <tbody id="soccer-body">
+          <tr><td colspan="5"><div class="no-data">Loading World Cup matches…</div></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- COPY-TRADE VIEW -->
+    <div class="view" id="view-copy">
+      <div class="section-lbl" id="copy-summary">Polymarket leaderboard · copy-trade candidates</div>
+      <div class="exec-bar">
+        <span class="exec-stat">Rank by
+          <select id="copy-metric" onchange="copyRescan()">
+            <option value="profit">Profit</option>
+            <option value="volume">Volume</option>
+          </select>
+        </span>
+        <span class="exec-stat">Window
+          <select id="copy-window" onchange="copyRescan()">
+            <option value="all">All-time</option>
+            <option value="30d">30d</option>
+            <option value="7d">7d</option>
+            <option value="1d">1d</option>
+          </select>
+        </span>
+        <span class="exec-stat copy-only" id="copy-onlybox">
+          <label><input type="checkbox" id="copy-only" onchange="renderCopy()"> copyable only</label>
+        </span>
+        <button class="exec-btn" id="copy-scan" onclick="copyRescan()">⟳ Re-scan</button>
+        <span class="exec-arm" id="copy-note"></span>
+      </div>
+      <!-- forward-test executor scoreboard -->
+      <div class="exec-bar" id="copyexec-bar">
+        <span class="exec-arm" id="copyexec-mode">📄 PAPER forward-test</span>
+        <span class="exec-stat">Copied <b id="cx-copied">0</b></span>
+        <span class="exec-stat">Open <b id="cx-open">0</b></span>
+        <span class="exec-stat">Settled <b id="cx-settled">0</b></span>
+        <span class="exec-stat">Win <b id="cx-win">—</b></span>
+        <span class="exec-stat">Paper P&L <b id="cx-pnl">$0</b></span>
+        <span class="exec-stat">Avg slip <b id="cx-slip">—</b></span>
+        <span class="exec-stat">Following <b id="cx-follow">0</b></span>
+      </div>
+      <div class="exec-pos" id="copyexec-pos"></div>
+
+      <table class="soccer-tbl copy-tbl">
+        <thead>
+          <tr>
+            <th class="l">Trader</th>
+            <th title="Leaderboard realized profit (primary signal)">Profit</th>
+            <th title="Lifetime realized win rate over settled markets (* = partial history)">Real Win%</th>
+            <th title="Lifetime realized ROI — inflated when history is capped">Real ROI</th>
+            <th title="Settled markets reconstructed">Settled</th>
+            <th title="Average trade size — smaller = easier to copy without moving the book">Avg $</th>
+            <th title="Open positions snapshot">Open</th>
+            <th>Copyable</th>
+          </tr>
+        </thead>
+        <tbody id="copy-body">
+          <tr><td colspan="8"><div class="no-data">Copy-trade scanner is off (COPYTRADE_ENABLED=false).</div></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+  </div>
+
+  <!-- LOG PANEL -->
+  <div id="log-panel">
+    <div class="log-ph">
+      <div class="log-pt">Event Log</div>
+      <div class="spacer"></div>
+      <div class="data-dot-wrap" style="margin-right:8px">
+        <div class="data-dot" id="conn-dot"></div>
+        <span id="conn-label" style="font-size:9px;color:var(--muted)">Disconnected</span>
+      </div>
+      <button class="log-toggle" onclick="toggleLog()" id="log-toggle-btn">Expand</button>
+    </div>
+    <div id="log-body"></div>
+  </div>
+
+</div>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
