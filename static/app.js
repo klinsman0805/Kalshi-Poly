@@ -1,13 +1,13 @@
 // ── State ─────────────────────────────────────────────────────────────────────
 const S = {
   tab: 'scalp', botRunning: false,
-  scalp: {}, scalpSession: {}, soccer: [], soccerCfg: {}, exec: null,
+  scalp: {}, scalpSession: {},
   copy: [], copyCfg: {}, copyEnabled: false, copyScanning: false, copyExec: null,
   lastDataTs: 0, logExpanded: false,
 };
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
-const TABS = ['scalp', 'soccer', 'copy'];
+const TABS = ['scalp', 'copy'];
 function showTab(t) {
   S.tab = t;
   TABS.forEach(x => {
@@ -41,11 +41,6 @@ function handleMsg(m) {
       S.scalp = m.assets || {}; S.scalpSession = m.session || {};
       S.lastDataTs = Date.now(); if (S.tab === 'scalp') renderScalp();
       renderScalpSummary(); break;
-    case 'soccer':
-      S.soccer = m.matches || []; S.soccerCfg = m.config || {};
-      if (m.exec) { S.exec = m.exec; renderExec(); }
-      S.lastDataTs = Date.now(); if (S.tab === 'soccer') renderSoccer();
-      renderSoccerSummary(); break;
     case 'copytrade':
       applyCopy(m); break;
   }
@@ -135,136 +130,6 @@ function renderScalpSummary() {
     `Crypto scalping · Kalshi 15-min up/down vs live spot &nbsp;·&nbsp; ` +
     `paper P&L <b style="color:${(s.pnl||0)>=0?'var(--ok)':'var(--down)'}">${(s.pnl||0)>=0?'+':''}$${(s.pnl||0).toFixed(4)}</b> ` +
     `· ${s.trades||0} settled · ${wr!=null?wr+'% win':'—'}`;
-}
-
-// ── Soccer render ─────────────────────────────────────────────────────────────
-function kickoff(iso) {
-  if (!iso) return '';
-  const d = new Date(iso), now = new Date();
-  const diff = (d - now) / 1000;
-  if (diff < 0) return 'live / past';
-  const h = Math.floor(diff/3600), m = Math.floor(diff%3600/60);
-  return h > 48 ? Math.floor(h/24)+'d' : h > 0 ? h+'h '+m+'m' : m+'m';
-}
-
-function ocell(o, isBuy) {
-  if (!o) return '<td><div class="cell"><span class="k">—</span></div></td>';
-  // best positive edge for this outcome, across venues
-  let edge = null, venue = null;
-  if (o.edge_p != null && o.edge_p > 0) { edge = o.edge_p; venue = 'P'; }
-  if (o.edge_k != null && o.edge_k > 0 && (edge == null || o.edge_k > edge)) { edge = o.edge_k; venue = 'K'; }
-  const edgeStr = edge != null
-    ? `<span class="edge buy">▲ ${venue} +${edge}¢</span>` : '';
-  const fairStr = o.fair != null ? `<span class="fair">fair ${o.fair}¢</span>` : '';
-  return `<td><div class="cell ${isBuy?'buycell':''}">
-    <span class="kp"><span class="k">K ${o.kalshi!=null?o.kalshi+'¢':'—'}</span>
-      <span class="p">P ${o.poly!=null?o.poly+'¢':'—'}</span></span>
-    ${fairStr}${edgeStr}</div></td>`;
-}
-
-function renderSoccer() {
-  const body = document.getElementById('soccer-body');
-  if (!S.soccer.length) {
-    body.innerHTML = '<tr><td colspan="5"><div class="no-data">No World Cup matches open right now.</div></td></tr>';
-    return;
-  }
-  body.innerHTML = S.soccer.map(m => {
-    const o = m.outcomes || {};
-    const buySlot = (m.chip_buy && m.chip !== 'BASIS-RISK') ? m.chip_buy.slot : null;
-    let chip, sub = '';
-    if (m.chip === 'NEWS-LAG') {
-      const b = m.chip_buy || {};
-      chip = `<span class="vchip news">⚡ NEWS-LAG +${m.chip_edge}¢</span>`;
-      sub = `<div class="chip-sub">buy <b>${b.venue} ${b.slot}</b> @ ${b.ask}¢ <span class="basis-tag">${esc(m.chip_basis||'')}</span></div>`;
-    } else if (m.chip === 'DRAW-VALUE' || m.chip === 'VALUE') {
-      const b = m.chip_buy || {};
-      const basis = m.chip_basis === 'model' ? 'vs model' : 'vs cross-venue';
-      chip = `<span class="vchip ${m.chip==='DRAW-VALUE'?'draw':'cross'}">${m.chip} +${m.chip_edge}¢</span>`;
-      sub = `<div class="chip-sub">buy <b>${b.venue} ${b.slot}</b> @ ${b.ask}¢ <span class="basis-tag">${basis}</span></div>`;
-    } else if (m.chip === 'BASIS-RISK') {
-      chip = `<span class="vchip basis" title="${esc(m.reason||'')}">⚠ BASIS-RISK</span>`;
-      sub = `<div class="chip-sub dim">${esc(m.reason||'')}</div>`;
-    } else if (!m.linked) {
-      chip = '<span class="vchip none">no Poly link</span>';
-    } else {
-      chip = '<span class="vchip none">fair priced</span>';
-    }
-    const mdl = m.model
-      ? `<div class="model">⌁ model H/D/A ${m.model.home}/${m.model.draw}/${m.model.away}` +
-        `${m.model_balanced ? '' : ' <span class="mdl-warn">(lopsided · low trust)</span>'}</div>`
-      : '';
-    const lv = m.live || {};
-    const isLive = lv.state === 'in';
-    const venueTag = m.venues === 'poly' ? ' <span class="venue-only">Poly-only</span>' : '';
-    const timeline = isLive
-      ? `<div class="kickoff live">🔴 LIVE ${esc(lv.clock||lv.detail||'')}${lv.score?` · ${esc(lv.score)}`:''}</div>`
-      : `<div class="kickoff">⏱ ${kickoff(m.start)}${m.blend_wp!=null?` · blend P${Math.round(m.blend_wp*100)}/K${Math.round((1-m.blend_wp)*100)}`:''}</div>`;
-    return `<tr class="${m.chip==='BASIS-RISK'?'rbasis':''} ${isLive?'rlive':''}">
-      <td class="l"><div class="match">${m.home} <small>vs</small> ${m.away}${venueTag}</div>
-        ${timeline}
-        ${mdl}</td>
-      ${ocell(o.home, buySlot==='home')}${ocell(o.draw, buySlot==='draw')}${ocell(o.away, buySlot==='away')}
-      <td class="chipcol">${chip}${sub}</td>
-    </tr>`;
-  }).join('');
-}
-
-function renderSoccerSummary() {
-  const cfg = S.soccerCfg || {};
-  const live = S.soccer.filter(m => (m.live||{}).state === 'in').length;
-  const linked = S.soccer.filter(m => m.linked).length;
-  const news = S.soccer.filter(m => m.chip === 'NEWS-LAG').length;
-  const sigs = S.soccer.filter(m => m.chip === 'DRAW-VALUE' || m.chip === 'VALUE').length;
-  document.getElementById('soccer-summary').innerHTML =
-    `Soccer · Kalshi×Poly + live &nbsp;·&nbsp; ${S.soccer.length} matches · ` +
-    `<b style="color:var(--down)">${live} live</b> · ${linked} cross-venue · ` +
-    (news ? `<b style="color:var(--down)">${news} news-lag</b> · ` : '') +
-    `<b style="color:var(--accent)">${sigs}</b> value signals &nbsp;·&nbsp; edge ≥${cfg.value_edge_c||3}¢`;
-}
-
-// ── Execution bar ─────────────────────────────────────────────────────────────
-function renderExec() {
-  const e = S.exec; if (!e) return;
-  document.getElementById('exec-paper').classList.toggle('active', e.mode === 'paper');
-  document.getElementById('exec-live').classList.toggle('active', e.mode === 'live');
-  const arm = document.getElementById('exec-arm');
-  if (!e.env_armed) { arm.textContent = '🔒 SOCCER_LIVE not set — paper only'; arm.className = 'exec-arm locked'; }
-  else if (e.live)  { arm.textContent = '🔴 LIVE — real orders'; arm.className = 'exec-arm live'; }
-  else              { arm.textContent = '🟢 armed · paper'; arm.className = 'exec-arm ok'; }
-  const s = e.session || {};
-  document.getElementById('exec-open').textContent = (e.open || []).length;
-  document.getElementById('exec-placed').textContent = s.placed || 0;
-  document.getElementById('exec-staked').textContent = '$' + (s.staked_usd || 0);
-  const st = document.getElementById('exec-stake');
-  if (document.activeElement !== st && e.stake_usd != null) st.value = e.stake_usd;
-
-  const pos = e.open || [];
-  const box = document.getElementById('exec-pos');
-  if (!pos.length) { box.innerHTML = ''; return; }
-  box.innerHTML = '<div class="pos-hd">Open positions</div>' + pos.map(p =>
-    `<div class="pos-row ${p.mode}">
-       <span class="pos-mode">${p.mode === 'live' ? 'LIVE' : 'PAPER'}</span>
-       <span class="pos-match">${esc(p.match)}</span>
-       <span class="pos-buy">${p.venue} ${p.slot} @ ${p.price}¢ ×${p.filled}</span>
-       <span class="pos-cost">$${p.cost_usd}</span>
-       <span class="pos-chip">${p.chip} +${p.edge_c}¢</span>
-     </div>`).join('');
-}
-
-async function setExecMode(mode) {
-  if (mode === 'live' && !(S.exec && S.exec.env_armed)) {
-    alert('Live orders are locked. Launch with SOCCER_LIVE=true to arm.'); return;
-  }
-  if (mode === 'live' && !confirm('Switch to LIVE — this will place REAL orders on signal. Continue?')) return;
-  const r = await fetch('/api/soccer_config', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({mode})}).then(r=>r.json());
-  S.exec = r; renderExec();
-}
-async function setStake() {
-  const v = parseFloat(document.getElementById('exec-stake').value) || 5;
-  const r = await fetch('/api/soccer_config', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({stake_usd: v})}).then(r=>r.json());
-  S.exec = r; renderExec();
 }
 
 // ── Copy-trade render ───────────────────────────────────────────────────────────
@@ -414,12 +279,6 @@ async function pollOnce() {
   try {
     const sc = await fetch('/api/scalping').then(r=>r.json());
     S.scalp = sc.assets||{}; S.scalpSession = sc.session||{}; renderScalp(); renderScalpSummary();
-  } catch(e){}
-  try {
-    const so = await fetch('/api/soccer').then(r=>r.json());
-    S.soccer = so.matches||[]; S.soccerCfg = so.config||{};
-    if (so.exec) { S.exec = so.exec; renderExec(); }
-    renderSoccer(); renderSoccerSummary();
   } catch(e){}
   try {
     const cp = await fetch('/api/copytrade').then(r=>r.json());

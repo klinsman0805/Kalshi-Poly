@@ -122,7 +122,7 @@ class CopyTradeExecutor:
             self.on_log("→", f"[copyexec] recovered {len(self.open)} open / "
                              f"{self.session['settled']} settled copies from {POS_LOG}")
 
-    # ── mode control (mirrors SoccerExecutor) ────────────────────────────────
+    # ── mode control ─────────────────────────────────────────────────────────
     def set_mode(self, mode):
         mode = (mode or "paper").lower()
         if mode == "live" and not ENV_ARMED:

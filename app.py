@@ -1,13 +1,11 @@
 """
-app.py — Two-module trading dashboard: SCALPING (crypto) + SOCCER (World Cup).
+app.py — Trading dashboard: SCALPING (Kalshi paper reference) + COPY-TRADE (Polymarket).
 
 Monitor + dry-run signals (no real orders in this build).
   • Scalping: Kalshi 15-min up/down vs live Coinbase spot → edge / fee gate /
-    paper P&L that settles within the 15-min window.
-  • Soccer:  Kalshi KXWCGAME vs Polymarket per-match → cross-venue spread +
-    Draw-underpricing flags, logged as signals.
-
-The legacy cross-venue arb dashboard is preserved in app_arb.py.
+    paper P&L that settles within the 15-min window. Kept as the reference
+    implementation of the Kalshi paper-trade pattern (no live edge at n=135).
+  • Copy-trade: Polymarket leaderboard scanner + forward-test executor.
 
 Run:  python app.py     →  http://localhost:5001
 """
@@ -40,8 +38,6 @@ import engine
 from feeds import poly_leaderboard
 from feeds.spot import SpotFeed
 from modules.scalping import ScalpEngine
-from modules.soccer import SoccerEngine
-from modules.soccer_exec import SoccerExecutor
 from modules.copytrader import CopyTraderEngine
 from modules.copytrade_exec import CopyTradeExecutor
 
@@ -57,10 +53,6 @@ _event_queue: queue.Queue = queue.Queue(maxsize=500)
 
 _spot = SpotFeed(assets=engine.ASSETS)
 _scalp = ScalpEngine(dry_run=True)
-_soccer_exec = SoccerExecutor()
-_soccer = SoccerEngine(dry_run=True, executor=_soccer_exec)
-_soccer_thread = None
-_soccer_stop = threading.Event()
 
 # Copy-trade scanner (Polymarket only, read-only) — off unless COPYTRADE_ENABLED=true.
 _copytrade = CopyTraderEngine()
@@ -92,8 +84,6 @@ def _add_log(icon: str, msg: str):
 
 
 _scalp.on_log = _add_log
-_soccer.on_log = _add_log
-_soccer_exec.on_log = _add_log
 _copytrade.on_log = _add_log
 _copytrade_exec.on_log = _add_log
 
@@ -115,18 +105,6 @@ def _on_prices(markets, snapshots):
 def _on_status(status):
     BOT_STATE["status"] = status
     _push("status", {"status": status})
-
-
-# ── Soccer poll loop ──────────────────────────────────────────────────────────
-def _soccer_loop():
-    while not _soccer_stop.is_set():
-        try:
-            rows = _soccer.refresh()
-            _push("soccer", {"matches": rows, "config": _soccer.state()["config"],
-                             "exec": _soccer_exec.state()})
-        except Exception as e:  # noqa: BLE001
-            _add_log("✗", f"soccer refresh error: {e}")
-        _soccer_stop.wait(12)
 
 
 # ── Copy-trade poll loop (Polymarket scan) ────────────────────────────────────
@@ -157,7 +135,7 @@ def _copytrade_exec_loop():
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
 def _start_bot():
-    global _bot, _soccer_thread
+    global _bot
     with _bot_lock:
         if _bot and _bot.is_running():
             return False, "already running"
@@ -169,10 +147,6 @@ def _start_bot():
         BOT_STATE["status"] = "starting"
         threading.Thread(target=engine.pre_warm_connection, daemon=True, name="http-prewarm").start()
         threading.Thread(target=_bot.start, daemon=True, name="bot-start").start()
-        _soccer_stop.clear()
-        if not (_soccer_thread and _soccer_thread.is_alive()):
-            _soccer_thread = threading.Thread(target=_soccer_loop, daemon=True, name="soccer-poll")
-            _soccer_thread.start()
         global _copytrade_thread
         if _copytrade.enabled and not (_copytrade_thread and _copytrade_thread.is_alive()):
             _copytrade_stop.clear()
@@ -180,14 +154,13 @@ def _start_bot():
             _copytrade_thread.start()
             threading.Thread(target=_copytrade_exec_loop, daemon=True, name="copytrade-exec").start()
             _add_log("◆", "Copy-trade scanner + forward-test executor ENABLED (paper)")
-        _add_log("→", "Dashboard started — scalping + soccer feeds live (dry-run)")
+        _add_log("→", "Dashboard started — scalping + copy-trade feeds live (dry-run)")
         return True, "ok"
 
 
 def _stop_bot():
     global _bot
     with _bot_lock:
-        _soccer_stop.set()
         _copytrade_stop.set()
         _spot.stop()
         if _bot:
@@ -244,27 +217,6 @@ def api_scalping():
     return jsonify(_scalp.state())
 
 
-@app.route("/api/soccer")
-def api_soccer():
-    st = _soccer.state()
-    st["exec"] = _soccer_exec.state()
-    return jsonify(st)
-
-
-@app.route("/api/soccer_config", methods=["POST"])
-def api_soccer_config():
-    data = request.get_json() or {}
-    if "mode" in data:
-        _soccer_exec.set_mode(data["mode"])
-    if "stake_usd" in data:
-        try:
-            _soccer_exec.stake_usd = max(1.0, float(data["stake_usd"]))
-            _add_log("⚙", f"[exec] stake = ${_soccer_exec.stake_usd}")
-        except (TypeError, ValueError):
-            pass
-    return jsonify(_soccer_exec.state())
-
-
 @app.route("/api/copytrade")
 def api_copytrade():
     """Copy-trade scan results + forward-test executor state."""
@@ -312,7 +264,7 @@ if __name__ == "__main__":
 
     creds_ok = bool(engine.KALSHI_KEY_ID and Path(engine.KALSHI_KEY_FILE).exists())
     print("\n" + "=" * 60)
-    print("  TWO-MODULE DASHBOARD — Scalping + Soccer (monitor + dry-run)")
+    print("  DASHBOARD — Scalping (paper) + Copy-trade (monitor + dry-run)")
     print(f"  Dashboard → http://localhost:5001")
     print(f"  Kalshi WS creds: {'found' if creds_ok else 'MISSING (ticker-only data)'}")
     print("=" * 60 + "\n")

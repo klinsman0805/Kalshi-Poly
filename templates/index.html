@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Scalping × Soccer Dashboard</title>
+<title>Edge Desk — Trading Dashboard</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
@@ -18,7 +18,6 @@
     <span id="slabel">STOPPED</span>
     <div class="tabs">
       <button class="tab active" id="tab-scalp"  onclick="showTab('scalp')">Scalping</button>
-      <button class="tab"        id="tab-soccer" onclick="showTab('soccer')">Soccer</button>
       <button class="tab"        id="tab-copy"   onclick="showTab('copy')" style="display:none">Copy-Trade</button>
     </div>
     <div class="spacer"></div>
@@ -40,42 +39,6 @@
       <div class="scalp-grid" id="scalp-grid">
         <div class="no-data">Waiting for market data…</div>
       </div>
-    </div>
-
-    <!-- SOCCER -->
-    <div class="view" id="view-soccer">
-      <div class="section-lbl" id="soccer-summary">World Cup · Kalshi vs Polymarket cross-venue</div>
-
-      <!-- Execution bar -->
-      <div class="exec-bar" id="exec-bar">
-        <span class="exec-lbl">Execution</span>
-        <div class="exec-toggle">
-          <button class="exec-btn active" id="exec-paper" onclick="setExecMode('paper')">Paper</button>
-          <button class="exec-btn" id="exec-live" onclick="setExecMode('live')">Live</button>
-        </div>
-        <span class="exec-arm" id="exec-arm"></span>
-        <span class="exec-stake">Stake $<input type="number" id="exec-stake" min="1" step="1" value="5" onchange="setStake()"></span>
-        <div class="spacer"></div>
-        <span class="exec-stat">Open <b id="exec-open">0</b></span>
-        <span class="exec-stat">Placed <b id="exec-placed">0</b></span>
-        <span class="exec-stat">Staked <b id="exec-staked">$0</b></span>
-      </div>
-      <div class="exec-pos" id="exec-pos"></div>
-
-      <table class="soccer-tbl">
-        <thead>
-          <tr>
-            <th class="l">Match</th>
-            <th>Home (K / P)</th>
-            <th>Draw (K / P)</th>
-            <th>Away (K / P)</th>
-            <th>Signal</th>
-          </tr>
-        </thead>
-        <tbody id="soccer-body">
-          <tr><td colspan="5"><div class="no-data">Loading World Cup matches…</div></td></tr>
-        </tbody>
-      </table>
     </div>
 
     <!-- COPY-TRADE VIEW -->
@@ -115,7 +78,7 @@
       </div>
       <div class="exec-pos" id="copyexec-pos"></div>
 
-      <table class="soccer-tbl copy-tbl">
+      <table class="data-tbl copy-tbl">
         <thead>
           <tr>
             <th class="l">Trader</th>

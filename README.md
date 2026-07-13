@@ -1,9 +1,17 @@
-# Kalshi 15-min Crypto Market-Making Bot
+# Kalshi × Polymarket Trading Bot
+
+Active experiments: **copy-trade scanner** (Polymarket) and **weather trading** (in progress).
+Retired strategies (cross-venue arb, single-venue ladder arb, scalping, soccer) were removed —
+see git history and `archive/` for their logs.
 
 ## Files
-- `engine.py`          — Market discovery, WebSocket feed, orderbook, arb detection
-- `trader.py`          — Order execution, quote manager, position tracking
-- `test_kalshi_bot.py` — 52-test suite (52/52 passing)
+- `app.py`             — Flask dashboard (SSE): scalping reference panel + copy-trade panel
+- `engine.py`          — Kalshi market discovery, WebSocket feed, orderbook
+- `trader.py`          — Kalshi order execution, quote manager, position tracking
+- `polymarket.py`      — Polymarket CLOB client: WS books, FOK buy/sell, fees, auth
+- `modules/`           — Strategy engines (scalping paper reference, copytrader + exec)
+- `feeds/`             — Data feeds (Coinbase spot, Polymarket leaderboard)
+- `test_kalshi_bot.py` — Kalshi engine/trader test suite
 - `.env.example`       — Config template
 
 ## Install

@@ -51,7 +51,7 @@ b{font-weight:600}
 
 .section-lbl{font-size:8px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim);
   margin:4px 0 8px}
-#soccer-summary{font-size:12px;letter-spacing:.02em;text-transform:none;color:var(--muted);margin:2px 0 12px}
+#scalp-summary,#copy-summary{font-size:12px;letter-spacing:.02em;text-transform:none;color:var(--muted);margin:2px 0 12px}
 .no-data{color:var(--muted);font-size:11px;padding:34px 16px;text-align:center;line-height:1.9}
 
 /* ── Scalping cards ── */
@@ -92,16 +92,11 @@ b{font-weight:600}
 /* ── Execution bar ── */
 .exec-bar{display:flex;align-items:center;gap:14px;padding:9px 12px;margin-bottom:10px;
   background:var(--surf);border:1px solid var(--border2);border-radius:7px;font-size:12px}
-.exec-lbl{font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
-.exec-toggle{display:flex;background:var(--surf2);border:1px solid var(--border2);border-radius:6px;padding:2px}
 .exec-btn{padding:4px 14px;border:none;background:transparent;color:var(--muted);cursor:pointer;
   font-family:inherit;font-size:11px;letter-spacing:.08em;text-transform:uppercase;border-radius:4px}
 .exec-btn.active{background:rgba(0,212,170,.16);color:var(--accent)}
-.exec-btn#exec-live.active{background:rgba(255,107,107,.18);color:var(--down)}
 .exec-arm{font-size:11px}
 .exec-arm.locked{color:var(--muted)}.exec-arm.ok{color:var(--ok)}.exec-arm.live{color:var(--down);font-weight:600}
-.exec-stake input{width:54px;background:var(--surf2);border:1px solid var(--border2);color:var(--text);
-  font-family:inherit;font-size:12px;padding:3px 6px;border-radius:4px}
 .exec-stat{font-size:11px;color:var(--muted)}.exec-stat b{color:var(--text)}
 .exec-pos{margin-bottom:12px}
 .pos-hd{font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim);margin:2px 0 6px}
@@ -113,40 +108,21 @@ b{font-weight:600}
 .pos-match{font-weight:600;flex:1}.pos-buy{color:var(--up)}.pos-cost{color:var(--text)}
 .pos-chip{font-size:10px;color:var(--accent)}
 
-/* ── Soccer table (enlarged for readability) ── */
-.soccer-tbl{width:100%;border-collapse:collapse;font-size:14px}
-.soccer-tbl th{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);
+/* ── Data table (copy-trade, weather-to-be) ── */
+.data-tbl{width:100%;border-collapse:collapse;font-size:14px}
+.data-tbl th{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);
   text-align:center;padding:10px 12px;border-bottom:1px solid var(--border);font-weight:400}
-.soccer-tbl th.l{text-align:left}
-.soccer-tbl td{padding:12px 12px;border-bottom:1px solid var(--border);text-align:center;vertical-align:top}
-.soccer-tbl td.l{text-align:left}
-.soccer-tbl tr.rbasis{opacity:.62}
-.soccer-tbl tr:hover{background:rgba(255,255,255,.02)}
+.data-tbl th.l{text-align:left}
+.data-tbl td{padding:12px 12px;border-bottom:1px solid var(--border);text-align:center;vertical-align:top}
+.data-tbl td.l{text-align:left}
+.data-tbl tr:hover{background:rgba(255,255,255,.02)}
 .match{font-weight:600;font-size:15px}.match small{color:var(--muted);font-weight:400;font-size:12px}
 .kickoff{font-size:11px;color:var(--muted);margin-top:3px}
-.model{font-size:11px;color:var(--purple);margin-top:4px;opacity:.85}
-.model .mdl-warn{color:var(--warn);opacity:.9}
 .basis-tag{color:var(--muted);font-weight:400}
-.cell{display:flex;flex-direction:column;gap:3px;align-items:center;padding:4px 6px;border-radius:5px}
-.cell .kp{display:flex;gap:10px;font-size:14px}
-.cell .k{color:var(--text)}.cell .p{color:var(--up)}
-.cell .fair{font-size:12px;color:var(--muted)}
-.cell .fair b{color:var(--text)}
-.cell .edge{font-size:11px;font-weight:600}
-.cell .edge.buy{color:var(--ok)}
-.cell.buycell{background:rgba(34,197,94,.1);outline:1px solid rgba(34,197,94,.4)}
 .vchip{font-size:11px;font-weight:600;letter-spacing:.04em;padding:4px 9px;border-radius:4px;
   display:inline-block;white-space:nowrap}
-.vchip.draw{background:rgba(167,139,250,.16);color:var(--purple);border:1px solid rgba(167,139,250,.35)}
 .vchip.cross{background:rgba(0,212,170,.14);color:var(--accent);border:1px solid rgba(0,212,170,.3)}
-.vchip.basis{background:rgba(245,166,35,.14);color:var(--warn);border:1px solid rgba(245,166,35,.4);cursor:help}
-.vchip.news{background:rgba(255,107,107,.18);color:var(--down);border:1px solid rgba(255,107,107,.5);animation:pulse 1.5s infinite}
-.kickoff.live{color:var(--down);font-weight:600}
-.soccer-tbl tr.rlive{background:rgba(255,107,107,.05)}
-.venue-only{font-size:9px;color:var(--purple);border:1px solid rgba(167,139,250,.3);border-radius:3px;padding:1px 5px;font-weight:400}
 .vchip.none{color:var(--muted);border:1px solid var(--border)}
-.chip-sub{font-size:10px;color:var(--ok);margin-top:4px;max-width:180px;line-height:1.4}
-.chip-sub.dim{color:var(--muted)}
 .chipcol{min-width:160px}
 
 /* ── Log panel ── */
