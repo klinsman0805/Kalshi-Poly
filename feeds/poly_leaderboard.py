@@ -240,27 +240,38 @@ def token_price(token_id: str, side: str = "buy"):
         return None
 
 
+def _gamma_market(token_id: str, closed: bool):
+    """One gamma market row for `token_id`, filtered by closed state. [] if none."""
+    r = requests.get(
+        f"{GAMMA_BASE}/markets",
+        params={"clob_token_ids": token_id, "closed": str(bool(closed)).lower()},
+        timeout=12,
+    )
+    r.raise_for_status()
+    return (r.json() or [])
+
+
 def market_resolution(token_id: str):
     """Resolution state for the market that owns `token_id`.
 
     Returns {closed, price} where `price` is this token's outcome price in [0,1]:
-    ~1.0 means this side WON, ~0.0 means it LOST. When `closed` is False the
-    price is just the current quoted value. None on lookup failure.
+    ~1.0 means this side WON, ~0.0 means it LOST. Returns None ONLY on a genuine
+    lookup failure — callers must not treat None as "still open".
+
+    NOTE: gamma's /markets excludes closed markets by default, so a resolved
+    market looks like a 404 unless you ask for closed=true explicitly. We probe
+    closed first (that's the state we care about), then fall back to open.
     """
+    import json as _json
     try:
-        r = requests.get(
-            f"{GAMMA_BASE}/markets",
-            params={"clob_token_ids": token_id},
-            timeout=12,
-        )
-        r.raise_for_status()
-        rows = r.json() or []
+        rows = _gamma_market(token_id, closed=True)
+        if not rows:
+            rows = _gamma_market(token_id, closed=False)
         if not rows:
             return None
         m = rows[0]
         ids = m.get("clobTokenIds")
         prices = m.get("outcomePrices")
-        import json as _json
         if isinstance(ids, str):
             ids = _json.loads(ids)
         if isinstance(prices, str):

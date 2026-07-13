@@ -69,7 +69,58 @@ class CopyTradeExecutor:
         self.session = {
             "copied": 0, "skipped": 0, "settled": 0, "wins": 0, "losses": 0,
             "staked_usd": 0.0, "realized_pnl": 0.0, "slippage_c_sum": 0,
+            "lookup_fails": 0,
         }
+        self._rehydrate()
+
+    # ── crash/restart recovery ───────────────────────────────────────────────
+    def _rehydrate(self):
+        """Rebuild state from the jsonl so a restart doesn't orphan open copies.
+
+        Without this the forward test silently resets on every restart: copies
+        recorded on disk stay unsettled forever because `open` starts empty.
+        Replays copy_open / copy_settle records to restore open positions,
+        settled tallies, dedup keys and per-wallet cursors.
+        """
+        if not POS_LOG.exists():
+            return
+        settled_tokens = set()
+        opens = {}
+        try:
+            for line in POS_LOG.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                t, tok = rec.get("type"), rec.get("token")
+                if t == "copy_open":
+                    opens[(tok, rec.get("ts"))] = rec
+                    self.session["copied"] += 1
+                    self.session["staked_usd"] = round(
+                        self.session["staked_usd"] + float(rec.get("cost_usd") or 0), 2)
+                    self.session["slippage_c_sum"] += int(rec.get("slippage_c") or 0)
+                elif t == "copy_settle":
+                    settled_tokens.add((tok, rec.get("ts")))
+                    pnl = float(rec.get("pnl_usd") or 0)
+                    self.session["settled"] += 1
+                    self.session["wins" if rec.get("won") else "losses"] += 1
+                    self.session["realized_pnl"] = round(self.session["realized_pnl"] + pnl, 2)
+                    self.closed.append(rec)
+        except Exception as e:  # noqa: BLE001
+            log.warning("rehydrate failed: %s", e)
+            return
+
+        for key, rec in opens.items():
+            if key in settled_tokens:
+                continue
+            rec.pop("type", None)   # don't let the on-disk tag ride along in memory
+            self.open.append(rec)
+            if rec.get("wallet"):
+                self.follow.add(rec["wallet"])
+        self.closed = self.closed[-200:]
+        if self.open or self.closed:
+            self.on_log("→", f"[copyexec] recovered {len(self.open)} open / "
+                             f"{self.session['settled']} settled copies from {POS_LOG}")
 
     # ── mode control (mirrors SoccerExecutor) ────────────────────────────────
     def set_mode(self, mode):
@@ -180,7 +231,7 @@ class CopyTradeExecutor:
         self.session["copied"] += 1
         self.session["staked_usd"] = round(self.session["staked_usd"] + cost, 2)
         self.session["slippage_c_sum"] += slip
-        self._persist({"type": "copy_open", **pos})
+        self._persist({**pos, "type": "copy_open"})   # type LAST — pos may carry a stale one
         self.on_log("✅", f"[copyexec] {self.mode.upper()} COPIED {wallet[:8]} → "
                          f"{title[:36]} {trade.get('outcome')} @{cur_ask}c ×{filled} "
                          f"(${cost}, slip {slip:+d}c vs {their_price}c)")
@@ -188,10 +239,19 @@ class CopyTradeExecutor:
     # ── settlement: book win/loss as copied markets resolve ──────────────────
     def mark_resolutions(self):
         still_open = []
+        lookup_fails = 0
         for pos in self.open:
             res = poly_leaderboard.market_resolution(pos["token"])
-            if not res or not res.get("closed") or res.get("price") is None:
+            if res is None:
+                # LOOKUP FAILED — this is NOT "still open". Conflating the two
+                # silently stalls the forward test whenever the API is down.
+                lookup_fails += 1
+                pos["lookup_fails"] = pos.get("lookup_fails", 0) + 1
                 still_open.append(pos)
+                continue
+            pos.pop("lookup_fails", None)   # recovered
+            if not res.get("closed") or res.get("price") is None:
+                still_open.append(pos)      # genuinely unresolved
                 continue
             payout_c = 100 if res["price"] >= 0.5 else 0   # this token won?
             proceeds = round(pos["filled"] * payout_c / 100.0, 2)
@@ -205,12 +265,19 @@ class CopyTradeExecutor:
             self.session["realized_pnl"] = round(self.session["realized_pnl"] + pnl, 2)
             self.closed.append(pos)
             self.closed = self.closed[-200:]
-            self._persist({"type": "copy_settle", **pos})
+            # type LAST: a rehydrated pos still carries "type": "copy_open", and
+            # {"type": x, **pos} would let it overwrite x and rewrite a fake open.
+            self._persist({**pos, "type": "copy_settle"})
             self.on_log("✅" if won else "✗",
                         f"[copyexec] SETTLED {'WIN' if won else 'LOSS'} "
                         f"{pos['title'][:36]} pnl ${pnl:+.2f} "
                         f"(entry {pos['entry']}c → {payout_c}c)")
         self.open = still_open
+        self.session["lookup_fails"] = lookup_fails
+        if lookup_fails:
+            # Loud, not silent: an unreachable API must never look like "nothing resolved".
+            self.on_log("!", f"[copyexec] {lookup_fails}/{len(self.open)} resolution "
+                             f"lookups FAILED — settlements stalled (API unreachable?)")
 
     # ── order placement ──────────────────────────────────────────────────────
     def _place(self, token, ask, shares):
