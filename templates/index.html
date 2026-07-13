@@ -17,8 +17,9 @@
     <div class="sdot" id="sdot"></div>
     <span id="slabel">STOPPED</span>
     <div class="tabs">
-      <button class="tab active" id="tab-scalp"  onclick="showTab('scalp')">Scalping</button>
-      <button class="tab"        id="tab-copy"   onclick="showTab('copy')" style="display:none">Copy-Trade</button>
+      <button class="tab active" id="tab-scalp"   onclick="showTab('scalp')">Scalping</button>
+      <button class="tab"        id="tab-weather" onclick="showTab('weather')">Weather</button>
+      <button class="tab"        id="tab-copy"    onclick="showTab('copy')" style="display:none">Copy-Trade</button>
     </div>
     <div class="spacer"></div>
     <span class="dry-pill" id="dry-pill">Dry-run · paper</span>
@@ -39,6 +40,40 @@
       <div class="scalp-grid" id="scalp-grid">
         <div class="no-data">Waiting for market data…</div>
       </div>
+    </div>
+
+    <!-- WEATHER VIEW -->
+    <div class="view" id="view-weather">
+      <div class="section-lbl" id="weather-summary">Polymarket daily-high temperature · NEAR-LOCK vs live METAR</div>
+      <!-- forward-test executor scoreboard -->
+      <div class="exec-bar" id="wxexec-bar">
+        <span class="exec-arm" id="wxexec-mode">📄 PAPER forward-test</span>
+        <span class="exec-stat">Open <b id="wx-open">0</b></span>
+        <span class="exec-stat">Settled <b id="wx-settled">0</b></span>
+        <span class="exec-stat">Win <b id="wx-win">—</b></span>
+        <span class="exec-stat" title="Average model probability at entry — win rate should converge to this">Avg model p <b id="wx-avgp">—</b></span>
+        <span class="exec-stat">Paper P&L <b id="wx-pnl">$0</b></span>
+        <span class="exec-stat">Staked <b id="wx-staked">$0</b></span>
+      </div>
+      <div class="exec-pos" id="wxexec-pos"></div>
+
+      <table class="data-tbl">
+        <thead>
+          <tr>
+            <th class="l">City · station</th>
+            <th>Local</th>
+            <th>Now / Day max</th>
+            <th>Best bucket</th>
+            <th>Model p</th>
+            <th>Bid / Ask</th>
+            <th>Edge</th>
+            <th>Signal</th>
+          </tr>
+        </thead>
+        <tbody id="weather-body">
+          <tr><td colspan="8"><div class="no-data">Waiting for weather engine…</div></td></tr>
+        </tbody>
+      </table>
     </div>
 
     <!-- COPY-TRADE VIEW -->

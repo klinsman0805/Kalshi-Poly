@@ -1,11 +1,14 @@
 """
-app.py — Trading dashboard: SCALPING (Kalshi paper reference) + COPY-TRADE (Polymarket).
+app.py — Trading dashboard: SCALPING (Kalshi paper reference) + COPY-TRADE +
+WEATHER NEAR-LOCK (Polymarket).
 
 Monitor + dry-run signals (no real orders in this build).
   • Scalping: Kalshi 15-min up/down vs live Coinbase spot → edge / fee gate /
     paper P&L that settles within the 15-min window. Kept as the reference
     implementation of the Kalshi paper-trade pattern (no live edge at n=135).
   • Copy-trade: Polymarket leaderboard scanner + forward-test executor.
+  • Weather: Polymarket daily-high-temperature markets vs live METAR at the
+    settlement station — NEAR-LOCK convergence signals + paper forward test.
 
 Run:  python app.py     →  http://localhost:5001
 """
@@ -37,9 +40,12 @@ except ImportError:
 import engine
 from feeds import poly_leaderboard
 from feeds.spot import SpotFeed
+from feeds.metar import MetarFeed
 from modules.scalping import ScalpEngine
 from modules.copytrader import CopyTraderEngine
 from modules.copytrade_exec import CopyTradeExecutor
+from modules.weather import WeatherEngine
+from modules.weather_exec import WeatherExecutor
 
 from flask import Flask, Response, jsonify, render_template, request
 
@@ -59,6 +65,15 @@ _copytrade = CopyTraderEngine()
 _copytrade_exec = CopyTradeExecutor()   # forward-test executor (paper by default)
 _copytrade_thread = None
 _copytrade_stop = threading.Event()
+
+# Weather NEAR-LOCK (Polymarket daily temperature markets) — on unless WEATHER_ENABLED=false.
+WEATHER_ENABLED = os.getenv("WEATHER_ENABLED", "true").strip().lower() == "true"
+_metar = MetarFeed()
+_weather_exec = WeatherExecutor()
+_weather = WeatherEngine(_metar, executor=_weather_exec)
+_weather_thread = None
+_weather_stop = threading.Event()
+WEATHER_REFRESH_SEC = int(os.getenv("WEATHER_REFRESH_SEC", "60"))
 
 BOT_STATE = {
     "status": "stopped",
@@ -86,6 +101,9 @@ def _add_log(icon: str, msg: str):
 _scalp.on_log = _add_log
 _copytrade.on_log = _add_log
 _copytrade_exec.on_log = _add_log
+_metar.on_log = _add_log
+_weather.on_log = _add_log
+_weather_exec.on_log = _add_log
 
 
 # ── Engine callbacks ──────────────────────────────────────────────────────────
@@ -105,6 +123,23 @@ def _on_prices(markets, snapshots):
 def _on_status(status):
     BOT_STATE["status"] = status
     _push("status", {"status": status})
+
+
+# ── Weather poll loop (Polymarket temp markets + METAR) ───────────────────────
+def _weather_loop():
+    settle_every, last_settle = 300, 0.0
+    while not _weather_stop.is_set():
+        try:
+            rows = _weather.refresh()
+            if time.time() - last_settle > settle_every:
+                _weather_exec.poll()
+                last_settle = time.time()
+            st = _weather.state()
+            st["exec"] = _weather_exec.state()
+            _push("weather", st)
+        except Exception as e:  # noqa: BLE001
+            _add_log("✗", f"weather refresh error: {e}")
+        _weather_stop.wait(WEATHER_REFRESH_SEC)
 
 
 # ── Copy-trade poll loop (Polymarket scan) ────────────────────────────────────
@@ -154,7 +189,13 @@ def _start_bot():
             _copytrade_thread.start()
             threading.Thread(target=_copytrade_exec_loop, daemon=True, name="copytrade-exec").start()
             _add_log("◆", "Copy-trade scanner + forward-test executor ENABLED (paper)")
-        _add_log("→", "Dashboard started — scalping + copy-trade feeds live (dry-run)")
+        global _weather_thread
+        if WEATHER_ENABLED and not (_weather_thread and _weather_thread.is_alive()):
+            _weather_stop.clear()
+            _weather_thread = threading.Thread(target=_weather_loop, daemon=True, name="weather-poll")
+            _weather_thread.start()
+            _add_log("◆", "Weather NEAR-LOCK engine ENABLED (paper forward-test)")
+        _add_log("→", "Dashboard started — scalping + copy-trade + weather feeds live (dry-run)")
         return True, "ok"
 
 
@@ -162,6 +203,7 @@ def _stop_bot():
     global _bot
     with _bot_lock:
         _copytrade_stop.set()
+        _weather_stop.set()
         _spot.stop()
         if _bot:
             _bot.stop()
@@ -215,6 +257,16 @@ def api_stop():
 @app.route("/api/scalping")
 def api_scalping():
     return jsonify(_scalp.state())
+
+
+@app.route("/api/weather")
+def api_weather():
+    """Weather NEAR-LOCK signals + forward-test executor state."""
+    st = _weather.state()
+    st["enabled"] = WEATHER_ENABLED
+    st["exec"] = _weather_exec.state()
+    st["metar"] = {"last_poll": _metar.last_poll_ts, "error": _metar.last_error}
+    return jsonify(st)
 
 
 @app.route("/api/copytrade")

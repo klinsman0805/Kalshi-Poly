@@ -3,11 +3,12 @@ const S = {
   tab: 'scalp', botRunning: false,
   scalp: {}, scalpSession: {},
   copy: [], copyCfg: {}, copyEnabled: false, copyScanning: false, copyExec: null,
+  weather: [], weatherCfg: {}, weatherExec: null,
   lastDataTs: 0, logExpanded: false,
 };
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
-const TABS = ['scalp', 'copy'];
+const TABS = ['scalp', 'weather', 'copy'];
 function showTab(t) {
   S.tab = t;
   TABS.forEach(x => {
@@ -15,6 +16,7 @@ function showTab(t) {
     document.getElementById('view-' + x).classList.toggle('active', t === x);
   });
   if (t === 'copy') renderCopy();
+  if (t === 'weather') renderWeather();
 }
 
 // ── SSE ───────────────────────────────────────────────────────────────────────
@@ -43,6 +45,8 @@ function handleMsg(m) {
       renderScalpSummary(); break;
     case 'copytrade':
       applyCopy(m); break;
+    case 'weather':
+      applyWeather(m); break;
   }
 }
 
@@ -130,6 +134,95 @@ function renderScalpSummary() {
     `Crypto scalping · Kalshi 15-min up/down vs live spot &nbsp;·&nbsp; ` +
     `paper P&L <b style="color:${(s.pnl||0)>=0?'var(--ok)':'var(--down)'}">${(s.pnl||0)>=0?'+':''}$${(s.pnl||0).toFixed(4)}</b> ` +
     `· ${s.trades||0} settled · ${wr!=null?wr+'% win':'—'}`;
+}
+
+// ── Weather render ────────────────────────────────────────────────────────────
+function applyWeather(m) {
+  S.weather = m.rows || [];
+  S.weatherCfg = m.config || {};
+  S.weatherExec = m.exec || null;
+  S.lastDataTs = Date.now();
+  renderWeatherSummary();
+  renderWeatherExec();
+  if (S.tab === 'weather') renderWeather();
+}
+
+function wxSigClass(sig) {
+  if (sig === 'ENTER') return 'enter';
+  if (sig === 'PRICED' || sig === 'THIN-EDGE' || sig === 'WIDE') return 'blocked';
+  if (sig === 'NO-LOCK' || sig === 'EARLY') return 'settling';
+  return 'flat';
+}
+
+function renderWeather() {
+  const body = document.getElementById('weather-body');
+  if (!S.weather.length) {
+    body.innerHTML = '<tr><td colspan="8"><div class="no-data">No temperature markets found (or engine still warming up).</div></td></tr>';
+    return;
+  }
+  // today's tradeable rows first (engine pre-sorts), dim monitor/tomorrow rows
+  body.innerHTML = S.weather.map(r => {
+    const dim = (!r.is_today || !r.tradeable) ? ' style="opacity:.55"' : '';
+    const localH = r.local_hour == null ? '—' :
+      String(Math.floor(r.local_hour)).padStart(2,'0') + ':' + String(Math.round((r.local_hour%1)*60)).padStart(2,'0');
+    const best = r.buckets && r.buckets.length ?
+      (r.buckets.find(b => b.label === r.best_label) || null) : null;
+    const bidask = best ? `${best.bid_c != null ? best.bid_c.toFixed(0)+'¢' : '—'} / ${best.ask_c != null ? best.ask_c.toFixed(0)+'¢' : '—'}` : '—';
+    const edge = best && best.edge_c != null ? (best.edge_c>0?'+':'')+best.edge_c+'¢' : '—';
+    const edgeCls = best && best.edge_c != null ? (best.edge_c > 0 ? 'up' : 'dn') : '';
+    const sc = wxSigClass(r.signal);
+    return `<tr${dim}>
+      <td class="l"><div class="match">${esc(r.city)}</div>
+        <div class="kickoff">${esc(r.station||'?')} · ${esc(r.date||'')}${r.tradeable?'':' · '+esc(r.why||'')}</div></td>
+      <td>${localH}</td>
+      <td>${r.temp_c != null ? r.temp_c.toFixed(0)+'°' : '—'} / <b>${r.max_c != null ? r.max_c.toFixed(0)+'°C' : '—'}</b></td>
+      <td>${r.best_label ? esc(r.best_label) : '—'}</td>
+      <td>${r.best_p != null ? (r.best_p*100).toFixed(1)+'%' : '—'}</td>
+      <td>${bidask}</td>
+      <td><span class="${edgeCls}">${edge}</span></td>
+      <td><span class="sig ${sc}" title="${esc(r.why||'')}">${esc(r.signal||'—')}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+function renderWeatherSummary() {
+  const cfg = S.weatherCfg || {};
+  const today = S.weather.filter(r => r.is_today && r.tradeable);
+  const enters = S.weather.filter(r => r.signal === 'ENTER').length;
+  document.getElementById('weather-summary').innerHTML =
+    `Polymarket daily-high temp · NEAR-LOCK vs live METAR &nbsp;·&nbsp; ` +
+    `${S.weather.length} markets · ${today.length} live today · ` +
+    `<b style="color:var(--accent)">${enters}</b> ENTER signals &nbsp;·&nbsp; ` +
+    `gates: p≥${cfg.p_min||'—'} · ask≤${cfg.price_max_c||'—'}¢ · edge≥${cfg.min_edge_c||'—'}¢ · local≥${cfg.min_local_hour||'—'}h`;
+}
+
+function renderWeatherExec() {
+  const e = S.weatherExec; if (!e) return;
+  const s = e.session || {};
+  const mode = document.getElementById('wxexec-mode');
+  if (e.live)          { mode.textContent = '🔴 LIVE forward-test — REAL orders'; mode.className = 'exec-arm live'; }
+  else if (e.env_armed){ mode.textContent = '🟢 armed · paper forward-test'; mode.className = 'exec-arm ok'; }
+  else                 { mode.textContent = '📄 PAPER forward-test'; mode.className = 'exec-arm'; }
+  document.getElementById('wx-open').textContent = (e.open || []).length;
+  document.getElementById('wx-settled').textContent = s.settled || 0;
+  document.getElementById('wx-win').textContent = s.win_rate == null ? '—' : Math.round(s.win_rate*100) + '%';
+  document.getElementById('wx-avgp').textContent = e.avg_model_p == null ? '—' : Math.round(e.avg_model_p*100) + '%';
+  const pnl = document.getElementById('wx-pnl');
+  pnl.textContent = (s.realized_pnl >= 0 ? '+$' : '-$') + Math.abs(s.realized_pnl||0).toFixed(2);
+  pnl.style.color = (s.realized_pnl||0) >= 0 ? 'var(--ok)' : 'var(--down)';
+  document.getElementById('wx-staked').textContent = '$' + (s.staked_usd || 0);
+
+  const box = document.getElementById('wxexec-pos');
+  const open = e.open || [];
+  if (!open.length) { box.innerHTML = ''; return; }
+  box.innerHTML = '<div class="pos-hd">Open paper positions</div>' + open.map(p =>
+    `<div class="pos-row ${p.mode}">
+       <span class="pos-mode">${p.mode === 'live' ? 'LIVE' : 'PAPER'}</span>
+       <span class="pos-match">${esc(p.city)} ${esc(p.date)}</span>
+       <span class="pos-buy">${esc(p.label)} @ ${p.entry_c}¢ ×${p.shares}</span>
+       <span class="pos-cost">$${p.cost_usd}</span>
+       <span class="pos-chip">p ${p.model_p} · +${p.edge_c}¢</span>
+     </div>`).join('');
 }
 
 // ── Copy-trade render ───────────────────────────────────────────────────────────
@@ -283,6 +376,10 @@ async function pollOnce() {
   try {
     const cp = await fetch('/api/copytrade').then(r=>r.json());
     applyCopy(cp);
+  } catch(e){}
+  try {
+    const wx = await fetch('/api/weather').then(r=>r.json());
+    applyWeather(wx);
   } catch(e){}
 }
 
