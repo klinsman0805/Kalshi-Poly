@@ -24,6 +24,7 @@ import logging
 import json
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from feeds.poly_weather import fetch_temperature_events
@@ -106,8 +107,12 @@ class WeatherEngine:
         })
         self.metar.poll()
 
+        today = datetime.now(timezone.utc).date()
         rows = []
         for e in events:
+            # Gamma keeps some long-settled dailies flagged active — drop them
+            if e["date"] and (today - e["date"]).days > 1:
+                continue
             row = self._compute_event(e)
             if row:
                 rows.append(row)

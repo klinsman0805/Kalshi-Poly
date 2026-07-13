@@ -125,7 +125,12 @@ def main():
     if OUT.exists():
         existing = json.loads(OUT.read_text())
     out = dict(existing)
-    for i, icao in enumerate(c for c in icaos if c in coords):
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    todo = [c for c in icaos if c in coords]
+    for i, icao in enumerate(todo):
+        if icao in out and out[icao].get("built") == date.today().isoformat():
+            print(f"[{i+1}] {icao} already built today — skip")
+            continue
         lat, lon = coords[icao]
         print(f"[{i+1}] {icao} ({lat:.3f},{lon:.3f}) …", end=" ", flush=True)
         try:
@@ -136,10 +141,11 @@ def main():
             continue
         out[icao] = {"tz": tz, "lat": lat, "lon": lon, "n_days": n_days,
                      "built": date.today().isoformat(), "pmf": pmf}
+        # write after every station: interrupts lose nothing, and the running
+        # dashboard hot-reloads the table as it grows
+        OUT.write_text(json.dumps(out))
         print(f"ok tz={tz} days={n_days}")
         time.sleep(1.0)                           # be polite to the free API
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    OUT.write_text(json.dumps(out))
     print(f"\nwrote {OUT} ({len(out)} stations, {OUT.stat().st_size//1024} KB)")
 
 

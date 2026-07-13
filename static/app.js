@@ -386,7 +386,8 @@ async function pollOnce() {
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 
 setInterval(() => {
-  const fresh = S.lastDataTs && (Date.now() - S.lastDataTs) < 8000;
+  // weather/copytrade push on 60s cadence — anything within ~1.5 cycles is live
+  const fresh = S.lastDataTs && (Date.now() - S.lastDataTs) < 90000;
   document.getElementById('data-dot').classList.toggle('live', fresh);
   document.getElementById('data-label').textContent = fresh ? 'Live' : 'No data';
 }, 1000);
