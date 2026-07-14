@@ -163,10 +163,14 @@ class WeatherExecutor:
             open_pos = list(self.open)
         if not open_pos:
             return
-        # Gamma needs repeated condition_ids params — comma-joining returns []
+        # Gamma needs repeated condition_ids params (comma-joining returns [])
+        # AND closed=true — the endpoint silently filters out closed markets by
+        # default, which is precisely the state a settling position is in.
         ids = [p["condition_id"] for p in open_pos if p.get("condition_id")]
         try:
-            r = requests.get(GAMMA_MARKETS, params={"condition_ids": ids}, timeout=15)
+            r = requests.get(GAMMA_MARKETS,
+                             params={"condition_ids": ids, "closed": "true"},
+                             timeout=15)
             r.raise_for_status()
             markets = {m.get("conditionId"): m for m in r.json()}
         except Exception as e:  # noqa: BLE001
