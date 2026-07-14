@@ -1,6 +1,10 @@
 """
 modules/weather.py — NEAR-LOCK weather signal engine (monitor + paper).
 
+Covers both daily-HIGH and daily-LOW temperature families (event kind
+"high"/"low"; lows use the remaining-fall PMF and unlock earlier in the day
+since the min usually prints around sunrise).
+
 Strategy: in the last hours of a city's local day, the daily max temperature
 is largely locked in — the settlement station has already printed it. Compare
 the market's bucket prices against P(final max | observed running max), where
@@ -37,6 +41,8 @@ P_MIN = float(os.getenv("WEATHER_P_MIN", "0.92"))
 PRICE_MAX_C = float(os.getenv("WEATHER_PRICE_MAX_C", "82"))
 MIN_EDGE_C = float(os.getenv("WEATHER_MIN_EDGE_C", "8"))
 MIN_LOCAL_HOUR = float(os.getenv("WEATHER_MIN_LOCAL_HOUR", "13"))
+# daily min usually prints around sunrise, so lows unlock earlier than highs
+MIN_LOCAL_HOUR_LOW = float(os.getenv("WEATHER_MIN_LOCAL_HOUR_LOW", "10"))
 MIN_OBS_TODAY = int(os.getenv("WEATHER_MIN_OBS_TODAY", "3"))
 MAX_SPREAD_C = float(os.getenv("WEATHER_MAX_SPREAD_C", "10"))
 
@@ -73,18 +79,20 @@ class WeatherEngine:
             self.on_log("✗", f"[weather] climatology load failed: {e}")
 
     # ── model ────────────────────────────────────────────────────────────────
-    def bucket_prob(self, icao, month, hour, run_max_c, lo, hi):
-        """P(final whole-°C max lands in [lo, hi]) given running max."""
+    def bucket_prob(self, icao, kind, month, hour, run_ext_c, lo, hi):
+        """P(final whole-°C daily extreme lands in [lo, hi]) given the running
+        extreme. kind="high": final = run_max + k; kind="low": final = run_min − k."""
         st = self.climo.get(icao)
         if not st:
             return None
-        pmf = (st.get("pmf", {}).get(str(month)) or {}).get(str(int(hour)))
+        table = st.get("pmf") if kind == "high" else st.get("pmf_low")
+        pmf = ((table or {}).get(str(month)) or {}).get(str(int(hour)))
         if not pmf:
             return None
-        r = round(run_max_c)
+        r = round(run_ext_c)
         p = 0.0
         for k_str, pk in pmf.items():
-            final = r + int(k_str)
+            final = r + int(k_str) if kind == "high" else r - int(k_str)
             if (lo is None or final >= lo) and (hi is None or final <= hi):
                 p += pk
         return p
@@ -130,20 +138,24 @@ class WeatherEngine:
 
     def _compute_event(self, e):
         icao = e["station"]
+        kind = e["kind"]
         st = self.metar.station(icao) if icao else None
-        tradeable = (e["source"] == "metar" and icao in self.climo
+        pmf_key = "pmf" if kind == "high" else "pmf_low"
+        tradeable = (e["source"] == "metar"
+                     and pmf_key in (self.climo.get(icao) or {})
                      and all(b["unit"] == "C" for b in e["buckets"]))
         # only today's local date is a NEAR-LOCK candidate
         is_today = bool(st and e["date"] and st["local_date"] == e["date"].isoformat())
         if not st and not e["date"]:
             return None
+        ext_c = (st or {}).get("max_c" if kind == "high" else "min_c")
 
         buckets, best = [], None
         for b in e["buckets"]:
             p = None
-            if tradeable and is_today and st["max_c"] is not None:
-                p = self.bucket_prob(icao, int(st["local_date"][5:7]),
-                                     st["local_hour"], st["max_c"], b["lo"], b["hi"])
+            if tradeable and is_today and ext_c is not None:
+                p = self.bucket_prob(icao, kind, int(st["local_date"][5:7]),
+                                     st["local_hour"], ext_c, b["lo"], b["hi"])
             ask_c = b["ask"] * 100 if b["ask"] is not None else None
             bid_c = b["bid"] * 100 if b["bid"] is not None else None
             edge_c = (p * 100 - ask_c) if (p is not None and ask_c is not None) else None
@@ -161,14 +173,15 @@ class WeatherEngine:
             if p is not None and (best is None or p > best["p"]):
                 best = {**bv, "p": p}
 
-        signal, why = self._gate(e, st, is_today, tradeable, best)
+        signal, why = self._gate(e, st, is_today, tradeable, best, ext_c)
         return {
-            "city": e["city"], "date": e["date"].isoformat() if e["date"] else None,
+            "city": e["city"], "kind": kind,
+            "date": e["date"].isoformat() if e["date"] else None,
             "station": icao, "source": e["source"], "slug": e["slug"],
             "tradeable": tradeable, "is_today": is_today,
             "local_hour": round(st["local_hour"], 2) if st else None,
             "temp_c": st["temp_c"] if st else None,
-            "max_c": st["max_c"] if st else None,
+            "ext_c": ext_c,
             "obs_today": st["obs_today"] if st else 0,
             "buckets": buckets,
             "best_p": round(best["p"], 4) if best else None,
@@ -178,25 +191,29 @@ class WeatherEngine:
                 "condition_id": best["condition_id"], "token_yes": best["token_yes"],
                 "label": best["label"], "ask_c": best["ask_c"], "bid_c": best["bid_c"],
                 "p": round(best["p"], 4), "edge_c": best["edge_c"],
-                "min_size": best["min_size"], "city": e["city"],
+                "min_size": best["min_size"], "city": e["city"], "kind": kind,
                 "date": e["date"].isoformat(), "station": icao, "slug": e["slug"],
+                "neg_risk": e["neg_risk"],
             } if signal == "ENTER" and best else None),
         }
 
-    def _gate(self, e, st, is_today, tradeable, best):
+    def _gate(self, e, st, is_today, tradeable, best, ext_c):
         if not tradeable:
             return "MONITOR", ("HKO source" if e["source"] == "hko" else
                                "no climatology" if e["station"] not in self.climo
+                               else "no low climatology" if e["kind"] == "low"
+                               and "pmf_low" not in (self.climo.get(e["station"]) or {})
                                else "non-°C buckets" if e["source"] == "metar"
                                else "unknown source")
         if not is_today:
             return "WAIT", "not station-local today"
-        if st is None or st["max_c"] is None:
+        if st is None or ext_c is None:
             return "NO-DATA", "no observations"
         if st["obs_today"] < MIN_OBS_TODAY:
             return "NO-DATA", f"only {st['obs_today']} obs today"
-        if st["local_hour"] < MIN_LOCAL_HOUR:
-            return "EARLY", f"local {st['local_hour']:.1f}h < {MIN_LOCAL_HOUR}h"
+        min_hour = MIN_LOCAL_HOUR if e["kind"] == "high" else MIN_LOCAL_HOUR_LOW
+        if st["local_hour"] < min_hour:
+            return "EARLY", f"local {st['local_hour']:.1f}h < {min_hour}h"
         if best is None:
             return "NO-DATA", "no model probability"
         if best["p"] < P_MIN:
@@ -229,5 +246,6 @@ class WeatherEngine:
             "last_error": self.last_error,
             "climo_stations": len(self.climo),
             "config": {"p_min": P_MIN, "price_max_c": PRICE_MAX_C,
-                       "min_edge_c": MIN_EDGE_C, "min_local_hour": MIN_LOCAL_HOUR},
+                       "min_edge_c": MIN_EDGE_C, "min_local_hour": MIN_LOCAL_HOUR,
+                       "min_local_hour_low": MIN_LOCAL_HOUR_LOW},
         }

@@ -96,9 +96,9 @@ class MetarFeed:
         return None
 
     def _reduce(self, icao, rows, tz, now_utc):
-        """Fold a station's obs into the running max for *today's* local date."""
+        """Fold a station's obs into running max AND min for *today's* local date."""
         local_today = now_utc.astimezone(tz).date()
-        max_c, latest, latest_ts, n_today = None, None, None, 0
+        max_c, min_c, latest, latest_ts, n_today = None, None, None, None, 0
         for o in rows:
             ts = self._obs_time(o)
             temp = o.get("temp")
@@ -110,11 +110,15 @@ class MetarFeed:
                 continue
             n_today += 1
             max_c = float(temp) if max_c is None else max(max_c, float(temp))
-            # 6-hourly max group (US stations): covers the preceding 6 h; only
-            # trust it for today when the report itself is ≥6 h into the day.
-            mx = o.get("maxT")
-            if mx is not None and ts.astimezone(tz).hour >= 6:
-                max_c = float(mx) if max_c is None else max(max_c, float(mx))
+            min_c = float(temp) if min_c is None else min(min_c, float(temp))
+            # 6-hourly max/min groups (US stations): cover the preceding 6 h;
+            # only trust them for today when the report is ≥6 h into the day.
+            if ts.astimezone(tz).hour >= 6:
+                mx, mn = o.get("maxT"), o.get("minT")
+                if mx is not None:
+                    max_c = float(mx) if max_c is None else max(max_c, float(mx))
+                if mn is not None:
+                    min_c = float(mn) if min_c is None else min(min_c, float(mn))
         return {
             "icao": icao,
             "local_date": local_today.isoformat(),
@@ -122,6 +126,7 @@ class MetarFeed:
             "tz": str(tz),
             "temp_c": latest,
             "max_c": max_c,
+            "min_c": min_c,
             "obs_today": n_today,
             "latest_obs_utc": latest_ts.isoformat() if latest_ts else None,
         }

@@ -32,12 +32,13 @@ FEE (per docs.polymarket.com — CLOB fee curve + Maker Rebates Program):
   hard-coded default — the previous 1000-bps default was an order of
   magnitude too high and caused profitable arbs to be rejected.
 
-ORDER SIGNING (EIP-712):
-  Domain: "Polymarket CTF Exchange" v1, chainId=137
-  Contract: 0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E  (neg_risk=false markets)
-  Side BUY:
-    makerAmount = price_float × size × DECIMALS   (USDC in, 6 dec)
-    takerAmount = size × DECIMALS                 (shares out, 6 dec)
+ORDER SIGNING:
+  Delegated to py-clob-client-v2 (create_order), which signs against the
+  correct exchange contract per market — standard CTF Exchange for normal
+  markets, Neg Risk CTF Exchange for negRisk events (multi-outcome families
+  like the weather temperature ladders). Pass neg_risk explicitly to
+  place_fok/place_sell_fok when the caller knows it (discovery does) to skip
+  the client's per-token neg-risk lookup on the first order.
 """
 
 import os
@@ -97,9 +98,6 @@ POLY_RESEED_INTERVAL = float(os.getenv("POLY_RESEED_INTERVAL", "2.0"))
 _UNWIND_MAX_ATTEMPTS = int(os.getenv("POLY_UNWIND_MAX_ATTEMPTS", "5"))
 _UNWIND_ATTEMPT_DELAY = float(os.getenv("POLY_UNWIND_ATTEMPT_DELAY", "1.0"))
 
-# Polygon mainnet CTF Exchange contract (neg_risk=false markets)
-CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
-
 # ERC1155 + USDC both use 6 decimal places in Polymarket's CLOB
 DECIMALS = 10 ** 6
 
@@ -154,30 +152,6 @@ def fetch_live_fee_bps(token_id: str) -> Optional[int]:
 # WARNING: a real Poly fill with no Kalshi fill = naked position. Use size=1 only.
 _global_dry = os.getenv("DRY_RUN", "true").lower() != "false"
 DRY_RUN     = os.getenv("POLY_DRY_RUN", str(_global_dry)).lower() != "false"
-
-# ── EIP-712 order schema ──────────────────────────────────────────────────────
-
-_EIP712_DOMAIN = {
-    "name": "Polymarket CTF Exchange",
-    "version": "1",
-    "chainId": 137,
-    "verifyingContract": CTF_EXCHANGE,
-}
-
-_ORDER_TYPE_FIELDS = [
-    {"name": "salt",          "type": "uint256"},
-    {"name": "maker",         "type": "address"},
-    {"name": "signer",        "type": "address"},
-    {"name": "taker",         "type": "address"},
-    {"name": "tokenId",       "type": "uint256"},
-    {"name": "makerAmount",   "type": "uint256"},
-    {"name": "takerAmount",   "type": "uint256"},
-    {"name": "expiration",    "type": "uint256"},
-    {"name": "nonce",         "type": "uint256"},
-    {"name": "feeRateBps",    "type": "uint256"},
-    {"name": "side",          "type": "uint8"},
-    {"name": "signatureType", "type": "uint8"},
-]
 
 # ── Local orderbook ───────────────────────────────────────────────────────────
 
@@ -492,85 +466,6 @@ class PolyClient:
             "Content-Type":    "application/json",
         }
 
-    # ── Order signing ────────────────────────────────────────────────────────
-
-    def _sign_order(self, token_id: str, price_cents: int,
-                    size: int, fee_bps: int) -> Optional[dict]:
-        """
-        Build and EIP-712-sign a FOK buy order.
-        Returns the full order body for POST /order, or None on error.
-        """
-        if not self._private_key or not self._address:
-            log.error("Polymarket private key not configured")
-            return None
-        try:
-            from eth_account import Account
-        except ImportError:
-            log.error("eth-account not installed: pip install eth-account")
-            return None
-
-        try:
-            account      = Account.from_key(self._private_key)
-            price_float  = price_cents / 100.0
-            maker_amount = int(price_float * size * DECIMALS)  # USDC spending
-            taker_amount = int(size * DECIMALS)                 # shares receiving
-            salt         = int(time.time() * 1000) & 0xFFFFFFFFFFFFFFFF
-
-            order_msg = {
-                "salt":          salt,
-                "maker":         account.address,
-                "signer":        account.address,
-                "taker":         "0x0000000000000000000000000000000000000000",
-                "tokenId":       int(token_id),
-                "makerAmount":   maker_amount,
-                "takerAmount":   taker_amount,
-                "expiration":    0,
-                "nonce":         0,
-                "feeRateBps":    fee_bps,
-                "side":          0,    # BUY
-                "signatureType": 0,    # EOA
-            }
-
-            signed = account.sign_typed_data(
-                domain_data=_EIP712_DOMAIN,
-                message_types={"Order": _ORDER_TYPE_FIELDS},
-                message_data=order_msg,
-            )
-
-            return self._order_to_json(order_msg, signed.signature.hex(), "BUY")
-        except Exception as e:
-            log.error("Order signing failed: %s", e)
-            return None
-
-    def _order_to_json(self, order_msg: dict, signature_hex: str,
-                       side_str: str, order_type: str = "FOK") -> dict:
-        """
-        Convert a signed EIP-712 order struct into the JSON body POST /order
-        expects. The signed struct uses numeric side/salt; the JSON body uses
-        string amounts, numeric salt, the "BUY"/"SELL" side string, and `owner`
-        = API key UUID (matches the official py-clob-client order_to_json).
-        """
-        sig_hex = signature_hex if signature_hex.startswith("0x") else "0x" + signature_hex
-        return {
-            "order": {
-                "salt":          order_msg["salt"],          # number
-                "maker":         order_msg["maker"],
-                "signer":        order_msg["signer"],
-                "taker":         order_msg["taker"],
-                "tokenId":       str(order_msg["tokenId"]),
-                "makerAmount":   str(order_msg["makerAmount"]),
-                "takerAmount":   str(order_msg["takerAmount"]),
-                "expiration":    str(order_msg["expiration"]),
-                "nonce":         str(order_msg["nonce"]),
-                "feeRateBps":    str(order_msg["feeRateBps"]),
-                "side":          side_str,                    # "BUY" / "SELL"
-                "signatureType": order_msg["signatureType"], # number
-                "signature":     sig_hex,
-            },
-            "owner":     self._api_key,                       # API key UUID
-            "orderType": order_type,
-        }
-
     # ── Order placement ──────────────────────────────────────────────────────
 
     @staticmethod
@@ -613,10 +508,15 @@ class PolyClient:
         return (making / taking) * 100.0
 
     def place_fok(self, token_id: str, price_cents: int,
-                  size: int, fee_bps: int) -> float:
+                  size: int, fee_bps: int, neg_risk: Optional[bool] = None) -> float:
         """
         Place a FOK buy order for `size` shares at `price_cents` via CLOB v2.
         Returns filled share count as float (simulates full fill in DRY_RUN).
+
+        neg_risk: pass True/False when the caller knows the market type
+        (negRisk = multi-outcome family, signed against a different exchange
+        contract). None lets the client resolve it — one extra API call the
+        first time each token is traded.
         """
         self._last_fill_price_cents = None
         if DRY_RUN:
@@ -633,7 +533,8 @@ class PolyClient:
             return 0.0
 
         try:
-            from py_clob_client_v2.clob_types import OrderArgs, OrderType
+            from py_clob_client_v2.clob_types import (OrderArgs, OrderType,
+                                                      PartialCreateOrderOptions)
             from py_clob_client_v2.order_builder.constants import BUY
         except ImportError:
             log.error("py-clob-client-v2 not installed")
@@ -642,7 +543,9 @@ class PolyClient:
         try:
             args   = OrderArgs(price=price_cents / 100.0, size=size,
                                side=BUY, token_id=token_id)
-            signed = self._clob.create_order(args)
+            opts   = (PartialCreateOrderOptions(neg_risk=neg_risk)
+                      if neg_risk is not None else None)
+            signed = self._clob.create_order(args, opts)
             resp   = self._clob.post_order(signed, OrderType.FOK)
             filled = self._filled_shares(resp, size)
             self._last_fill_price_cents = self._filled_price_cents(resp)
@@ -701,7 +604,8 @@ class PolyClient:
             log.debug("balance read failed token=...%s: %s", token_id[-6:], e)
             return None
 
-    def place_sell_fok(self, token_id: str, size: float, fee_bps: int) -> float:
+    def place_sell_fok(self, token_id: str, size: float, fee_bps: int,
+                       neg_risk: Optional[bool] = None) -> float:
         """
         Emergency unwind sell of `size` shares at any available bid via CLOB v2.
 
@@ -722,7 +626,8 @@ class PolyClient:
             return 0.0
 
         try:
-            from py_clob_client_v2.clob_types import OrderArgs, OrderType
+            from py_clob_client_v2.clob_types import (OrderArgs, OrderType,
+                                                      PartialCreateOrderOptions)
             from py_clob_client_v2.order_builder.constants import SELL
         except ImportError:
             log.error("py-clob-client-v2 not installed")
@@ -737,7 +642,9 @@ class PolyClient:
 
         def _submit_sell(sz: int) -> float:
             args   = OrderArgs(price=0.01, size=sz, side=SELL, token_id=token_id)
-            signed = self._clob.create_order(args)
+            opts   = (PartialCreateOrderOptions(neg_risk=neg_risk)
+                      if neg_risk is not None else None)
+            signed = self._clob.create_order(args, opts)
             resp   = self._clob.post_order(signed, OrderType.FAK)
             return self._filled_shares(resp, sz)
 

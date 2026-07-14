@@ -31,7 +31,7 @@ TIMEOUT = 15
 PAGE = 100
 MAX_PAGES = 4
 
-_TITLE = re.compile(r"^Highest temperature in (.+?) on (.+?)\?$")
+_TITLE = re.compile(r"^(Highest|Lowest) temperature in (.+?) on (.+?)\?$")
 _SLUG_DATE = re.compile(r"-(\w+)-(\d{1,2})-(\d{4})$")
 _WUND = re.compile(r"wunderground\.com/history/daily/(\S+)")
 _NOAA = re.compile(r"weather\.gov/wrh/timeseries\?site=([A-Za-z0-9]{3,5})")
@@ -97,7 +97,7 @@ def _parse_date(slug):
 
 
 def fetch_temperature_events():
-    """Return a list of parsed highest-temperature events (all cities, all dates)."""
+    """Return parsed daily-temperature events, kind = "high" | "low"."""
     events, offset = [], 0
     for _ in range(MAX_PAGES):
         r = requests.get(GAMMA, params={"limit": PAGE, "offset": offset, "active": "true",
@@ -146,7 +146,8 @@ def fetch_temperature_events():
         # sort ladder: below-tail, exact buckets ascending, above-tail
         buckets.sort(key=lambda b: (b["lo"] if b["lo"] is not None else -999))
         out.append({
-            "city": t.group(1),
+            "kind": "high" if t.group(1) == "Highest" else "low",
+            "city": t.group(2),
             "date": _parse_date(e.get("slug")),
             "title": e.get("title"),
             "slug": e.get("slug"),

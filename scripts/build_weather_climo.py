@@ -4,12 +4,13 @@ scripts/build_weather_climo.py — build the remaining-rise climatology table.
 
 For every settlement station currently referenced by a Polymarket temperature
 market, pull ~5 years of hourly temperatures (Open-Meteo ERA5 archive, local
-time) and estimate, for each (month, local hour):
+time) and estimate, for each (month, local hour), TWO PMFs:
 
-    P( round(final daily max) − round(running max through this hour) = k )
+    pmf     P( round(final daily max) − round(running max through hour) = k )
+    pmf_low P( round(running min through hour) − round(final daily min) = k )
 
-That PMF is the NEAR-LOCK engine's only model: given today's observed running
-max at hour h, it says how much higher the day can still go. It is empirical,
+These are the NEAR-LOCK engine's only model: given today's observed running
+extreme at hour h, how much further the day can still go. Empirical,
 station-specific, and deliberately smoothed (Laplace α) so no bucket is ever
 assigned probability 1.0 — the scalping lesson is that overconfident models
 donate fees.
@@ -18,10 +19,11 @@ Months are pooled ±1 (e.g. July uses Jun+Jul+Aug days) for sample size:
 ~450 day-samples per (month, hour) from 5 years.
 
 Output: data/weather_climo.json
-    {icao: {tz, lat, lon, n_days, pmf: {month: {hour: {k: p}}}}}
+    {icao: {tz, lat, lon, n_days, pmf: {month: {hour: {k: p}}}, pmf_low: {...}}}
 
-Run:  python scripts/build_weather_climo.py [ICAO ...]
-      (no args = every metar-source station in current Polymarket events)
+Run:  python scripts/build_weather_climo.py [--force] [ICAO ...]
+      (no ICAOs = every metar-source station in current Polymarket events;
+       --force rebuilds stations already built today)
 """
 
 import json
@@ -68,28 +70,8 @@ def fetch_hourly(lat, lon):
     return d["timezone"], d["hourly"]["time"], d["hourly"]["temperature_2m"]
 
 
-def build_pmf(times, temps):
-    """counts[month][hour][k] over days; running/final max in whole °C."""
-    days = defaultdict(list)                      # 'YYYY-MM-DD' -> [(hour, temp)]
-    for t, v in zip(times, temps):
-        if v is None:
-            continue
-        days[t[:10]].append((int(t[11:13]), v))
-    counts = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
-    n_days = 0
-    for day, rows in days.items():
-        if len(rows) < 24:
-            continue
-        n_days += 1
-        month = int(day[5:7])
-        rows.sort()
-        final = round(max(v for _, v in rows))
-        run = None
-        for hour, v in rows:
-            run = v if run is None else max(run, v)
-            k = min(max(final - round(run), 0), K_MAX)
-            counts[month][hour][k] += 1
-    # pool ±1 month, smooth, normalise
+def _smooth(counts):
+    """pool ±1 month, Laplace-smooth, normalise → {month: {hour: {k: p}}}."""
     pmf = {}
     for m in range(1, 13):
         pool = [m, m - 1 or 12, m + 1 if m < 12 else 1]
@@ -106,11 +88,41 @@ def build_pmf(times, temps):
             pmf[str(m)][str(h)] = {
                 str(k): round((c[k] + ALPHA) / denom, 6) for k in range(K_MAX + 1)
             }
-    return pmf, n_days
+    return pmf
+
+
+def build_pmf(times, temps):
+    """Remaining-rise (daily max) and remaining-fall (daily min) PMFs."""
+    days = defaultdict(list)                      # 'YYYY-MM-DD' -> [(hour, temp)]
+    for t, v in zip(times, temps):
+        if v is None:
+            continue
+        days[t[:10]].append((int(t[11:13]), v))
+    hi = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+    lo = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+    n_days = 0
+    for day, rows in days.items():
+        if len(rows) < 24:
+            continue
+        n_days += 1
+        month = int(day[5:7])
+        rows.sort()
+        final_max = round(max(v for _, v in rows))
+        final_min = round(min(v for _, v in rows))
+        run_max = run_min = None
+        for hour, v in rows:
+            run_max = v if run_max is None else max(run_max, v)
+            run_min = v if run_min is None else min(run_min, v)
+            k_hi = min(max(final_max - round(run_max), 0), K_MAX)
+            k_lo = min(max(round(run_min) - final_min, 0), K_MAX)
+            hi[month][hour][k_hi] += 1
+            lo[month][hour][k_lo] += 1
+    return _smooth(hi), _smooth(lo), n_days
 
 
 def main():
-    icaos = [a.upper() for a in sys.argv[1:]]
+    force = "--force" in sys.argv[1:]
+    icaos = [a.upper() for a in sys.argv[1:] if not a.startswith("-")]
     if not icaos:
         events = fetch_temperature_events()
         icaos = sorted({e["station"] for e in events
@@ -128,19 +140,21 @@ def main():
     OUT.parent.mkdir(parents=True, exist_ok=True)
     todo = [c for c in icaos if c in coords]
     for i, icao in enumerate(todo):
-        if icao in out and out[icao].get("built") == date.today().isoformat():
+        if (not force and icao in out and "pmf_low" in out[icao]
+                and out[icao].get("built") == date.today().isoformat()):
             print(f"[{i+1}] {icao} already built today — skip")
             continue
         lat, lon = coords[icao]
         print(f"[{i+1}] {icao} ({lat:.3f},{lon:.3f}) …", end=" ", flush=True)
         try:
             tz, times, temps = fetch_hourly(lat, lon)
-            pmf, n_days = build_pmf(times, temps)
+            pmf_hi, pmf_lo, n_days = build_pmf(times, temps)
         except Exception as e:  # noqa: BLE001
             print(f"FAILED: {e}")
             continue
         out[icao] = {"tz": tz, "lat": lat, "lon": lon, "n_days": n_days,
-                     "built": date.today().isoformat(), "pmf": pmf}
+                     "built": date.today().isoformat(),
+                     "pmf": pmf_hi, "pmf_low": pmf_lo}
         # write after every station: interrupts lose nothing, and the running
         # dashboard hot-reloads the table as it grows
         OUT.write_text(json.dumps(out))

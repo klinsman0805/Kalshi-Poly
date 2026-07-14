@@ -107,7 +107,7 @@ class WeatherExecutor:
             self._consider(entry)
 
     def _consider(self, entry):
-        key = f"{entry['city']}|{entry['date']}"
+        key = f"{entry['city']}|{entry['date']}|{entry.get('kind', 'high')}"
         with self._lock:
             if len(self.open) >= MAX_OPEN:
                 return
@@ -122,14 +122,15 @@ class WeatherExecutor:
         filled_c = ask_c
         mode = "paper"
         if self.is_live:
-            filled = self._place_live(entry["token_yes"], ask_c, shares)
+            filled = self._place_live(entry["token_yes"], ask_c, shares,
+                                      entry.get("neg_risk"))
             if filled <= 0:
                 self.on_log("!", f"[weatherexec] LIVE FOK missed {entry['city']} {entry['label']}")
                 return
             shares, mode = filled, "live"
         cost = round(shares * filled_c / 100.0, 2)
         pos = {
-            "type": "open", "key": key, "mode": mode,
+            "type": "open", "key": key, "mode": mode, "kind": entry.get("kind", "high"),
             "city": entry["city"], "date": entry["date"], "station": entry["station"],
             "label": entry["label"], "condition_id": entry["condition_id"],
             "token_yes": entry["token_yes"], "slug": entry["slug"],
@@ -145,12 +146,13 @@ class WeatherExecutor:
         self.on_log("◆", f"[weatherexec] {mode.upper()} ENTER {entry['city']} {entry['label']} "
                          f"@ {filled_c:.0f}c ×{shares} (p={entry['p']}, edge +{entry['edge_c']}c)")
 
-    def _place_live(self, token_id, ask_c, shares):
+    def _place_live(self, token_id, ask_c, shares, neg_risk=None):
         try:
             import polymarket
             client = polymarket.PolyClient()
             fee = polymarket.fetch_live_fee_bps(token_id) or 0
-            return client.place_fok(token_id, int(round(ask_c)), float(shares), fee)
+            return client.place_fok(token_id, int(round(ask_c)), float(shares), fee,
+                                    neg_risk=neg_risk)
         except Exception as e:  # noqa: BLE001
             self.on_log("✗", f"[weatherexec] live order failed: {e}")
             return 0.0
@@ -209,10 +211,11 @@ class WeatherExecutor:
                 "stake_usd": self.stake_usd, "session": s,
                 "avg_model_p": round(sum(avg_p) / len(avg_p), 3) if avg_p else None,
                 "open": [{k: p.get(k) for k in
-                          ("mode", "city", "date", "label", "entry_c", "shares",
+                          ("mode", "city", "kind", "date", "label", "entry_c", "shares",
                            "cost_usd", "model_p", "edge_c", "opened")}
                          for p in self.open],
                 "recent": [{k: c.get(k) for k in
-                            ("city", "date", "label", "entry_c", "model_p", "won", "pnl_usd")}
+                            ("city", "kind", "date", "label", "entry_c", "model_p",
+                             "won", "pnl_usd")}
                            for c in self.closed[-15:]][::-1],
             }

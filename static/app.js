@@ -163,19 +163,23 @@ function renderWeather() {
   // today's tradeable rows first (engine pre-sorts), dim monitor/tomorrow rows
   body.innerHTML = S.weather.map(r => {
     const dim = (!r.is_today || !r.tradeable) ? ' style="opacity:.55"' : '';
-    const localH = r.local_hour == null ? '—' :
-      String(Math.floor(r.local_hour)).padStart(2,'0') + ':' + String(Math.round((r.local_hour%1)*60)).padStart(2,'0');
+    let localH = '—';
+    if (r.local_hour != null) {
+      const hh = Math.floor(r.local_hour), mm = Math.round((r.local_hour % 1) * 60);
+      localH = String(mm === 60 ? hh + 1 : hh).padStart(2,'0') + ':' + String(mm === 60 ? 0 : mm).padStart(2,'0');
+    }
     const best = r.buckets && r.buckets.length ?
       (r.buckets.find(b => b.label === r.best_label) || null) : null;
     const bidask = best ? `${best.bid_c != null ? best.bid_c.toFixed(0)+'¢' : '—'} / ${best.ask_c != null ? best.ask_c.toFixed(0)+'¢' : '—'}` : '—';
     const edge = best && best.edge_c != null ? (best.edge_c>0?'+':'')+best.edge_c+'¢' : '—';
     const edgeCls = best && best.edge_c != null ? (best.edge_c > 0 ? 'up' : 'dn') : '';
     const sc = wxSigClass(r.signal);
+    const arrow = r.kind === 'low' ? '<span class="dn">▼</span>' : '<span class="up">▲</span>';
     return `<tr${dim}>
-      <td class="l"><div class="match">${esc(r.city)}</div>
-        <div class="kickoff">${esc(r.station||'?')} · ${esc(r.date||'')}${r.tradeable?'':' · '+esc(r.why||'')}</div></td>
+      <td class="l"><div class="match">${esc(r.city)} ${arrow}</div>
+        <div class="kickoff">${esc(r.station||'?')} · ${esc(r.date||'')} · ${r.kind === 'low' ? 'LOW' : 'HIGH'}${r.tradeable?'':' · '+esc(r.why||'')}</div></td>
       <td>${localH}</td>
-      <td>${r.temp_c != null ? r.temp_c.toFixed(0)+'°' : '—'} / <b>${r.max_c != null ? r.max_c.toFixed(0)+'°C' : '—'}</b></td>
+      <td>${r.temp_c != null ? r.temp_c.toFixed(0)+'°' : '—'} / <b>${r.ext_c != null ? r.ext_c.toFixed(0)+'°C' : '—'}</b></td>
       <td>${r.best_label ? esc(r.best_label) : '—'}</td>
       <td>${r.best_p != null ? (r.best_p*100).toFixed(1)+'%' : '—'}</td>
       <td>${bidask}</td>
@@ -218,7 +222,7 @@ function renderWeatherExec() {
   box.innerHTML = '<div class="pos-hd">Open paper positions</div>' + open.map(p =>
     `<div class="pos-row ${p.mode}">
        <span class="pos-mode">${p.mode === 'live' ? 'LIVE' : 'PAPER'}</span>
-       <span class="pos-match">${esc(p.city)} ${esc(p.date)}</span>
+       <span class="pos-match">${esc(p.city)} ${p.kind === 'low' ? '▼' : '▲'} ${esc(p.date)}</span>
        <span class="pos-buy">${esc(p.label)} @ ${p.entry_c}¢ ×${p.shares}</span>
        <span class="pos-cost">$${p.cost_usd}</span>
        <span class="pos-chip">p ${p.model_p} · +${p.edge_c}¢</span>
