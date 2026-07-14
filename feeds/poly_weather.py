@@ -36,9 +36,11 @@ _SLUG_DATE = re.compile(r"-(\w+)-(\d{1,2})-(\d{4})$")
 _WUND = re.compile(r"wunderground\.com/history/daily/(\S+)")
 _NOAA = re.compile(r"weather\.gov/wrh/timeseries\?site=([A-Za-z0-9]{3,5})")
 _HKO = re.compile(r"weather\.gov\.hk")
+# °C markets phrase buckets "be 26°C" / "be 24°C or below" / "be 34°C or above";
+# °F markets use ranges "be between 88-89°F" and the top tail "or higher".
 _B_BELOW = re.compile(r"be (-?\d+)°([CF]) or below")
-_B_ABOVE = re.compile(r"be (-?\d+)°([CF]) or above")
-_B_RANGE = re.compile(r"be (-?\d+)-(-?\d+)°([CF])")
+_B_ABOVE = re.compile(r"be (-?\d+)°([CF]) or (?:above|higher)")
+_B_RANGE = re.compile(r"be (?:between )?(-?\d+)-(-?\d+)°([CF])")
 _B_EXACT = re.compile(r"be (-?\d+)°([CF])")
 
 

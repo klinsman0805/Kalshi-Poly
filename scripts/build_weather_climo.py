@@ -40,10 +40,21 @@ from feeds.poly_weather import fetch_temperature_events  # noqa: E402
 
 OUT = Path(__file__).resolve().parent.parent / "data" / "weather_climo.json"
 YEARS = 5
-K_MAX = 12          # cap on remaining-rise degrees tracked
+# cap on remaining-rise degrees tracked, per unit (12°C ≈ 22°F span)
+K_MAX = {"C": 12, "F": 22}
 ALPHA = 0.5         # Laplace smoothing pseudo-count per k bin
 METAR_API = "https://aviationweather.gov/api/data/metar"
 ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
+
+
+def station_units():
+    """Map station ICAO → settlement unit ('C'|'F') from current Poly events."""
+    units = {}
+    for e in fetch_temperature_events():
+        if e["source"] != "metar" or not e["station"] or not e["buckets"]:
+            continue
+        units[e["station"]] = e["buckets"][0]["unit"]
+    return units
 
 
 def station_coords(icaos):
@@ -57,20 +68,23 @@ def station_coords(icaos):
     return out
 
 
-def fetch_hourly(lat, lon):
+def fetch_hourly(lat, lon, unit):
     end = date.today().replace(day=1)             # full months only
     start = end.replace(year=end.year - YEARS)
-    r = requests.get(ARCHIVE, params={
+    params = {
         "latitude": lat, "longitude": lon,
         "start_date": start.isoformat(), "end_date": end.isoformat(),
         "hourly": "temperature_2m", "timezone": "auto",
-    }, timeout=60)
+    }
+    if unit == "F":
+        params["temperature_unit"] = "fahrenheit"
+    r = requests.get(ARCHIVE, params=params, timeout=60)
     r.raise_for_status()
     d = r.json()
     return d["timezone"], d["hourly"]["time"], d["hourly"]["temperature_2m"]
 
 
-def _smooth(counts):
+def _smooth(counts, k_max):
     """pool ±1 month, Laplace-smooth, normalise → {month: {hour: {k: p}}}."""
     pmf = {}
     for m in range(1, 13):
@@ -84,14 +98,14 @@ def _smooth(counts):
             total = sum(c.values())
             if total == 0:
                 continue
-            denom = total + ALPHA * (K_MAX + 1)
+            denom = total + ALPHA * (k_max + 1)
             pmf[str(m)][str(h)] = {
-                str(k): round((c[k] + ALPHA) / denom, 6) for k in range(K_MAX + 1)
+                str(k): round((c[k] + ALPHA) / denom, 6) for k in range(k_max + 1)
             }
     return pmf
 
 
-def build_pmf(times, temps):
+def build_pmf(times, temps, k_max):
     """Remaining-rise (daily max) and remaining-fall (daily min) PMFs."""
     days = defaultdict(list)                      # 'YYYY-MM-DD' -> [(hour, temp)]
     for t, v in zip(times, temps):
@@ -113,20 +127,19 @@ def build_pmf(times, temps):
         for hour, v in rows:
             run_max = v if run_max is None else max(run_max, v)
             run_min = v if run_min is None else min(run_min, v)
-            k_hi = min(max(final_max - round(run_max), 0), K_MAX)
-            k_lo = min(max(round(run_min) - final_min, 0), K_MAX)
+            k_hi = min(max(final_max - round(run_max), 0), k_max)
+            k_lo = min(max(round(run_min) - final_min, 0), k_max)
             hi[month][hour][k_hi] += 1
             lo[month][hour][k_lo] += 1
-    return _smooth(hi), _smooth(lo), n_days
+    return _smooth(hi, k_max), _smooth(lo, k_max), n_days
 
 
 def main():
     force = "--force" in sys.argv[1:]
     icaos = [a.upper() for a in sys.argv[1:] if not a.startswith("-")]
+    units = station_units()
     if not icaos:
-        events = fetch_temperature_events()
-        icaos = sorted({e["station"] for e in events
-                        if e["source"] == "metar" and e["station"]})
+        icaos = sorted(units)
         print(f"stations from current Polymarket events: {icaos}")
     coords = station_coords(icaos)
     missing = [i for i in icaos if i not in coords]
@@ -140,19 +153,28 @@ def main():
     OUT.parent.mkdir(parents=True, exist_ok=True)
     todo = [c for c in icaos if c in coords]
     for i, icao in enumerate(todo):
-        if (not force and icao in out and "pmf_low" in out[icao]
-                and out[icao].get("built") == date.today().isoformat()):
-            print(f"[{i+1}] {icao} already built today — skip")
+        unit = units.get(icao, "C")
+        ent = out.get(icao)
+        fresh = ent and "pmf_low" in ent and ent.get("built") == date.today().isoformat()
+        if not force and fresh and ent.get("unit") == unit:
+            print(f"[{i+1}] {icao} already built today ({unit}) — skip")
+            continue
+        # Backfill: existing entries predate unit tagging and were built in °C.
+        # A °C station just needs the tag — no refetch.
+        if not force and fresh and unit == "C" and ent.get("unit") is None:
+            ent["unit"] = "C"
+            OUT.write_text(json.dumps(out))
+            print(f"[{i+1}] {icao} tagged °C (no refetch)")
             continue
         lat, lon = coords[icao]
-        print(f"[{i+1}] {icao} ({lat:.3f},{lon:.3f}) …", end=" ", flush=True)
+        print(f"[{i+1}] {icao} ({lat:.3f},{lon:.3f}) [{unit}] …", end=" ", flush=True)
         try:
-            tz, times, temps = fetch_hourly(lat, lon)
-            pmf_hi, pmf_lo, n_days = build_pmf(times, temps)
+            tz, times, temps = fetch_hourly(lat, lon, unit)
+            pmf_hi, pmf_lo, n_days = build_pmf(times, temps, K_MAX[unit])
         except Exception as e:  # noqa: BLE001
             print(f"FAILED: {e}")
             continue
-        out[icao] = {"tz": tz, "lat": lat, "lon": lon, "n_days": n_days,
+        out[icao] = {"tz": tz, "lat": lat, "lon": lon, "n_days": n_days, "unit": unit,
                      "built": date.today().isoformat(),
                      "pmf": pmf_hi, "pmf_low": pmf_lo}
         # write after every station: interrupts lose nothing, and the running

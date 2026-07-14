@@ -95,10 +95,22 @@ class MetarFeed:
                 return None
         return None
 
+    @staticmethod
+    def _f(c):
+        return None if c is None else c * 9.0 / 5.0 + 32.0
+
     def _reduce(self, icao, rows, tz, now_utc):
-        """Fold a station's obs into running max AND min for *today's* local date."""
+        """Fold a station's obs into running max AND min for *today's* local date.
+
+        Tracked in both °C and °F. aviationweather.gov decodes the METAR T-group
+        into `temp` as a float with tenths precision when present (US ASOS
+        stations), so the °F extreme is boundary-accurate — °F markets settle on
+        whole °F derived from that same tenths data.
+        """
         local_today = now_utc.astimezone(tz).date()
-        max_c, min_c, latest, latest_ts, n_today = None, None, None, None, 0
+        max_c = min_c = latest = latest_ts = None
+        max_f = min_f = None
+        n_today = 0
         for o in rows:
             ts = self._obs_time(o)
             temp = o.get("temp")
@@ -109,24 +121,29 @@ class MetarFeed:
             if ts.astimezone(tz).date() != local_today:
                 continue
             n_today += 1
-            max_c = float(temp) if max_c is None else max(max_c, float(temp))
-            min_c = float(temp) if min_c is None else min(min_c, float(temp))
+            tc = float(temp)
+            tf = self._f(tc)
+            max_c = tc if max_c is None else max(max_c, tc)
+            min_c = tc if min_c is None else min(min_c, tc)
+            max_f = tf if max_f is None else max(max_f, tf)
+            min_f = tf if min_f is None else min(min_f, tf)
             # 6-hourly max/min groups (US stations): cover the preceding 6 h;
             # only trust them for today when the report is ≥6 h into the day.
             if ts.astimezone(tz).hour >= 6:
                 mx, mn = o.get("maxT"), o.get("minT")
                 if mx is not None:
-                    max_c = float(mx) if max_c is None else max(max_c, float(mx))
+                    max_c = max(max_c, float(mx)); max_f = max(max_f, self._f(float(mx)))
                 if mn is not None:
-                    min_c = float(mn) if min_c is None else min(min_c, float(mn))
+                    min_c = min(min_c, float(mn)); min_f = min(min_f, self._f(float(mn)))
         return {
             "icao": icao,
             "local_date": local_today.isoformat(),
             "local_hour": now_utc.astimezone(tz).hour + now_utc.astimezone(tz).minute / 60.0,
             "tz": str(tz),
             "temp_c": latest,
-            "max_c": max_c,
-            "min_c": min_c,
+            "temp_f": self._f(latest),
+            "max_c": max_c, "min_c": min_c,
+            "max_f": max_f, "min_f": min_f,
             "obs_today": n_today,
             "latest_obs_utc": latest_ts.isoformat() if latest_ts else None,
         }

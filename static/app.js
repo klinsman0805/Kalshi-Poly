@@ -179,7 +179,7 @@ function renderWeather() {
       <td class="l"><div class="match">${esc(r.city)} ${arrow}</div>
         <div class="kickoff">${esc(r.station||'?')} · ${esc(r.date||'')} · ${r.kind === 'low' ? 'LOW' : 'HIGH'}${r.tradeable?'':' · '+esc(r.why||'')}</div></td>
       <td>${localH}</td>
-      <td>${r.temp_c != null ? r.temp_c.toFixed(0)+'°' : '—'} / <b>${r.ext_c != null ? r.ext_c.toFixed(0)+'°C' : '—'}</b></td>
+      <td>${r.temp_c != null ? r.temp_c.toFixed(0)+'°' : '—'} / <b>${r.ext_c != null ? r.ext_c.toFixed(0)+'°'+(r.unit||'C') : '—'}</b></td>
       <td>${r.best_label ? esc(r.best_label) : '—'}</td>
       <td>${r.best_p != null ? (r.best_p*100).toFixed(1)+'%' : '—'}</td>
       <td>${bidask}</td>
