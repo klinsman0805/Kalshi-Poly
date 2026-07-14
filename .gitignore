@@ -15,3 +15,6 @@ __pycache__/
 # Local environment
 venv/
 .claude/
+
+# Weather climatology (regenerate with scripts/build_weather_climo.py)
+data/weather_climo.json
