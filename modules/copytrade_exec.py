@@ -17,11 +17,16 @@ Anything less → PAPER: identical selection/sizing/logging, simulated fill.
 Config (env):
   COPYTRADE_FOLLOW          comma wallet list to force-follow (else: copyable
                             wallets handed in from the scanner)
-  COPYTRADE_EXEC_STAKE_USD  $ per copied trade            (default 5)
+  COPYTRADE_EXEC_STAKE_USD  legacy flat-stake $ (unused; RISK_USD sizes now)
   COPYTRADE_EXEC_MAX_OPEN   max concurrent open copies    (default 20)
   COPYTRADE_EXEC_MAX_USD    only copy trades whose usdcSize ≤ this (default 5000)
-  COPYTRADE_EXEC_MIN_C      skip entries below this price  (default 5)
-  COPYTRADE_EXEC_MAX_C      skip entries above this price  (default 95)
+  COPYTRADE_EXEC_MIN_C      hard price floor (default 5)
+  COPYTRADE_EXEC_MAX_C      hard price ceiling (default 95)
+  COPYTRADE_EXEC_ENTRY_MIN_C EV band floor — skip cheaper (default = MIN_C)
+  COPYTRADE_EXEC_ENTRY_MAX_C EV band ceiling — skip deep favourites (default 85)
+  COPYTRADE_EXEC_RISK_USD    $ risked per copy; shares = RISK_USD/price (default 5)
+  COPYTRADE_EXEC_MAX_SLIP_C  reject copy if price ran > this vs their fill (default 3)
+  COPYTRADE_EXEC_MAX_SHARES  hard share cap per copy (default 200)
   COPYTRADE_EXEC_LOOKBACK   activity events scanned per wallet per poll (default 40)
   COPYTRADE_LIVE            true|false  arm real Poly orders (default false)
   COPYTRADE_EXEC_LOG        positions jsonl path (default copytrade_positions.jsonl)
@@ -49,6 +54,23 @@ MIN_C = int(os.getenv("COPYTRADE_EXEC_MIN_C", "5"))
 MAX_C = int(os.getenv("COPYTRADE_EXEC_MAX_C", "95"))
 LOOKBACK = int(os.getenv("COPYTRADE_EXEC_LOOKBACK", "40"))
 
+# ── EV trade filter + risk sizing ────────────────────────────────────────────
+# The n=317 paper test lost because copies were flat-STAKE: a 90c favourite and a
+# 32c longshot both risked ~$5, but the favourite's upside is tiny ($0.10/share)
+# while its downside is large ($0.90/share). Winning 52% of favourite-heavy bets
+# can't pay for that. Two fixes:
+#   1. EV price band — only copy entries where wins can pay for losses. Skip deep
+#      favourites (>MAX_ENTRY_C) whose payoff is asymmetric against you.
+#   2. Flat-NOTIONAL-RISK sizing — size so each YES buy risks the same dollars.
+#      Risk per share of a YES buy at price p ($/share) is p (you lose entry on a
+#      NO resolution), so shares = RISK_USD / p. This replaces shares = stake / p,
+#      which under-sized longshots and over-sized favourites — the exact bleed.
+ENTRY_MIN_C = int(os.getenv("COPYTRADE_EXEC_ENTRY_MIN_C", str(MIN_C)))
+ENTRY_MAX_C = int(os.getenv("COPYTRADE_EXEC_ENTRY_MAX_C", "85"))
+RISK_USD = float(os.getenv("COPYTRADE_EXEC_RISK_USD", "5"))
+MAX_SLIP_C = int(os.getenv("COPYTRADE_EXEC_MAX_SLIP_C", "3"))
+MAX_SHARES = int(os.getenv("COPYTRADE_EXEC_MAX_SHARES", "200"))
+
 
 def _env_follow():
     raw = os.getenv("COPYTRADE_FOLLOW", "").strip()
@@ -65,6 +87,7 @@ class CopyTradeExecutor:
         self.closed = []                         # settled copies (bounded, for UI)
         self._seen = set()                       # dedup by trade transactionHash
         self._cursor = {}                        # wallet -> last-seen timestamp
+        self._skips = {}                         # skip-reason -> count (visibility)
         self._poly = None
         self.session = {
             "copied": 0, "skipped": 0, "settled": 0, "wins": 0, "losses": 0,
@@ -173,6 +196,11 @@ class CopyTradeExecutor:
                 self._consider(wallet, a)
         self._cursor[wallet] = max(newest, cursor)
 
+    def _skip(self, reason):
+        """Tally why a candidate was skipped (bucketed by leading token) for visibility."""
+        key = reason.split()[0] if reason else "other"
+        self._skips[key] = self._skips.get(key, 0) + 1
+
     def _consider(self, wallet, trade):
         txh = trade.get("transactionHash")
         if txh and txh in self._seen:
@@ -185,31 +213,48 @@ class CopyTradeExecutor:
         token = trade.get("asset")
         title = trade.get("title") or trade.get("slug") or "?"
 
-        # filters — copyability band, price band, capacity
+        # filters — copyability band, EV price band, capacity
         reason = None
         if not token:
             reason = "no token"
         elif usd > MAX_TRADE_USD:
             reason = f"size ${usd:,.0f}>cap"
-        elif not (MIN_C <= their_price <= MAX_C):
-            reason = f"price {their_price}c out of band"
+        elif not (ENTRY_MIN_C <= their_price <= ENTRY_MAX_C):
+            reason = f"their {their_price}c out of EV band [{ENTRY_MIN_C},{ENTRY_MAX_C}]"
         elif len(self.open) >= MAX_OPEN:
             reason = "max_open"
         if reason:
             self.session["skipped"] += 1
+            self._skip(reason)
             return
 
         # fill at CURRENT market ask — this is where latency slippage shows up
         cur_ask = poly_leaderboard.token_price(token, side="buy")
-        if cur_ask is None or not (MIN_C <= cur_ask <= MAX_C):
+        if cur_ask is None:
             self.session["skipped"] += 1
+            self._skip("no live book")
             self.on_log("!", f"[copyexec] skip {title[:32]} — no live book "
                             f"(their {their_price}c)")
             return
+        # by the time we fill, the price may have run past the EV band — re-check it
+        if not (ENTRY_MIN_C <= cur_ask <= ENTRY_MAX_C):
+            self.session["skipped"] += 1
+            self._skip(f"cur {cur_ask}c out of EV band")
+            return
+        # reject copies where latency already moved the price too far against us
+        if cur_ask - their_price > MAX_SLIP_C:
+            self.session["skipped"] += 1
+            self._skip(f"slip {cur_ask - their_price}c>{MAX_SLIP_C}")
+            return
 
-        shares = int(round(self.stake_usd / (cur_ask / 100.0))) if cur_ask > 0 else 0
+        # flat-NOTIONAL-RISK sizing: risk per share of a YES buy at p is p, so
+        # shares = RISK_USD / p equalises dollar-at-risk across favourites/longshots.
+        p = cur_ask / 100.0
+        shares = int(round(RISK_USD / p)) if p > 0 else 0
+        shares = min(shares, MAX_SHARES)
         if shares <= 0:
             self.session["skipped"] += 1
+            self._skip("zero shares")
             return
         filled, detail = self._place(token, cur_ask, shares)
         if filled <= 0:
@@ -225,7 +270,8 @@ class CopyTradeExecutor:
             "mode": self.mode, "wallet": wallet, "title": title,
             "token": token, "outcome": trade.get("outcome"),
             "their_price": their_price, "entry": cur_ask, "slippage_c": slip,
-            "filled": filled, "cost_usd": cost, "detail": detail, "phase": "open",
+            "filled": filled, "cost_usd": cost, "risk_usd": round(RISK_USD, 2),
+            "detail": detail, "phase": "open",
         }
         self.open.append(pos)
         self.session["copied"] += 1
@@ -311,8 +357,11 @@ class CopyTradeExecutor:
             "stake_usd": self.stake_usd,
             "follow": sorted(self.follow),
             "open": self.open, "closed": self.closed[-25:], "session": s,
+            "skips": dict(self._skips),
             "config": {"max_open": MAX_OPEN, "max_trade_usd": MAX_TRADE_USD,
-                       "min_c": MIN_C, "max_c": MAX_C, "log": str(POS_LOG)},
+                       "entry_min_c": ENTRY_MIN_C, "entry_max_c": ENTRY_MAX_C,
+                       "risk_usd": RISK_USD, "max_slip_c": MAX_SLIP_C,
+                       "max_shares": MAX_SHARES, "log": str(POS_LOG)},
         }
 
 
