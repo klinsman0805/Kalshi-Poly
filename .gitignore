@@ -18,3 +18,6 @@ venv/
 
 # Weather climatology (regenerate with scripts/build_weather_climo.py)
 data/weather_climo.json
+
+# Belt-and-suspenders: ignore any .env variant (backups etc.)
+.env*
