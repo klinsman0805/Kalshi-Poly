@@ -1,11 +1,7 @@
 """
-app.py — Trading dashboard: SCALPING (Kalshi paper reference) + COPY-TRADE +
-WEATHER NEAR-LOCK (Polymarket).
+app.py — Trading dashboard: COPY-TRADE + WEATHER NEAR-LOCK (Polymarket).
 
 Monitor + dry-run signals (no real orders in this build).
-  • Scalping: Kalshi 15-min up/down vs live Coinbase spot → edge / fee gate /
-    paper P&L that settles within the 15-min window. Kept as the reference
-    implementation of the Kalshi paper-trade pattern (no live edge at n=135).
   • Copy-trade: Polymarket leaderboard scanner + forward-test executor.
   • Weather: Polymarket daily-high-temperature markets vs live METAR at the
     settlement station — NEAR-LOCK convergence signals + paper forward test.
@@ -39,9 +35,7 @@ except ImportError:
 
 import engine
 from feeds import poly_leaderboard
-from feeds.spot import SpotFeed
 from feeds.metar import MetarFeed
-from modules.scalping import ScalpEngine
 from modules.copytrader import CopyTraderEngine
 from modules.copytrade_exec import CopyTradeExecutor
 from modules.weather import WeatherEngine
@@ -56,9 +50,6 @@ app.config["SECRET_KEY"] = os.urandom(24)
 _bot: engine.BotEngine = None
 _bot_lock = threading.Lock()
 _event_queue: queue.Queue = queue.Queue(maxsize=500)
-
-_spot = SpotFeed(assets=engine.ASSETS)
-_scalp = ScalpEngine(dry_run=True)
 
 # Copy-trade scanner (Polymarket only, read-only) — off unless COPYTRADE_ENABLED=true.
 _copytrade = CopyTraderEngine()
@@ -98,7 +89,6 @@ def _add_log(icon: str, msg: str):
     _push("log", entry)
 
 
-_scalp.on_log = _add_log
 _copytrade.on_log = _add_log
 _copytrade_exec.on_log = _add_log
 _metar.on_log = _add_log
@@ -112,12 +102,9 @@ def _on_log(icon, msg):
 
 
 def _on_prices(markets, snapshots):
-    """Kalshi crypto snapshot tick → recompute scalping signals."""
-    try:
-        view = _scalp.compute(snapshots, _spot.snapshot())
-        _push("scalping", {"assets": view, "session": _scalp.session})
-    except Exception as e:  # noqa: BLE001
-        _add_log("✗", f"scalp compute error: {e}")
+    """Kalshi snapshot tick. No consumer since scalping was retired — kept as a
+    no-op so BotEngine's status/keepalive still drives the dashboard state dot."""
+    return
 
 
 def _on_status(status):
@@ -176,7 +163,6 @@ def _start_bot():
             return False, "already running"
         engine.DRY_RUN = True
         engine.USE_DEMO = False
-        _spot.start()
         _bot = engine.BotEngine(on_log=_on_log, on_prices=_on_prices, on_status=_on_status)
         BOT_STATE["started_at"] = datetime.now(timezone.utc).isoformat()
         BOT_STATE["status"] = "starting"
@@ -195,7 +181,7 @@ def _start_bot():
             _weather_thread = threading.Thread(target=_weather_loop, daemon=True, name="weather-poll")
             _weather_thread.start()
             _add_log("◆", "Weather NEAR-LOCK engine ENABLED (paper forward-test)")
-        _add_log("→", "Dashboard started — scalping + copy-trade + weather feeds live (dry-run)")
+        _add_log("→", "Dashboard started — copy-trade + weather feeds live (dry-run)")
         return True, "ok"
 
 
@@ -204,7 +190,6 @@ def _stop_bot():
     with _bot_lock:
         _copytrade_stop.set()
         _weather_stop.set()
-        _spot.stop()
         if _bot:
             _bot.stop()
             BOT_STATE["status"] = "stopped"
@@ -252,11 +237,6 @@ def api_start():
 def api_stop():
     ok, msg = _stop_bot()
     return jsonify({"ok": ok, "msg": msg})
-
-
-@app.route("/api/scalping")
-def api_scalping():
-    return jsonify(_scalp.state())
 
 
 @app.route("/api/weather")
@@ -316,7 +296,7 @@ if __name__ == "__main__":
 
     creds_ok = bool(engine.KALSHI_KEY_ID and Path(engine.KALSHI_KEY_FILE).exists())
     print("\n" + "=" * 60)
-    print("  DASHBOARD — Scalping (paper) + Copy-trade (monitor + dry-run)")
+    print("  DASHBOARD — Copy-trade + Weather (monitor + dry-run)")
     print(f"  Dashboard → http://localhost:5001")
     print(f"  Kalshi WS creds: {'found' if creds_ok else 'MISSING (ticker-only data)'}")
     print("=" * 60 + "\n")

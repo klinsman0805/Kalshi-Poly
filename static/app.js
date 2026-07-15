@@ -1,14 +1,13 @@
 // ── State ─────────────────────────────────────────────────────────────────────
 const S = {
-  tab: 'scalp', botRunning: false,
-  scalp: {}, scalpSession: {},
+  tab: 'weather', botRunning: false,
   copy: [], copyCfg: {}, copyEnabled: false, copyScanning: false, copyExec: null,
   weather: [], weatherCfg: {}, weatherExec: null,
   lastDataTs: 0, logExpanded: false,
 };
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
-const TABS = ['scalp', 'weather', 'copy'];
+const TABS = ['weather', 'copy'];
 function showTab(t) {
   S.tab = t;
   TABS.forEach(x => {
@@ -39,10 +38,6 @@ function handleMsg(m) {
     case 'init':     updateStatus(m.status); break;
     case 'status':   updateStatus(m.status); break;
     case 'log':      addLog(m); break;
-    case 'scalping':
-      S.scalp = m.assets || {}; S.scalpSession = m.session || {};
-      S.lastDataTs = Date.now(); if (S.tab === 'scalp') renderScalp();
-      renderScalpSummary(); break;
     case 'copytrade':
       applyCopy(m); break;
     case 'weather':
@@ -61,79 +56,6 @@ function updateStatus(st) {
   document.getElementById('slabel').textContent = (st || 'stopped').toUpperCase();
   document.getElementById('btn-start').style.display = S.botRunning ? 'none' : '';
   document.getElementById('btn-stop').style.display = S.botRunning ? '' : 'none';
-}
-
-// ── Scalping render ───────────────────────────────────────────────────────────
-const c = v => (v == null ? '—' : v + '¢');
-function fmtSpot(v) { return v == null ? '—' : '$' + v.toLocaleString(undefined, {maximumFractionDigits: 2}); }
-function fmtSecs(s) { if (s == null) return '—'; return s >= 60 ? Math.floor(s/60)+'m '+(s%60)+'s' : s+'s'; }
-
-function sigClass(sig) {
-  if (!sig) return 'flat';
-  if (sig.startsWith('ENTER')) return 'enter';
-  if (sig === 'FEE-BLOCKED') return 'blocked';
-  if (sig === 'SETTLING') return 'settling';
-  return 'flat';
-}
-
-function renderScalp() {
-  const grid = document.getElementById('scalp-grid');
-  const assets = ['BTC', 'ETH', 'SOL'].filter(a => S.scalp[a]);
-  if (!assets.length) { grid.innerHTML = '<div class="no-data">Waiting for market data…</div>'; return; }
-  grid.innerHTML = assets.map(a => renderScard(S.scalp[a])).join('');
-}
-
-function renderScard(v) {
-  const sc = sigClass(v.signal);
-  const timerCls = v.secs_left == null ? '' : v.secs_left < 60 ? 'crit' : v.secs_left < 180 ? 'warn' : '';
-  const vel = v.vel30;
-  const velCls = vel == null ? 'flat' : vel > 0 ? 'up' : vel < 0 ? 'dn' : 'flat';
-  const velStr = vel == null ? '' : (vel > 0 ? '▲ +' : '▼ ') + Math.abs(vel).toFixed(2) + '/30s';
-  const mktPct = v.mkt_prob != null ? (v.mkt_prob * 100) : null;
-  const mdlPct = v.model_prob != null ? (v.model_prob * 100) : null;
-  const edgeCls = v.net_edge_c == null ? '' : v.net_edge_c > 0 ? 'ok' : 'dn';
-  const cardCls = 'scard ' + (sc === 'enter' ? 'enter' : sc === 'blocked' ? 'blocked' : '');
-  const paper = v.paper
-    ? `<span class="paper">PAPER ${v.paper.side} @ ${v.paper.entry_cost}¢</span>` : '';
-  return `<div class="${cardCls}">
-    <div class="scard-head">
-      <span class="scard-asset">${v.asset}</span>
-      <span class="sig ${sc}">${v.signal || '—'}</span>
-      <span class="scard-timer ${timerCls}">${fmtSecs(v.secs_left)}</span>
-    </div>
-    <div class="spot-row">
-      <span class="spot-val">${fmtSpot(v.spot)}</span>
-      <span class="vel ${velCls}">${velStr}</span>
-    </div>
-    <div class="probbar">
-      ${mktPct != null ? `<div class="mkt" style="width:${mktPct}%"></div>` : ''}
-      ${mdlPct != null ? `<div class="mdl" style="left:${mdlPct}%"></div>` : ''}
-      <span class="lbl">mkt ${mktPct != null ? mktPct.toFixed(0) : '–'}%</span>
-      <span class="lbl r">model ${mdlPct != null ? mdlPct.toFixed(0) : '–'}%</span>
-    </div>
-    <div class="kv-grid">
-      <div class="kv"><div class="k">Kalshi YES</div><div class="v up">${c(v.yes_bid)} / ${c(v.yes_ask)}</div></div>
-      <div class="kv"><div class="k">Kalshi NO</div><div class="v dn">${c(v.no_bid)} / ${c(v.no_ask)}</div></div>
-      <div class="kv"><div class="k">Strike</div><div class="v">${v.strike != null ? fmtSpot(v.strike) : '—'}</div></div>
-      <div class="kv"><div class="k">Net edge (after fee)</div><div class="v ${edgeCls}">${v.net_edge_c != null ? (v.net_edge_c>0?'+':'')+v.net_edge_c+'¢' : '—'}</div></div>
-    </div>
-    <div class="scard-foot">
-      <span>gross ${v.gross_edge_c != null ? v.gross_edge_c+'¢' : '—'}</span>
-      <span>fee ${v.fee_c != null ? v.fee_c+'¢' : '—'} ×2</span>
-      <span>vol ${v.vol != null ? (v.vol*100).toFixed(0)+'%' : '—'}</span>
-      <span>window ${v.window_pct != null ? v.window_pct+'%' : '—'}</span>
-      ${paper}
-    </div>
-  </div>`;
-}
-
-function renderScalpSummary() {
-  const s = S.scalpSession || {};
-  const wr = s.trades ? Math.round(s.wins / s.trades * 100) : null;
-  document.getElementById('scalp-summary').innerHTML =
-    `Crypto scalping · Kalshi 15-min up/down vs live spot &nbsp;·&nbsp; ` +
-    `paper P&L <b style="color:${(s.pnl||0)>=0?'var(--ok)':'var(--down)'}">${(s.pnl||0)>=0?'+':''}$${(s.pnl||0).toFixed(4)}</b> ` +
-    `· ${s.trades||0} settled · ${wr!=null?wr+'% win':'—'}`;
 }
 
 // ── Weather render ────────────────────────────────────────────────────────────
@@ -373,10 +295,6 @@ async function stopBot() {
 
 // fallback poll so panels fill immediately on load
 async function pollOnce() {
-  try {
-    const sc = await fetch('/api/scalping').then(r=>r.json());
-    S.scalp = sc.assets||{}; S.scalpSession = sc.session||{}; renderScalp(); renderScalpSummary();
-  } catch(e){}
   try {
     const cp = await fetch('/api/copytrade').then(r=>r.json());
     applyCopy(cp);

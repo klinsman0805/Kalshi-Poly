@@ -17,8 +17,7 @@
     <div class="sdot" id="sdot"></div>
     <span id="slabel">STOPPED</span>
     <div class="tabs">
-      <button class="tab active" id="tab-scalp"   onclick="showTab('scalp')">Scalping</button>
-      <button class="tab"        id="tab-weather" onclick="showTab('weather')">Weather</button>
+      <button class="tab active" id="tab-weather" onclick="showTab('weather')">Weather</button>
       <button class="tab"        id="tab-copy"    onclick="showTab('copy')" style="display:none">Copy-Trade</button>
     </div>
     <div class="spacer"></div>
@@ -34,16 +33,8 @@
   <!-- MODULES -->
   <div class="main">
 
-    <!-- SCALPING -->
-    <div class="view active" id="view-scalp">
-      <div class="section-lbl" id="scalp-summary">Crypto scalping · Kalshi 15-min up/down vs live spot</div>
-      <div class="scalp-grid" id="scalp-grid">
-        <div class="no-data">Waiting for market data…</div>
-      </div>
-    </div>
-
     <!-- WEATHER VIEW -->
-    <div class="view" id="view-weather">
+    <div class="view active" id="view-weather">
       <div class="section-lbl" id="weather-summary">Polymarket daily-high temperature · NEAR-LOCK vs live METAR</div>
       <!-- forward-test executor scoreboard -->
       <div class="exec-bar" id="wxexec-bar">
