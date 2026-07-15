@@ -26,6 +26,8 @@ from pathlib import Path
 
 import requests
 
+from feeds.poly_weather import taker_fee_c
+
 log = logging.getLogger("modules.weather_exec")
 
 POS_LOG = Path(os.getenv("WEATHER_EXEC_LOG", "weather_positions.jsonl"))
@@ -42,8 +44,11 @@ class WeatherExecutor:
         self.stake_usd = STAKE_USD
         self.open = []            # position dicts
         self.closed = []
+        # realized_pnl is NET of taker fees; realized_gross and fees_paid are
+        # tracked alongside so the forward test can report both.
         self.session = {"opened": 0, "settled": 0, "wins": 0,
-                        "staked_usd": 0.0, "realized_pnl": 0.0}
+                        "staked_usd": 0.0, "realized_pnl": 0.0,
+                        "realized_gross": 0.0, "fees_paid": 0.0}
         self._lock = threading.Lock()
         self._rehydrate()
 
@@ -61,10 +66,21 @@ class WeatherExecutor:
                     by_key[rec["key"]] = rec
                 elif rec.get("type") == "settle" and rec.get("key") in by_key:
                     pos = by_key.pop(rec["key"])
-                    self.closed.append({**pos, **rec})
+                    # backfill net/gross/fee for pre-fee-accounting settle records
+                    gross = rec.get("gross_pnl")
+                    if gross is None:
+                        gross = rec.get("pnl_usd", 0.0)   # old records stored gross here
+                    fee = rec.get("fee_usd")
+                    if fee is None:
+                        fee = round(pos.get("shares", 0) * taker_fee_c(pos.get("entry_c")) / 100.0, 2)
+                    net = round(gross - fee, 2)
+                    self.closed.append({**pos, **rec, "gross_pnl": gross,
+                                        "fee_usd": fee, "pnl_usd": net})
                     self.session["settled"] += 1
                     self.session["wins"] += 1 if rec.get("won") else 0
-                    self.session["realized_pnl"] += rec.get("pnl_usd", 0.0)
+                    self.session["realized_pnl"] += net
+                    self.session["realized_gross"] += gross
+                    self.session["fees_paid"] += fee
         except Exception as e:  # noqa: BLE001
             self.on_log("✗", f"[weatherexec] rehydrate failed: {e}")
             return
@@ -187,8 +203,11 @@ class WeatherExecutor:
             except (TypeError, ValueError, IndexError):
                 continue
             won = yes >= 0.5
-            pnl = round(pos["shares"] * ((100 - pos["entry_c"]) if won else -pos["entry_c"]) / 100.0, 2)
-            rec = {"type": "settle", "key": pos["key"], "won": won, "pnl_usd": pnl,
+            gross = round(pos["shares"] * ((100 - pos["entry_c"]) if won else -pos["entry_c"]) / 100.0, 2)
+            fee = round(pos["shares"] * taker_fee_c(pos["entry_c"]) / 100.0, 2)
+            net = round(gross - fee, 2)
+            rec = {"type": "settle", "key": pos["key"], "won": won,
+                   "gross_pnl": gross, "fee_usd": fee, "pnl_usd": net,
                    "settled": datetime.now(timezone.utc).isoformat()}
             with self._lock:
                 self.open = [p for p in self.open if p["key"] != pos["key"]]
@@ -196,13 +215,16 @@ class WeatherExecutor:
                 self.closed = self.closed[-200:]
                 self.session["settled"] += 1
                 self.session["wins"] += 1 if won else 0
-                self.session["realized_pnl"] = round(self.session["realized_pnl"] + pnl, 2)
+                self.session["realized_pnl"] = round(self.session["realized_pnl"] + net, 2)
+                self.session["realized_gross"] = round(self.session["realized_gross"] + gross, 2)
+                self.session["fees_paid"] = round(self.session["fees_paid"] + fee, 2)
                 self.session["staked_usd"] = round(
                     max(0.0, self.session["staked_usd"] - pos.get("cost_usd", 0.0)), 2)
             self._persist(rec)
             self.on_log("✅" if won else "✗",
                         f"[weatherexec] SETTLE {pos['city']} {pos['date']} {pos['label']} "
-                        f"{'WIN' if won else 'LOSS'} {pnl:+.2f} USD (model p was {pos['model_p']})")
+                        f"{'WIN' if won else 'LOSS'} net {net:+.2f} USD (gross {gross:+.2f} − fee {fee:.2f}, "
+                        f"model p was {pos['model_p']})")
 
     # ── state ────────────────────────────────────────────────────────────────
     def state(self):
@@ -220,6 +242,6 @@ class WeatherExecutor:
                          for p in self.open],
                 "recent": [{k: c.get(k) for k in
                             ("city", "kind", "date", "label", "entry_c", "model_p",
-                             "won", "pnl_usd")}
+                             "won", "pnl_usd", "gross_pnl", "fee_usd")}
                            for c in self.closed[-15:]][::-1],
             }

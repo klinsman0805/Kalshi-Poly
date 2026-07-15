@@ -136,6 +136,9 @@ function renderWeatherExec() {
   const pnl = document.getElementById('wx-pnl');
   pnl.textContent = (s.realized_pnl >= 0 ? '+$' : '-$') + Math.abs(s.realized_pnl||0).toFixed(2);
   pnl.style.color = (s.realized_pnl||0) >= 0 ? 'var(--ok)' : 'var(--down)';
+  if (s.realized_gross != null) pnl.title = `gross $${(s.realized_gross||0).toFixed(2)} − fees $${(s.fees_paid||0).toFixed(2)}`;
+  const feesEl = document.getElementById('wx-fees');
+  if (feesEl) feesEl.textContent = '$' + (s.fees_paid || 0).toFixed(2);
   document.getElementById('wx-staked').textContent = '$' + (s.staked_usd || 0);
 
   const box = document.getElementById('wxexec-pos');

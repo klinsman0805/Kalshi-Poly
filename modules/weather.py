@@ -33,7 +33,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from feeds.poly_weather import fetch_temperature_events
+from feeds.poly_weather import fetch_temperature_events, taker_fee_c
 
 log = logging.getLogger("modules.weather")
 
@@ -173,11 +173,13 @@ class WeatherEngine:
                                      st["local_hour"], ext, b["lo"], b["hi"])
             ask_c = b["ask"] * 100 if b["ask"] is not None else None
             bid_c = b["bid"] * 100 if b["bid"] is not None else None
-            edge_c = (p * 100 - ask_c) if (p is not None and ask_c is not None) else None
+            # edge is NET of the taker fee we'd pay to enter at the ask
+            fee_c = taker_fee_c(ask_c)
+            edge_c = (p * 100 - ask_c - fee_c) if (p is not None and ask_c is not None) else None
             bv = {
                 "label": self._label(b),
                 "lo": b["lo"], "hi": b["hi"], "unit": b["unit"],
-                "bid_c": bid_c, "ask_c": ask_c,
+                "bid_c": bid_c, "ask_c": ask_c, "fee_c": round(fee_c, 2),
                 "p": round(p, 4) if p is not None else None,
                 "edge_c": round(edge_c, 1) if edge_c is not None else None,
                 "condition_id": b["condition_id"],
@@ -268,6 +270,7 @@ class WeatherEngine:
             "climo_stations": len(self.climo),
             "climo_f": sum(1 for v in self.climo.values() if v.get("unit") == "F"),
             "config": {"p_min": P_MIN, "price_max_c": PRICE_MAX_C,
+                       "price_min_c": PRICE_MIN_C,
                        "min_edge_c": MIN_EDGE_C, "min_local_hour": MIN_LOCAL_HOUR,
                        "min_local_hour_low": MIN_LOCAL_HOUR_LOW},
         }

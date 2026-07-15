@@ -19,12 +19,28 @@ fills; a live executor should confirm against the CLOB book before ordering.
 
 import json
 import logging
+import os
 import re
 from datetime import datetime
 
 import requests
 
 log = logging.getLogger("feeds.poly_weather")
+
+# Polymarket taker fee — weather category (2026): fee = shares × rate × p × (1−p),
+# charged on the TAKER side only, at fill. Redemption/settlement is fee-free, and
+# our bot is always a taker (FOK buy at ask), so we pay it once, on entry.
+# At our prices this is ~0.8–1.25¢/share (peaks at 50¢). Rate confirmed from
+# docs.polymarket.com/trading/fees; override if Polymarket changes the schedule.
+TAKER_FEE_RATE = float(os.getenv("WEATHER_TAKER_FEE_RATE", "0.05"))
+
+
+def taker_fee_c(price_c):
+    """Taker fee in CENTS per share for a fill at `price_c` cents."""
+    if not price_c:
+        return 0.0
+    p = price_c / 100.0
+    return TAKER_FEE_RATE * p * (1.0 - p) * 100.0
 
 GAMMA = "https://gamma-api.polymarket.com/events"
 TIMEOUT = 15
