@@ -30,7 +30,12 @@ log = logging.getLogger("feeds.metar")
 
 API = "https://aviationweather.gov/api/data/metar"
 LOOKBACK_HOURS = 20          # enough to rebuild the local day's max after restart
-TIMEOUT = 15
+TIMEOUT = 20
+# aviationweather caps a single response at ~400 obs total, so a 49-station
+# batch returns only ~8 obs/station (the last few hours) — which silently
+# misses the afternoon peak and corrupts each station's daily max. Request in
+# small chunks so every station gets its full LOOKBACK_HOURS of history.
+CHUNK = 10
 
 
 class MetarFeed:
@@ -61,16 +66,23 @@ class MetarFeed:
             icaos = sorted(self._tz)
         if not icaos:
             return
-        try:
-            r = requests.get(API, params={"ids": ",".join(icaos), "format": "json",
-                                          "hours": LOOKBACK_HOURS}, timeout=TIMEOUT)
-            r.raise_for_status()
-            obs = r.json()
-            self.last_error = None
-        except Exception as e:  # noqa: BLE001
-            self.last_error = str(e)
-            self.on_log("!", f"[metar] poll failed: {e}")
+        obs, errors = [], 0
+        for i in range(0, len(icaos), CHUNK):
+            chunk = icaos[i:i + CHUNK]
+            try:
+                r = requests.get(API, params={"ids": ",".join(chunk), "format": "json",
+                                              "hours": LOOKBACK_HOURS}, timeout=TIMEOUT)
+                r.raise_for_status()
+                obs.extend(r.json())
+            except Exception as e:  # noqa: BLE001
+                errors += 1
+                self.last_error = str(e)
+        if errors:
+            self.on_log("!", f"[metar] {errors}/{(len(icaos)+CHUNK-1)//CHUNK} chunks failed")
+        if not obs:
             return
+        if not errors:
+            self.last_error = None
         by_station = {}
         for o in obs:
             by_station.setdefault(o.get("icaoId"), []).append(o)

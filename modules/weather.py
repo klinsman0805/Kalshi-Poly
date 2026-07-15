@@ -41,6 +41,11 @@ CLIMO_PATH = Path(os.getenv("WEATHER_CLIMO", "data/weather_climo.json"))
 
 P_MIN = float(os.getenv("WEATHER_P_MIN", "0.92"))
 PRICE_MAX_C = float(os.getenv("WEATHER_PRICE_MAX_C", "82"))
+# Floor: a genuine lagging NEAR-LOCK bucket trades ~60–82¢. If our target bucket
+# asks near zero while the market has locked another bucket near 100¢, the market
+# has resolved AGAINST us — our observed extreme is off by ~1° near a boundary,
+# not free money. Never buy into that.
+PRICE_MIN_C = float(os.getenv("WEATHER_PRICE_MIN_C", "40"))
 MIN_EDGE_C = float(os.getenv("WEATHER_MIN_EDGE_C", "8"))
 MIN_LOCAL_HOUR = float(os.getenv("WEATHER_MIN_LOCAL_HOUR", "13"))
 # daily min usually prints around sunrise, so lows unlock earlier than highs
@@ -234,6 +239,8 @@ class WeatherEngine:
             return "NO-LOCK", f"best p {best['p']:.2f} < {P_MIN}"
         if best["ask_c"] is None or best["bid_c"] is None:
             return "NO-BOOK", "missing quote"
+        if best["ask_c"] < PRICE_MIN_C:
+            return "MKT-LOCKED", f"ask {best['ask_c']:.0f}c < {PRICE_MIN_C:.0f}c — market resolved against us"
         if best["ask_c"] - best["bid_c"] > MAX_SPREAD_C:
             return "WIDE", f"spread {best['ask_c'] - best['bid_c']:.0f}c"
         if best["ask_c"] > PRICE_MAX_C:
