@@ -49,6 +49,22 @@ PRICE_MAX_C = float(os.getenv("WEATHER_PRICE_MAX_C", "82"))
 # not free money. Never buy into that.
 PRICE_MIN_C = float(os.getenv("WEATHER_PRICE_MIN_C", "40"))
 MIN_EDGE_C = float(os.getenv("WEATHER_MIN_EDGE_C", "8"))
+# Ceiling on "edge". The whole thesis is model > market, so a gap is EXPECTED —
+# but a huge gap is not a gift, it's a warning that the market knows something we
+# don't. Our observed extreme is a whole degree (international METAR carries no
+# tenths) and is up to a poll-cycle stale, so near a rounding boundary the market
+# — repricing on the real print first — is routinely right and we are not.
+#
+# CALIBRATION (provisional, fitted to n=3 live — revisit with real data):
+#   Manila   @70c: market 70% vs model 98% => gap 28  -> WON   (must allow)
+#   BA       @54c: market 54% vs model 97% => gap 43  -> DEAD  (must block)
+#   Amsterdam@44c: market 44% vs model 93% => gap 49  -> flagged
+# The boundary lies between ~28 and ~43; 35 splits it. A ceiling of 25 was tried
+# first and would have blocked Manila — our only winner — so do NOT tighten this
+# without evidence. Note this is near-equivalent to a ~60c PRICE_MIN_C floor,
+# since p is gated >=0.92; it is expressed as an edge so it scales with model
+# confidence.
+MAX_EDGE_C = float(os.getenv("WEATHER_MAX_EDGE_C", "35"))
 MIN_LOCAL_HOUR = float(os.getenv("WEATHER_MIN_LOCAL_HOUR", "13"))
 # daily min usually prints around sunrise, so lows unlock earlier than highs
 MIN_LOCAL_HOUR_LOW = float(os.getenv("WEATHER_MIN_LOCAL_HOUR_LOW", "10"))
@@ -229,6 +245,7 @@ class WeatherEngine:
                 "book_depth": best.get("book_depth"),
                 "gamma_ask_c": best.get("gamma_ask_c"),
                 "limit_c": best.get("limit_c"),   # FOK limit (worst level touched)
+                "lo": best.get("lo"), "hi": best.get("hi"),  # for dead-position detection
                 "date": e["date"].isoformat(), "station": icao, "slug": e["slug"],
                 "neg_risk": e["neg_risk"],
             } if signal == "ENTER" and best else None),
@@ -270,6 +287,9 @@ class WeatherEngine:
             return "PRICED", f"real ask {best['ask_c']:.0f}c > {PRICE_MAX_C:.0f}c (gamma said {gamma_ask:.0f}c)"
         if best["edge_c"] < MIN_EDGE_C:
             return "THIN-EDGE", f"real edge {best['edge_c']}c < {MIN_EDGE_C}c (gamma implied more)"
+        if best["edge_c"] > MAX_EDGE_C:
+            return "TOO-GOOD", (f"edge {best['edge_c']}c > {MAX_EDGE_C:.0f}c — model {best['p']*100:.0f}% "
+                                f"vs market ~{vwap:.0f}%; the market is probably right")
         drift = abs(vwap - gamma_ask)
         return "ENTER", (f"p {best['p']:.2f} @ real {best['ask_c']:.0f}c ×{shares}"
                          + (f" (gamma {gamma_ask:.0f}c, drift {drift:.0f}c)" if drift >= 1 else ""))

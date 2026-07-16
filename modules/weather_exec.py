@@ -130,11 +130,76 @@ class WeatherExecutor:
 
     # ── entries (called by WeatherEngine.refresh) ────────────────────────────
     def on_refresh(self, rows):
+        self._close_dead(rows)          # bail out of provably-lost buckets first
         for row in rows:
             entry = row.get("entry")
             if not entry:
                 continue
             self._consider(entry)
+
+    # ── dead-position exit ───────────────────────────────────────────────────
+    def _close_dead(self, rows):
+        """Exit buckets that CANNOT win any more.
+
+        A daily extreme is monotonic: the max only rises, the min only falls.
+        So once the observed max exceeds a high-bucket's ceiling (or the observed
+        min drops below a low-bucket's floor), that bucket is arithmetically dead
+        — it will settle 0. Riding it to settlement burns the slot and forfeits
+        whatever bid is still standing. (Live BA 23°C died this way: 24°C printed
+        and the bids vanished within minutes. Salvage beats hope.)
+        """
+        by_key = {f"{r['city']}|{r['date']}|{r['kind']}": r for r in rows}
+        with self._lock:
+            open_pos = list(self.open)
+        for pos in open_pos:
+            row = by_key.get(pos["key"])
+            if not row or row.get("ext_c") is None:
+                continue
+            ext, lo, hi = row["ext_c"], pos.get("lo"), pos.get("hi")
+            kind = pos.get("kind", "high")
+            if kind == "high" and hi is not None and ext > hi:
+                self._exit_dead(pos, row, f"max {ext:.0f}° > bucket ceiling {hi}°")
+            elif kind == "low" and lo is not None and ext < lo:
+                self._exit_dead(pos, row, f"min {ext:.0f}° < bucket floor {lo}°")
+
+    def _exit_dead(self, pos, row, reason):
+        """Sell out of a dead bucket (or write it off when nothing bids)."""
+        bucket = next((b for b in row.get("buckets", [])
+                       if b.get("label") == pos.get("label")), {})
+        bid_c = bucket.get("bid_c") or 0.0
+        sold, proceeds = 0.0, 0.0
+        if pos.get("mode") == "live" and self.is_live:
+            try:
+                import polymarket
+                client = self._poly()
+                fee = polymarket.fetch_live_fee_bps(pos["token_yes"]) or 0
+                sold = client.place_sell_fok(pos["token_yes"], float(pos["shares"]),
+                                             fee, neg_risk=pos.get("neg_risk"))
+                proceeds = round(sold * bid_c / 100.0, 2)
+            except Exception as e:  # noqa: BLE001
+                self.on_log("✗", f"[weatherexec] dead-exit sell failed {pos['city']}: {e}")
+        else:
+            sold = float(pos["shares"])          # paper: mark out at the bid
+            proceeds = round(sold * bid_c / 100.0, 2)
+        pnl = round(proceeds - pos.get("cost_usd", 0.0), 2)
+        rec = {"type": "settle", "key": pos["key"], "won": False,
+               "closed_early": True, "reason": reason,
+               "salvage_usd": proceeds, "sold_shares": round(sold, 6),
+               "gross_pnl": pnl, "fee_usd": 0.0, "pnl_usd": pnl,
+               "settled": datetime.now(timezone.utc).isoformat()}
+        with self._lock:
+            self.open = [p for p in self.open if p["key"] != pos["key"]]
+            self.closed.append({**pos, **rec})
+            self.closed = self.closed[-200:]
+            self.session["settled"] += 1
+            self.session["realized_pnl"] = round(self.session["realized_pnl"] + pnl, 2)
+            self.session["realized_gross"] = round(self.session["realized_gross"] + pnl, 2)
+            self.session["staked_usd"] = round(
+                max(0.0, self.session["staked_usd"] - pos.get("cost_usd", 0.0)), 2)
+        self._persist(rec)
+        self.on_log("✗", f"[weatherexec] DEAD-EXIT {pos['city']} {pos['label']} — {reason}; "
+                         f"salvaged ${proceeds:.2f} of ${pos.get('cost_usd',0):.2f} "
+                         f"({pnl:+.2f})")
 
     def _consider(self, entry):
         key = f"{entry['city']}|{entry['date']}|{entry.get('kind', 'high')}"
@@ -176,6 +241,8 @@ class WeatherExecutor:
             "city": entry["city"], "date": entry["date"], "station": entry["station"],
             "label": entry["label"], "condition_id": entry["condition_id"],
             "token_yes": entry["token_yes"], "slug": entry["slug"],
+            "lo": entry.get("lo"), "hi": entry.get("hi"),
+            "neg_risk": entry.get("neg_risk"),
             "entry_c": filled_c, "shares": shares, "cost_usd": cost,
             "model_p": entry["p"], "edge_c": entry["edge_c"],
             "opened": datetime.now(timezone.utc).isoformat(),
