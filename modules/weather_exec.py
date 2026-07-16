@@ -148,11 +148,18 @@ class WeatherExecutor:
         ask_c = entry["ask_c"]
         if ask_c is None or ask_c <= 0:
             return
-        shares = max(entry.get("min_size") or 5, round(self.stake_usd / (ask_c / 100.0)))
-        filled_c = ask_c          # paper fills at the ask by definition
+        # Prefer the size the engine actually verified depth for on the real
+        # book; fall back to stake/price only if the book wasn't confirmed.
+        shares = entry.get("shares_planned") or max(
+            entry.get("min_size") or 5, round(self.stake_usd / (ask_c / 100.0)))
+        filled_c = ask_c          # paper fills at the (book-confirmed) ask
         mode = "paper"
         if self.is_live:
-            filled, fill_c = self._place_live(entry["token_yes"], ask_c, shares,
+            # Send the LIMIT that clears the worst level we'd touch (ask_c is the
+            # VWAP we expect to pay — using it as the limit under-prices the FOK
+            # and gets it killed).
+            limit_c = entry.get("limit_c") or ask_c
+            filled, fill_c = self._place_live(entry["token_yes"], limit_c, shares,
                                               entry.get("neg_risk"))
             if filled <= 0:
                 self.on_log("!", f"[weatherexec] LIVE FOK missed {entry['city']} {entry['label']}")

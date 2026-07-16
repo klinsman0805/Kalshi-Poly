@@ -42,6 +42,56 @@ def taker_fee_c(price_c):
     p = price_c / 100.0
     return TAKER_FEE_RATE * p * (1.0 - p) * 100.0
 
+
+CLOB_BOOK = "https://clob.polymarket.com/book"
+
+
+def fetch_book_asks(token_id, timeout=6):
+    """The REAL executable ask ladder from the CLOB, ascending [(price_c, size)].
+
+    Gamma's `bestAsk` is a screening field, NOT an executable price — it goes
+    stale in both directions (a live order filled 9c BETTER than Gamma's ask on
+    one market, while another had NOTHING at Gamma's ask and the FOK died).
+    Anything that decides money must price off this ladder, not off Gamma.
+    Returns None on error (caller must treat as "unknown", never as "empty").
+    """
+    try:
+        r = requests.get(CLOB_BOOK, params={"token_id": token_id}, timeout=timeout)
+        r.raise_for_status()
+        asks = [(float(a["price"]) * 100.0, float(a["size"]))
+                for a in (r.json().get("asks") or [])]
+        return sorted(asks)
+    except Exception as e:  # noqa: BLE001
+        log.debug("book fetch failed %s: %s", str(token_id)[-8:], e)
+        return None
+
+
+def vwap_for_size(asks, shares):
+    """Walk the ask ladder buying `shares`.
+
+    Returns (vwap_cents, shares_filled, marginal_price_cents) where:
+      vwap     = what we'd actually PAY on average (use for cost/edge)
+      marginal = the WORST (highest) price level we'd touch
+
+    The distinction matters: a FOK only fills if its limit clears the marginal
+    price, not the VWAP. Book 82c x3 + 83c x5, buying 5 => vwap 82.4 but a
+    limit of 82 is KILLED. Price the edge off vwap; set the limit off marginal.
+    """
+    if not asks or shares <= 0:
+        return None, 0.0, None
+    need, cost, got, marginal = float(shares), 0.0, 0.0, None
+    for price_c, size in asks:
+        take = min(need, size)
+        cost += take * price_c
+        got += take
+        marginal = price_c
+        need -= take
+        if need <= 1e-9:
+            break
+    if got <= 0:
+        return None, 0.0, None
+    return cost / got, got, marginal
+
 GAMMA = "https://gamma-api.polymarket.com/events"
 TIMEOUT = 15
 PAGE = 100

@@ -27,13 +27,15 @@ value are the same METAR feed for these markets (see feeds/poly_weather.py).
 """
 
 import logging
+import math
 import json
 import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from feeds.poly_weather import fetch_temperature_events, taker_fee_c
+from feeds.poly_weather import (fetch_temperature_events, taker_fee_c,
+                                fetch_book_asks, vwap_for_size)
 
 log = logging.getLogger("modules.weather")
 
@@ -52,6 +54,11 @@ MIN_LOCAL_HOUR = float(os.getenv("WEATHER_MIN_LOCAL_HOUR", "13"))
 MIN_LOCAL_HOUR_LOW = float(os.getenv("WEATHER_MIN_LOCAL_HOUR_LOW", "10"))
 MIN_OBS_TODAY = int(os.getenv("WEATHER_MIN_OBS_TODAY", "3"))
 MAX_SPREAD_C = float(os.getenv("WEATHER_MAX_SPREAD_C", "10"))
+# Gamma's bestAsk only SCREENS. Before a candidate becomes a signal, re-price it
+# on the real CLOB ladder for the size we'd actually buy. Off => Gamma-priced
+# (fast, but signals/paper fills can be fiction).
+BOOK_CONFIRM = os.getenv("WEATHER_BOOK_CONFIRM", "true").strip().lower() == "true"
+STAKE_USD = float(os.getenv("WEATHER_STAKE_USD", "5"))
 
 
 class WeatherEngine:
@@ -187,10 +194,15 @@ class WeatherEngine:
                 "min_size": b["min_size"],
             }
             buckets.append(bv)
+            # keep a REFERENCE (not a copy) so a book re-price updates the row
+            # the dashboard renders, not just the order we send
             if p is not None and (best is None or p > best["p"]):
-                best = {**bv, "p": p}
+                best = bv
 
         signal, why = self._gate(e, st, is_today, tradeable, best, ext)
+        # Gamma got it this far; only the real ladder decides money.
+        if signal == "ENTER" and best is not None and BOOK_CONFIRM:
+            signal, why = self._book_confirm(best)
         temp_now = (st or {}).get("temp_f" if unit == "F" else "temp_c") if st else None
         return {
             "city": e["city"], "kind": kind, "unit": unit,
@@ -211,10 +223,56 @@ class WeatherEngine:
                 "p": round(best["p"], 4), "edge_c": best["edge_c"],
                 "min_size": best["min_size"], "city": e["city"], "kind": kind,
                 "unit": unit,
+                # book-confirmed: the size we verified depth for, and what the
+                # ladder really costs vs what Gamma advertised
+                "shares_planned": best.get("shares_planned"),
+                "book_depth": best.get("book_depth"),
+                "gamma_ask_c": best.get("gamma_ask_c"),
+                "limit_c": best.get("limit_c"),   # FOK limit (worst level touched)
                 "date": e["date"].isoformat(), "station": icao, "slug": e["slug"],
                 "neg_risk": e["neg_risk"],
             } if signal == "ENTER" and best else None),
         }
+
+    def _book_confirm(self, best):
+        """Re-price a would-be signal on the REAL CLOB ask ladder.
+
+        Gamma's bestAsk is a screening field and can be pure fiction: one live
+        FOK died because Gamma advertised 72c while the real book started at
+        82c (nothing at all at 72c). We buy with a FOK that walks the ladder,
+        so the honest entry price is the VWAP for the size we'd actually take,
+        and the honest gate is whether that size is even there.
+
+        Mutates `best` in place with real ask/fee/edge/depth. Returns (signal, why).
+        """
+        asks = fetch_book_asks(best["token_yes"])
+        if asks is None:
+            return "NO-BOOK", "book unavailable — not pricing on Gamma"
+        if not asks:
+            return "NO-BOOK", "empty book"
+        gamma_ask = best["ask_c"]
+        shares = max(best.get("min_size") or 5, round(STAKE_USD / (asks[0][0] / 100.0)))
+        vwap, got, marginal = vwap_for_size(asks, shares)
+        if vwap is None or got + 1e-9 < shares:
+            return "NO-DEPTH", f"only {got:.0f}/{shares} shares on the book"
+        fee = taker_fee_c(vwap)
+        best["ask_c"] = round(vwap, 2)          # what we'd PAY (cost/edge basis)
+        best["limit_c"] = math.ceil(marginal)   # FOK limit must clear the WORST level
+        best["fee_c"] = round(fee, 2)
+        best["edge_c"] = round(best["p"] * 100 - vwap - fee, 1)
+        best["book_depth"] = round(got, 2)
+        best["shares_planned"] = shares
+        best["gamma_ask_c"] = gamma_ask          # keep for drift visibility
+        # re-apply the money gates at the price we'd REALLY pay
+        if best["ask_c"] < PRICE_MIN_C:
+            return "MKT-LOCKED", f"real ask {best['ask_c']:.0f}c < {PRICE_MIN_C:.0f}c"
+        if best["ask_c"] > PRICE_MAX_C:
+            return "PRICED", f"real ask {best['ask_c']:.0f}c > {PRICE_MAX_C:.0f}c (gamma said {gamma_ask:.0f}c)"
+        if best["edge_c"] < MIN_EDGE_C:
+            return "THIN-EDGE", f"real edge {best['edge_c']}c < {MIN_EDGE_C}c (gamma implied more)"
+        drift = abs(vwap - gamma_ask)
+        return "ENTER", (f"p {best['p']:.2f} @ real {best['ask_c']:.0f}c ×{shares}"
+                         + (f" (gamma {gamma_ask:.0f}c, drift {drift:.0f}c)" if drift >= 1 else ""))
 
     def _gate(self, e, st, is_today, tradeable, best, ext):
         if not tradeable:
