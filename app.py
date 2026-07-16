@@ -249,6 +249,16 @@ def api_weather():
     return jsonify(st)
 
 
+@app.route("/api/weather_config", methods=["POST"])
+def api_weather_config():
+    """Set the weather executor mode (paper|live). Live also requires
+    WEATHER_LIVE=true in the environment (double gate) — set_mode enforces it."""
+    data = request.get_json(silent=True) or {}
+    if "mode" in data:
+        _weather_exec.set_mode(data["mode"])
+    return jsonify(_weather_exec.state())
+
+
 @app.route("/api/copytrade")
 def api_copytrade():
     """Copy-trade scan results + forward-test executor state."""

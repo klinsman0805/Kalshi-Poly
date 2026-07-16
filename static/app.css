@@ -150,3 +150,7 @@ b{font-weight:600}
 .copy-tbl td .match a:hover{text-decoration:underline}
 .copy-tbl td{font-variant-numeric:tabular-nums}
 .copy-tbl .up{color:var(--ok)}.copy-tbl .dn{color:var(--down)}
+
+/* on-chain (real money) stats — distinguish from modeled */
+.exec-stat.wx-real{color:var(--accent)}
+.exec-stat.wx-real b{color:var(--text)}

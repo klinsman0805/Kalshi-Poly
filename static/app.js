@@ -122,13 +122,36 @@ function renderWeatherSummary() {
     `gates: p≥${cfg.p_min||'—'} · ask≤${cfg.price_max_c||'—'}¢ · edge≥${cfg.min_edge_c||'—'}¢ · local≥${cfg.min_local_hour||'—'}h`;
 }
 
+async function setWeatherMode(m) {
+  const e = S.weatherExec || {};
+  if (m === 'live') {
+    if (!e.env_armed) { alert('Live is locked. Set WEATHER_LIVE=true and restart to arm.'); return; }
+    if (!confirm('Switch to LIVE — the bot will place REAL orders with real USDC on the next qualifying signal. Continue?')) return;
+  }
+  try {
+    const r = await fetch('/api/weather_config', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({mode:m})}).then(r=>r.json());
+    S.weatherExec = r; renderWeatherExec();
+  } catch(err){ alert('Could not change mode: ' + err); }
+}
+
 function renderWeatherExec() {
   const e = S.weatherExec; if (!e) return;
   const s = e.session || {};
   const mode = document.getElementById('wxexec-mode');
   if (e.live)          { mode.textContent = '🔴 LIVE forward-test — REAL orders'; mode.className = 'exec-arm live'; }
-  else if (e.env_armed){ mode.textContent = '🟢 armed · paper forward-test'; mode.className = 'exec-arm ok'; }
-  else                 { mode.textContent = '📄 PAPER forward-test'; mode.className = 'exec-arm'; }
+  else if (e.env_armed){ mode.textContent = '🟢 armed · paper (flip to Live to trade)'; mode.className = 'exec-arm ok'; }
+  else                 { mode.textContent = '📄 PAPER · WEATHER_LIVE not set'; mode.className = 'exec-arm'; }
+  // toggle button state (Live disabled until WEATHER_LIVE=true arms the env gate)
+  const pb = document.getElementById('wx-paper'), lb = document.getElementById('wx-live');
+  if (pb && lb) {
+    pb.classList.toggle('active', !e.live);
+    lb.classList.toggle('active', !!e.live);
+    lb.disabled = !e.env_armed;
+    lb.title = e.env_armed ? 'Place REAL orders' : 'Locked — set WEATHER_LIVE=true and restart to arm';
+    lb.style.opacity = e.env_armed ? '' : '.5';
+    lb.style.cursor = e.env_armed ? 'pointer' : 'not-allowed';
+  }
   document.getElementById('wx-open').textContent = (e.open || []).length;
   document.getElementById('wx-settled').textContent = s.settled || 0;
   document.getElementById('wx-win').textContent = s.win_rate == null ? '—' : Math.round(s.win_rate*100) + '%';
@@ -140,6 +163,23 @@ function renderWeatherExec() {
   const feesEl = document.getElementById('wx-fees');
   if (feesEl) feesEl.textContent = '$' + (s.fees_paid || 0).toFixed(2);
   document.getElementById('wx-staked').textContent = '$' + (s.staked_usd || 0);
+
+  // REAL on-chain P&L — only shown once live trading has a baseline
+  const a = e.account;
+  const rBox = document.getElementById('wx-real-box'), uBox = document.getElementById('wx-usdc-box');
+  if (a && rBox && uBox) {
+    rBox.style.display = ''; uBox.style.display = '';
+    const rp = document.getElementById('wx-realpnl');
+    rp.textContent = (a.real_pnl >= 0 ? '+$' : '-$') + Math.abs(a.real_pnl).toFixed(2);
+    rp.style.color = a.real_pnl >= 0 ? 'var(--ok)' : 'var(--down)';
+    rp.title = `equity $${a.equity.toFixed(2)} (USDC $${a.usdc.toFixed(2)} + open cost $${a.open_cost.toFixed(2)}) − baseline $${a.baseline.toFixed(2)}`;
+    document.getElementById('wx-usdc').textContent = '$' + a.usdc.toFixed(2);
+    // flag when modeled and real disagree by more than a cent or two
+    const gap = a.real_pnl - (s.realized_pnl || 0);
+    rp.textContent += Math.abs(gap) >= 0.02 ? ` (${gap >= 0 ? '+' : ''}${gap.toFixed(2)} vs modeled)` : '';
+  } else if (rBox && uBox) {
+    rBox.style.display = 'none'; uBox.style.display = 'none';
+  }
 
   const box = document.getElementById('wxexec-pos');
   const open = e.open || [];

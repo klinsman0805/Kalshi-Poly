@@ -35,6 +35,11 @@ ENV_ARMED = os.getenv("WEATHER_LIVE", "false").strip().lower() == "true"
 STAKE_USD = float(os.getenv("WEATHER_STAKE_USD", "5"))
 MAX_OPEN = int(os.getenv("WEATHER_MAX_OPEN", "10"))
 GAMMA_MARKETS = "https://gamma-api.polymarket.com/markets"
+# USDC balance immediately BEFORE live trading began. Set this to capture P&L
+# from the very first live trade; otherwise the baseline is snapped on first read
+# (which would silently exclude any profit already banked).
+BASELINE_ENV = os.getenv("WEATHER_LIVE_BASELINE_USD", "").strip()
+ACCT_REFRESH_SEC = 60
 
 
 class WeatherExecutor:
@@ -49,6 +54,11 @@ class WeatherExecutor:
         self.session = {"opened": 0, "settled": 0, "wins": 0,
                         "staked_usd": 0.0, "realized_pnl": 0.0,
                         "realized_gross": 0.0, "fees_paid": 0.0}
+        # REAL on-chain account tracking (live only) — the ledger's P&L is
+        # modeled; USDC is truth. See _refresh_account.
+        self._live_baseline = float(BASELINE_ENV) if BASELINE_ENV else None
+        self._acct = None
+        self._acct_ts = 0.0
         self._lock = threading.Lock()
         self._rehydrate()
 
@@ -62,7 +72,11 @@ class WeatherExecutor:
                 if not line.strip():
                     continue
                 rec = json.loads(line)
-                if rec.get("type") == "open":
+                if rec.get("type") == "baseline":
+                    # env override wins; else recover the persisted baseline
+                    if not BASELINE_ENV:
+                        self._live_baseline = rec.get("live_baseline_usd")
+                elif rec.get("type") == "open":
                     by_key[rec["key"]] = rec
                 elif rec.get("type") == "settle" and rec.get("key") in by_key:
                     pos = by_key.pop(rec["key"])
@@ -189,8 +203,51 @@ class WeatherExecutor:
             self.on_log("✗", f"[weatherexec] live order failed: {e}")
             return 0.0, None
 
+    # ── real on-chain account (live truth, not modeled) ──────────────────────
+    def _refresh_account(self):
+        """Snapshot the REAL USDC balance so the dashboard shows actual P&L.
+
+        equity = USDC + cost of still-open live positions (valuing open ones at
+        cost, so tied-up capital isn't mistaken for a loss). Therefore
+        real_pnl = equity − baseline is pure REALIZED profit, inclusive of
+        everything the modeled ledger can miss: true fill prices, real fees,
+        slippage. Cached to one read a minute.
+        """
+        if not (self.is_live or self._live_baseline is not None
+                or any(p.get("mode") == "live" for p in self.open)):
+            return
+        now = time.time()
+        if now - self._acct_ts < ACCT_REFRESH_SEC:
+            return
+        try:
+            from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+            client = self._poly()
+            bal = client._clob.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+            usdc = int(bal.get("balance", 0)) / 1_000_000.0
+        except Exception as e:  # noqa: BLE001
+            self.on_log("!", f"[weatherexec] account read failed: {e}")
+            return
+        self._acct_ts = now
+        if self._live_baseline is None:
+            self._live_baseline = usdc
+            self._persist({"type": "baseline", "live_baseline_usd": usdc,
+                           "ts": datetime.now(timezone.utc).isoformat()})
+            self.on_log("◆", f"[weatherexec] live USDC baseline set = ${usdc:.2f}")
+        with self._lock:
+            open_cost = sum(p.get("cost_usd", 0.0) for p in self.open
+                            if p.get("mode") == "live")
+        self._acct = {
+            "usdc": round(usdc, 2),
+            "open_cost": round(open_cost, 2),
+            "equity": round(usdc + open_cost, 2),
+            "baseline": round(self._live_baseline, 2),
+            "real_pnl": round(usdc + open_cost - self._live_baseline, 2),
+        }
+
     # ── settlement (poll Gamma for resolutions) ──────────────────────────────
     def poll(self):
+        self._refresh_account()
         with self._lock:
             open_pos = list(self.open)
         if not open_pos:
@@ -250,7 +307,9 @@ class WeatherExecutor:
             avg_p = ([p for p in (c.get("model_p") for c in self.closed) if p is not None])
             return {
                 "mode": self.mode, "live": self.is_live, "env_armed": ENV_ARMED,
-                "stake_usd": self.stake_usd, "session": s,
+                "stake_usd": self.stake_usd, "max_open": MAX_OPEN, "session": s,
+                "account": self._acct,      # REAL on-chain USDC / equity / P&L
+
                 "avg_model_p": round(sum(avg_p) / len(avg_p), 3) if avg_p else None,
                 "open": [{k: p.get(k) for k in
                           ("mode", "city", "kind", "date", "label", "entry_c", "shares",
