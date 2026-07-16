@@ -135,15 +135,20 @@ class WeatherExecutor:
         if ask_c is None or ask_c <= 0:
             return
         shares = max(entry.get("min_size") or 5, round(self.stake_usd / (ask_c / 100.0)))
-        filled_c = ask_c
+        filled_c = ask_c          # paper fills at the ask by definition
         mode = "paper"
         if self.is_live:
-            filled = self._place_live(entry["token_yes"], ask_c, shares,
-                                      entry.get("neg_risk"))
+            filled, fill_c = self._place_live(entry["token_yes"], ask_c, shares,
+                                              entry.get("neg_risk"))
             if filled <= 0:
                 self.on_log("!", f"[weatherexec] LIVE FOK missed {entry['city']} {entry['label']}")
                 return
             shares, mode = filled, "live"
+            # record the ACTUAL average fill price the exchange gave us (a FOK
+            # often fills below the limit), not the limit ask — otherwise live
+            # cost/P&L is mis-stated. fill_c is None only if the resp lacked amounts.
+            if fill_c is not None and fill_c > 0:
+                filled_c = round(fill_c, 2)
         cost = round(shares * filled_c / 100.0, 2)
         pos = {
             "type": "open", "key": key, "mode": mode, "kind": entry.get("kind", "high"),
@@ -162,16 +167,27 @@ class WeatherExecutor:
         self.on_log("◆", f"[weatherexec] {mode.upper()} ENTER {entry['city']} {entry['label']} "
                          f"@ {filled_c:.0f}c ×{shares} (p={entry['p']}, edge +{entry['edge_c']}c)")
 
+    def _poly(self):
+        """Lazily build and REUSE one PolyClient — avoids re-authenticating (and
+        the couple-seconds latency that costs) on every live order."""
+        if getattr(self, "_client", None) is None:
+            import polymarket
+            self._client = polymarket.PolyClient()
+        return self._client
+
     def _place_live(self, token_id, ask_c, shares, neg_risk=None):
+        """Place a live FOK buy. Returns (filled_shares, avg_fill_price_cents);
+        fill price is None if the fill response lacked amounts."""
         try:
             import polymarket
-            client = polymarket.PolyClient()
+            client = self._poly()
             fee = polymarket.fetch_live_fee_bps(token_id) or 0
-            return client.place_fok(token_id, int(round(ask_c)), float(shares), fee,
-                                    neg_risk=neg_risk)
+            filled = client.place_fok(token_id, int(round(ask_c)), float(shares), fee,
+                                      neg_risk=neg_risk)
+            return filled, getattr(client, "_last_fill_price_cents", None)
         except Exception as e:  # noqa: BLE001
             self.on_log("✗", f"[weatherexec] live order failed: {e}")
-            return 0.0
+            return 0.0, None
 
     # ── settlement (poll Gamma for resolutions) ──────────────────────────────
     def poll(self):
