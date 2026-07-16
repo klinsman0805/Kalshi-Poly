@@ -21,3 +21,4 @@ data/weather_climo.json
 
 # Belt-and-suspenders: ignore any .env variant (backups etc.)
 .env*
+*.pid
