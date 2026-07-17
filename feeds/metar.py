@@ -122,12 +122,17 @@ class MetarFeed:
         local_today = now_utc.astimezone(tz).date()
         max_c = min_c = latest = latest_ts = None
         max_f = min_f = None
+        max_ts = min_ts = None
         n_today = 0
-        for o in rows:
+        # ASCENDING order matters: max_ts must be the FIRST time the current max
+        # was reached (plateau duration), not the last. That age is what tells us
+        # the peak is genuinely in rather than still climbing.
+        obs = sorted((o for o in rows
+                      if self._obs_time(o) is not None and o.get("temp") is not None),
+                     key=self._obs_time)
+        for o in obs:
             ts = self._obs_time(o)
             temp = o.get("temp")
-            if ts is None or temp is None:
-                continue
             if latest_ts is None or ts > latest_ts:
                 latest, latest_ts = float(temp), ts
             if ts.astimezone(tz).date() != local_today:
@@ -135,18 +140,24 @@ class MetarFeed:
             n_today += 1
             tc = float(temp)
             tf = self._f(tc)
-            max_c = tc if max_c is None else max(max_c, tc)
-            min_c = tc if min_c is None else min(min_c, tc)
-            max_f = tf if max_f is None else max(max_f, tf)
-            min_f = tf if min_f is None else min(min_f, tf)
+            if max_c is None or tc > max_c:
+                max_c, max_f, max_ts = tc, tf, ts     # NEW max -> restart its clock
+            if min_c is None or tc < min_c:
+                min_c, min_f, min_ts = tc, tf, ts
             # 6-hourly max/min groups (US stations): cover the preceding 6 h;
             # only trust them for today when the report is ≥6 h into the day.
+            # We cannot know WHEN within that window the extreme occurred, so we
+            # stamp it at this report — conservative (reads as a fresh, unlocked
+            # max and blocks entry) rather than falsely claiming a long plateau.
             if ts.astimezone(tz).hour >= 6:
                 mx, mn = o.get("maxT"), o.get("minT")
-                if mx is not None:
-                    max_c = max(max_c, float(mx)); max_f = max(max_f, self._f(float(mx)))
-                if mn is not None:
-                    min_c = min(min_c, float(mn)); min_f = min(min_f, self._f(float(mn)))
+                if mx is not None and float(mx) > max_c:
+                    max_c, max_f, max_ts = float(mx), self._f(float(mx)), ts
+                if mn is not None and float(mn) < min_c:
+                    min_c, min_f, min_ts = float(mn), self._f(float(mn)), ts
+
+        def _age(t):
+            return None if t is None else (now_utc - t).total_seconds() / 60.0
         return {
             "icao": icao,
             "local_date": local_today.isoformat(),
@@ -156,6 +167,11 @@ class MetarFeed:
             "temp_f": self._f(latest),
             "max_c": max_c, "min_c": min_c,
             "max_f": max_f, "min_f": min_f,
+            # minutes since the current max/min was FIRST reached = how long the
+            # extreme has held. A fresh extreme means the temperature is still
+            # moving and the day is NOT locked.
+            "max_age_min": _age(max_ts),
+            "min_age_min": _age(min_ts),
             "obs_today": n_today,
             "latest_obs_utc": latest_ts.isoformat() if latest_ts else None,
         }

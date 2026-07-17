@@ -68,6 +68,24 @@ MAX_EDGE_C = float(os.getenv("WEATHER_MAX_EDGE_C", "35"))
 MIN_LOCAL_HOUR = float(os.getenv("WEATHER_MIN_LOCAL_HOUR", "13"))
 # daily min usually prints around sunrise, so lows unlock earlier than highs
 MIN_LOCAL_HOUR_LOW = float(os.getenv("WEATHER_MIN_LOCAL_HOUR_LOW", "10"))
+# THE core NEAR-LOCK precondition — the one the strategy is named for and which
+# the first implementation never actually checked. "Observed max is in our bucket"
+# is NOT the same as "the day's max is locked": a max that was set minutes ago
+# means the temperature is at its peak and STILL CLIMBING — the worst moment to
+# bet it stops. We require the max to have HELD for a while (plateau).
+#
+# Evidence (n=3 live, real money) — ages are LOWER BOUNDS (a 6-hourly maxT group
+# proves the max existed by its report time but not when within that window):
+#   Manila  first hit its max >=165min before entry -> plateau  -> WON
+#   Miami   first hit its max >= 75min before entry -> climbing -> LOST -$4.09
+#   BA      first hit its max >= 30min before entry -> climbing -> LOST -$4.04
+# Model claimed ~94.8% on all three; 1/3 is a 0.78% outcome if honest. The market
+# priced both climbers at 41-54% and was right.
+#
+# Threshold: any value in (75, 165] separates our three. 120 is the midpoint —
+# max margin on both sides. Fitted to n=3, so treat as provisional; losses cost
+# ~4x a win here, so err high. Raising it trades frequency for safety.
+MIN_MAX_AGE_MIN = float(os.getenv("WEATHER_MIN_MAX_AGE_MIN", "120"))
 MIN_OBS_TODAY = int(os.getenv("WEATHER_MIN_OBS_TODAY", "3"))
 MAX_SPREAD_C = float(os.getenv("WEATHER_MAX_SPREAD_C", "10"))
 # Gamma's bestAsk only SCREENS. Before a candidate becomes a signal, re-price it
@@ -228,6 +246,11 @@ class WeatherEngine:
             "local_hour": round(st["local_hour"], 2) if st else None,
             "temp_c": temp_now,          # value shown "now" in the market's unit
             "ext_c": ext,                # observed extreme in the market's unit
+            # how long the extreme has held — the NEAR-LOCK precondition
+            "ext_age_min": (round(st.get("max_age_min") if kind == "high"
+                                  else st.get("min_age_min"), 1)
+                            if st and (st.get("max_age_min") if kind == "high"
+                                       else st.get("min_age_min")) is not None else None),
             "obs_today": st["obs_today"] if st else 0,
             "buckets": buckets,
             "best_p": round(best["p"], 4) if best else None,
@@ -313,6 +336,15 @@ class WeatherEngine:
         min_hour = MIN_LOCAL_HOUR if e["kind"] == "high" else MIN_LOCAL_HOUR_LOW
         if st["local_hour"] < min_hour:
             return "EARLY", f"local {st['local_hour']:.1f}h < {min_hour}h"
+        # the actual NEAR-LOCK test: has the extreme HELD, or is it still moving?
+        if MIN_MAX_AGE_MIN > 0:
+            age = st.get("max_age_min") if e["kind"] == "high" else st.get("min_age_min")
+            if age is None:
+                return "NO-DATA", "extreme age unknown"
+            if age < MIN_MAX_AGE_MIN:
+                return "NOT-LOCKED", (f"{'max' if e['kind']=='high' else 'min'} set "
+                                      f"{age:.0f}min ago < {MIN_MAX_AGE_MIN:.0f}min — "
+                                      f"still moving, not locked")
         if best is None:
             return "NO-DATA", "no model probability"
         if best["p"] < P_MIN:
