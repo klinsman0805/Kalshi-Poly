@@ -185,14 +185,30 @@ function renderWeatherExec() {
   const box = document.getElementById('wxexec-pos');
   const open = e.open || [];
   if (!open.length) { box.innerHTML = ''; return; }
-  box.innerHTML = '<div class="pos-hd">Open paper positions</div>' + open.map(p =>
-    `<div class="pos-row ${p.mode}">
+  box.innerHTML = '<div class="pos-hd">Open positions</div>' + open.map(p => {
+    const h = p.health || {};
+    const broke = (h.breaks || []).length > 0;
+    // live health: is the thesis we bought on still true?
+    let hs = '';
+    if (h.p_now != null) {
+      const dcls = (h.p_delta ?? 0) < -0.02 ? 'dn' : '';
+      hs = `<span class="pos-chip ${broke ? 'dn' : ''}" title="${esc((h.breaks||[]).join('; ') || 'thesis intact')}">`
+         + `${broke ? '⚠ ' : ''}p ${p.model_p}→<span class="${dcls}">${h.p_now}</span>`
+         + (h.headroom != null ? ` · room ${h.headroom > 0 ? '+' : ''}${h.headroom}°` : '')
+         + ` · ${h.locked ? 'locked' : 'UNLOCKED'}</span>`;
+    } else {
+      hs = `<span class="pos-chip">p ${p.model_p} · +${p.edge_c}¢</span>`;
+    }
+    const mk = p.mark_c != null
+      ? `<span class="pos-chip ${p.mark_c < p.entry_c ? 'dn' : 'up'}">bid ${p.mark_c}¢</span>` : '';
+    return `<div class="pos-row ${p.mode}">
        <span class="pos-mode">${p.mode === 'live' ? 'LIVE' : 'PAPER'}</span>
        <span class="pos-match">${esc(p.city)} ${p.kind === 'low' ? '▼' : '▲'} ${esc(p.date)}</span>
        <span class="pos-buy">${esc(p.label)} @ ${p.entry_c}¢ ×${p.shares}</span>
        <span class="pos-cost">$${p.cost_usd}</span>
-       <span class="pos-chip">p ${p.model_p} · +${p.edge_c}¢</span>
-     </div>`).join('');
+       ${mk}${hs}
+     </div>`;
+  }).join('');
 }
 
 // ── Copy-trade render ───────────────────────────────────────────────────────────

@@ -40,6 +40,12 @@ GAMMA_MARKETS = "https://gamma-api.polymarket.com/markets"
 # (which would silently exclude any profit already banked).
 BASELINE_ENV = os.getenv("WEATHER_LIVE_BASELINE_USD", "").strip()
 ACCT_REFRESH_SEC = 60
+# Re-run the entry reasoning against open positions on this cadence. Entry is a
+# snapshot; the world moves. Warnings fire IMMEDIATELY regardless of cadence.
+RECHECK_SEC = float(os.getenv("WEATHER_RECHECK_SEC", "1200"))     # 20 min
+# mirrored from the engine's gates (read from env, not imported, to stay decoupled)
+P_MIN = float(os.getenv("WEATHER_P_MIN", "0.92"))
+MIN_MAX_AGE_MIN = float(os.getenv("WEATHER_MIN_MAX_AGE_MIN", "120"))
 
 
 class WeatherExecutor:
@@ -131,6 +137,7 @@ class WeatherExecutor:
     # ── entries (called by WeatherEngine.refresh) ────────────────────────────
     def on_refresh(self, rows):
         self._mark_open(rows)           # mark positions to market before anything else
+        self._recheck_open(rows)        # is the thesis we bought on still true?
         self._close_dead(rows)          # bail out of provably-lost buckets first
         for row in rows:
             entry = row.get("entry")
@@ -157,6 +164,82 @@ class WeatherExecutor:
                           if x.get("label") == pos.get("label")), None)
                 if b is not None and b.get("bid_c") is not None:
                     pos["mark_c"] = b["bid_c"]
+
+    # ── position health re-check ─────────────────────────────────────────────
+    def _recheck_open(self, rows):
+        """Re-run the ENTRY reasoning (thermometer -> lock -> probability) against
+        every open position.
+
+        Entry is a snapshot and the world moves. BA and Miami both went from a
+        confident buy to worthless inside an hour as the temperature resumed
+        climbing — and by the time they were arithmetically dead, every bid had
+        already gone. Waiting for the dead-exit is waiting too long: it fires
+        when the position is provably lost, which is exactly when nobody will
+        buy it. This re-reads the thermometer each refresh so a broken thesis is
+        visible while there is still a bid to sell into.
+
+        Health is logged on RECHECK_SEC cadence, but a BREAK warns immediately.
+        """
+        by_key = {f"{r['city']}|{r['date']}|{r['kind']}": r for r in rows}
+        now = time.time()
+        with self._lock:
+            open_pos = list(self.open)
+        for pos in open_pos:
+            row = by_key.get(pos["key"])
+            if not row:
+                continue
+            kind = pos.get("kind", "high")
+            ext, age = row.get("ext_c"), row.get("ext_age_min")
+            bucket = next((b for b in row.get("buckets", [])
+                           if b.get("label") == pos.get("label")), None)
+            p_now = (bucket or {}).get("p")
+            lo, hi = pos.get("lo"), pos.get("hi")
+            # how many degrees of room before the bucket dies
+            headroom = None
+            if ext is not None:
+                if kind == "high" and hi is not None:
+                    headroom = hi - ext
+                elif kind == "low" and lo is not None:
+                    headroom = ext - lo
+            p_entry = pos.get("model_p")
+            locked = (age is not None and age >= MIN_MAX_AGE_MIN)
+            reasons = []
+            if p_now is not None and p_now < P_MIN:
+                reasons.append(f"confidence {p_now:.2f} < entry bar {P_MIN}")
+            if not locked and age is not None:
+                reasons.append(f"lock BROKEN — new extreme {age:.0f}min ago, moving again")
+            if headroom is not None and headroom <= 0:
+                reasons.append(f"no headroom ({headroom:+.0f}°)")
+            health = {
+                "p_now": round(p_now, 4) if p_now is not None else None,
+                "p_entry": p_entry,
+                "p_delta": (round(p_now - p_entry, 4)
+                            if (p_now is not None and p_entry is not None) else None),
+                "ext_now": ext, "headroom": headroom,
+                "age_min": round(age, 1) if age is not None else None,
+                "locked": locked, "mark_c": pos.get("mark_c"),
+                "breaks": reasons, "checked": now,
+            }
+            pos["health"] = health
+            broke = bool(reasons)
+            was_broken = pos.get("_broken", False)
+            due = (now - pos.get("_recheck_ts", 0)) >= RECHECK_SEC
+            if broke and not was_broken:
+                # fire the moment it breaks — a bid may still exist right now
+                mk = pos.get("mark_c")
+                self.on_log("!", f"[weatherexec] ⚠ THESIS BREAK {pos['city']} {pos['label']}: "
+                                 f"{'; '.join(reasons)} | bid {mk if mk is not None else '?'}c "
+                                 f"vs entry {pos['entry_c']:.0f}c — exit window is NOW, "
+                                 f"dead-exit will be too late")
+                pos["_recheck_ts"] = now
+            elif due:
+                self.on_log("→", f"[weatherexec] recheck {pos['city']} {pos['label']}: "
+                                 f"max {ext}° headroom {headroom if headroom is not None else '?'}° "
+                                 f"| p {p_entry}→{health['p_now']} | "
+                                 f"{'locked' if locked else 'UNLOCKED'} {health['age_min']}min "
+                                 f"| bid {pos.get('mark_c')}c vs entry {pos['entry_c']:.0f}c")
+                pos["_recheck_ts"] = now
+            pos["_broken"] = broke
 
     # ── dead-position exit ───────────────────────────────────────────────────
     def _close_dead(self, rows):
@@ -420,7 +503,7 @@ class WeatherExecutor:
                 "avg_model_p": round(sum(avg_p) / len(avg_p), 3) if avg_p else None,
                 "open": [{k: p.get(k) for k in
                           ("mode", "city", "kind", "date", "label", "entry_c", "shares",
-                           "cost_usd", "model_p", "edge_c", "opened")}
+                           "cost_usd", "model_p", "edge_c", "opened", "mark_c", "health")}
                          for p in self.open],
                 "recent": [{k: c.get(k) for k in
                             ("city", "kind", "date", "label", "entry_c", "model_p",
