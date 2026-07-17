@@ -274,7 +274,7 @@ class WeatherExecutor:
         bucket = next((b for b in row.get("buckets", [])
                        if b.get("label") == pos.get("label")), {})
         bid_c = bucket.get("bid_c") or 0.0
-        sold, proceeds = 0.0, 0.0
+        sold, proceeds, fill_c = 0.0, 0.0, None
         if pos.get("mode") == "live" and self.is_live:
             try:
                 import polymarket
@@ -282,7 +282,13 @@ class WeatherExecutor:
                 fee = polymarket.fetch_live_fee_bps(pos["token_yes"]) or 0
                 sold = client.place_sell_fok(pos["token_yes"], float(pos["shares"]),
                                              fee, neg_risk=pos.get("neg_risk"))
-                proceeds = round(sold * bid_c / 100.0, 2)
+                # Use the REAL USDC received, not shares x a cached book quote.
+                # The quote can be badly stale in our favour: a dead Shenzhen
+                # bucket swept stale 90c bids for $6.30 while the cached bid
+                # implied $5.54 (booked +$1.13 against a real +$1.89).
+                real = getattr(client, "_last_sell_proceeds_usd", None)
+                fill_c = getattr(client, "_last_fill_price_cents", None)
+                proceeds = round(real if real is not None else sold * bid_c / 100.0, 2)
             except Exception as e:  # noqa: BLE001
                 self.on_log("✗", f"[weatherexec] dead-exit sell failed {pos['city']}: {e}")
         else:
@@ -292,6 +298,7 @@ class WeatherExecutor:
         rec = {"type": "settle", "key": pos["key"], "won": False,
                "closed_early": True, "reason": reason,
                "salvage_usd": proceeds, "sold_shares": round(sold, 6),
+               "sold_at_c": round(fill_c, 2) if fill_c is not None else None,
                "gross_pnl": pnl, "fee_usd": 0.0, "pnl_usd": pnl,
                "settled": datetime.now(timezone.utc).isoformat()}
         with self._lock:

@@ -365,6 +365,7 @@ class PolyClient:
         # None if it didn't fill / Poly returned no amounts. Read by the arb trader
         # right after the call to record the real fill vs the limit price we sent.
         self._last_fill_price_cents: Optional[float] = None
+        self._last_sell_proceeds_usd: Optional[float] = None
 
         # Start WS loop
         self._ws_thread = threading.Thread(
@@ -617,6 +618,7 @@ class PolyClient:
 
         Returns sold share count (may be partial). Caller must check < size.
         """
+        self._last_sell_proceeds_usd = None      # accumulated across attempts
         if DRY_RUN:
             log.info("[DRY RUN] Poly FAK sell token=...%s x%s", token_id[-6:], size)
             return float(size)
@@ -646,7 +648,23 @@ class PolyClient:
                       if neg_risk is not None else None)
             signed = self._clob.create_order(args, opts)
             resp   = self._clob.post_order(signed, OrderType.FAK)
-            return self._filled_shares(resp, sz)
+            filled = self._filled_shares(resp, sz)
+            # Capture what we ACTUALLY got. A 1c-limit FAK sweeps whatever bids
+            # exist, so the realised price is nothing like the limit — a dead
+            # Shenzhen bucket sold into stale 90c bids. Callers that price the
+            # exit off a cached book quote mis-state P&L (that trade booked
+            # +$1.13 against a real +$1.89). On a SELL, makingAmount = shares
+            # given, takingAmount = USDC received -> price = taking/making.
+            try:
+                making = float(resp.get("makingAmount", "") or "")   # shares out
+                taking = float(resp.get("takingAmount", "") or "")   # USDC in
+                if making > 0:
+                    self._last_fill_price_cents = (taking / making) * 100.0
+                    self._last_sell_proceeds_usd = (
+                        (self._last_sell_proceeds_usd or 0.0) + taking)
+            except (TypeError, ValueError):
+                pass
+            return filled
 
         # Balance-aware unwind loop. Each attempt asks Poly how many shares we
         # ACTUALLY hold right now, then sells exactly that (capped at `want`).
