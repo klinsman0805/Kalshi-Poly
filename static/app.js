@@ -152,9 +152,14 @@ function renderWeatherExec() {
     lb.style.opacity = e.env_armed ? '' : '.5';
     lb.style.cursor = e.env_armed ? 'pointer' : 'not-allowed';
   }
-  document.getElementById('wx-open').textContent = (e.open || []).length;
-  document.getElementById('wx-settled').textContent = s.settled || 0;
-  document.getElementById('wx-win').textContent = s.win_rate == null ? '—' : Math.round(s.win_rate*100) + '%';
+  // per-mode counts (paper and live are separate books)
+  const bm = e.by_mode || {live:{}, paper:{}};
+  const wr = d => (d.settled_held ? Math.round(100*d.wins_held/d.settled_held)+'% ('+d.settled_held+')' : '—');
+  const set = (id,v) => { const el=document.getElementById(id); if(el) el.textContent=v; };
+  set('wx-live-open',    bm.live.open||0);   set('wx-live-settled',  bm.live.settled||0);
+  set('wx-live-wr',      wr(bm.live||{}));
+  set('wx-paper-open',   bm.paper.open||0);  set('wx-paper-settled', bm.paper.settled||0);
+  set('wx-paper-wr',     wr(bm.paper||{}));
   document.getElementById('wx-avgp').textContent = e.avg_model_p == null ? '—' : Math.round(e.avg_model_p*100) + '%';
   const pnl = document.getElementById('wx-pnl');
   pnl.textContent = (s.realized_pnl >= 0 ? '+$' : '-$') + Math.abs(s.realized_pnl||0).toFixed(2);

@@ -43,10 +43,13 @@
           <button class="exec-btn" id="wx-live" onclick="setWeatherMode('live')">Live</button>
         </div>
         <span class="exec-arm" id="wxexec-mode">📄 PAPER forward-test</span>
-        <span class="exec-stat">Open <b id="wx-open">0</b></span>
-        <span class="exec-stat">Settled <b id="wx-settled">0</b></span>
-        <span class="exec-stat">Win <b id="wx-win">—</b></span>
-        <span class="exec-stat" title="Average model probability at entry — win rate should converge to this">Avg model p <b id="wx-avgp">—</b></span>
+        <span class="exec-stat" title="Real-money positions"><b class="live-tag">LIVE</b>
+          open <b id="wx-live-open">0</b> · settled <b id="wx-live-settled">0</b>
+          · held-win <b id="wx-live-wr">—</b></span>
+        <span class="exec-stat" title="Simulated positions"><b class="paper-tag">PAPER</b>
+          open <b id="wx-paper-open">0</b> · settled <b id="wx-paper-settled">0</b>
+          · held-win <b id="wx-paper-wr">—</b></span>
+        <span class="exec-stat" title="Average model probability at entry — held win-rate should converge to this">Avg model p <b id="wx-avgp">—</b></span>
         <span class="exec-stat" title="Modeled: from the ledger's recorded entry prices and fee model">Modeled P&L <b id="wx-pnl">$0</b></span>
         <span class="exec-stat" title="Taker fees the model deducted on settled trades">Fees <b id="wx-fees">$0</b></span>
         <span class="exec-stat">Staked <b id="wx-staked">$0</b></span>

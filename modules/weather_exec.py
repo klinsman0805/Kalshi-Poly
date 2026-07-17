@@ -365,6 +365,7 @@ class WeatherExecutor:
             proceeds = round(sold * bid_c / 100.0, 2)
         pnl = round(proceeds - pos.get("cost_usd", 0.0), 2)
         rec = {"type": "settle", "key": pos["key"], "won": won,
+               "mode": pos.get("mode"),
                "closed_early": True, "exit": tag, "reason": reason,
                "salvage_usd": proceeds, "sold_shares": round(sold, 6),
                "sold_at_c": round(fill_c, 2) if fill_c is not None else None,
@@ -553,6 +554,7 @@ class WeatherExecutor:
             fee = round(pos["shares"] * taker_fee_c(pos["entry_c"]) / 100.0, 2)
             net = round(gross - fee, 2)
             rec = {"type": "settle", "key": pos["key"], "won": won,
+                   "mode": pos.get("mode"),
                    "gross_pnl": gross, "fee_usd": fee, "pnl_usd": net,
                    "settled": datetime.now(timezone.utc).isoformat()}
             with self._lock:
@@ -584,9 +586,28 @@ class WeatherExecutor:
             s["settled_held"] = held
             s["win_rate_held"] = (s.get("wins_held", 0) / held) if held else None
             avg_p = ([p for p in (c.get("model_p") for c in self.closed) if p is not None])
+            # PER-MODE breakdown — paper and live are different books and must be
+            # counted separately, even though they share this ledger. Derived
+            # from the position lists (each carries its own mode), so it is always
+            # consistent with what's actually open/closed.
+            by_mode = {}
+            for m in ("live", "paper"):
+                op = [p for p in self.open if p.get("mode") == m]
+                cl = [c for c in self.closed if c.get("mode") == m]
+                held_c = [c for c in cl if not c.get("closed_early")]
+                by_mode[m] = {
+                    "open": len(op),
+                    "settled": len(cl),
+                    "wins": sum(1 for c in cl if c.get("won")),
+                    "settled_held": len(held_c),
+                    "wins_held": sum(1 for c in held_c if c.get("won")),
+                    "realized_pnl": round(sum(c.get("pnl_usd", 0.0) for c in cl), 2),
+                    "staked_usd": round(sum(p.get("cost_usd", 0.0) for p in op), 2),
+                }
             return {
                 "mode": self.mode, "live": self.is_live, "env_armed": ENV_ARMED,
                 "stake_usd": self.stake_usd, "max_open": MAX_OPEN, "session": s,
+                "by_mode": by_mode,         # {live:{...}, paper:{...}}
                 "account": self._acct,      # REAL on-chain USDC / equity / P&L
 
                 "avg_model_p": round(sum(avg_p) / len(avg_p), 3) if avg_p else None,
