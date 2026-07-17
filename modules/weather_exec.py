@@ -43,6 +43,9 @@ ACCT_REFRESH_SEC = 60
 # Re-run the entry reasoning against open positions on this cadence. Entry is a
 # snapshot; the world moves. Warnings fire IMMEDIATELY regardless of cadence.
 RECHECK_SEC = float(os.getenv("WEATHER_RECHECK_SEC", "1200"))     # 20 min
+# Close once the market has converged this far. The edge is the convergence; the
+# last few cents carry the entire downside. 0 disables.
+TAKE_PROFIT_BID_C = float(os.getenv("WEATHER_TAKE_PROFIT_BID_C", "90"))
 # mirrored from the engine's gates (read from env, not imported, to stay decoupled)
 P_MIN = float(os.getenv("WEATHER_P_MIN", "0.92"))
 MIN_MAX_AGE_MIN = float(os.getenv("WEATHER_MIN_MAX_AGE_MIN", "120"))
@@ -138,7 +141,8 @@ class WeatherExecutor:
     def on_refresh(self, rows):
         self._mark_open(rows)           # mark positions to market before anything else
         self._recheck_open(rows)        # is the thesis we bought on still true?
-        self._close_dead(rows)          # bail out of provably-lost buckets first
+        self._close_dead(rows)          # bail out of provably-lost buckets
+        self._take_profit(rows)         # and out of ones the market already agrees with
         for row in rows:
             entry = row.get("entry")
             if not entry:
@@ -269,8 +273,51 @@ class WeatherExecutor:
             elif kind == "low" and lo is not None and ext < lo:
                 self._exit_dead(pos, row, f"min {ext:.0f}° < bucket floor {lo}°")
 
+    # ── take profit once the market has converged ────────────────────────────
+    def _take_profit(self, rows):
+        """Close positions the market has already repriced to (near) certainty.
+
+        The edge is in the CONVERGENCE, not the settlement. We buy a lagging
+        bucket and get paid when the market catches up — after that the trade is
+        over, but holding to settlement silently swaps a good asymmetry for a
+        terrible one. Istanbul: bought 82c, market moved to 91c (9 of the 18c
+        captured); holding the last 9c risks the whole 91c — a 10:1 bet to earn
+        pennies. Chengdu at 99c bid has literally ~1c left to win and $3.80 to lose.
+
+        This is a VARIANCE trade, not free money: if the book is fair, selling at
+        the bid gives up ~half the spread versus holding. With a small bankroll,
+        a demonstrably overconfident model, and ~2.7 wins needed per loss, that
+        is a price worth paying.
+        """
+        if TAKE_PROFIT_BID_C <= 0:
+            return
+        by_key = {f"{r['city']}|{r['date']}|{r['kind']}": r for r in rows}
+        with self._lock:
+            open_pos = list(self.open)
+        for pos in open_pos:
+            row = by_key.get(pos["key"])
+            if not row:
+                continue
+            bid = pos.get("mark_c")
+            if bid is None or bid < TAKE_PROFIT_BID_C:
+                continue
+            entry = pos.get("entry_c") or 0
+            captured = bid - entry
+            if captured <= 0:                     # never "take profit" at a loss
+                continue
+            upside, risk = 100 - bid, bid
+            self._exit_position(
+                pos, row, won=True, tag="TAKE-PROFIT",
+                reason=(f"bid {bid:.0f}c >= {TAKE_PROFIT_BID_C:.0f}c — converged "
+                        f"({captured:+.0f}c of {100-entry:.0f}c captured); holding "
+                        f"risks {risk:.0f}c to win {upside:.0f}c"))
+
     def _exit_dead(self, pos, row, reason):
         """Sell out of a dead bucket (or write it off when nothing bids)."""
+        self._exit_position(pos, row, won=False, tag="DEAD-EXIT", reason=reason)
+
+    def _exit_position(self, pos, row, won, tag, reason):
+        """Shared exit: sell into whatever bids exist and book the REAL proceeds."""
         bucket = next((b for b in row.get("buckets", [])
                        if b.get("label") == pos.get("label")), {})
         bid_c = bucket.get("bid_c") or 0.0
@@ -290,13 +337,14 @@ class WeatherExecutor:
                 fill_c = getattr(client, "_last_fill_price_cents", None)
                 proceeds = round(real if real is not None else sold * bid_c / 100.0, 2)
             except Exception as e:  # noqa: BLE001
-                self.on_log("✗", f"[weatherexec] dead-exit sell failed {pos['city']}: {e}")
+                self.on_log("✗", f"[weatherexec] {tag} sell failed {pos['city']}: {e}")
+                return                       # keep the position; retry next refresh
         else:
             sold = float(pos["shares"])          # paper: mark out at the bid
             proceeds = round(sold * bid_c / 100.0, 2)
         pnl = round(proceeds - pos.get("cost_usd", 0.0), 2)
-        rec = {"type": "settle", "key": pos["key"], "won": False,
-               "closed_early": True, "reason": reason,
+        rec = {"type": "settle", "key": pos["key"], "won": won,
+               "closed_early": True, "exit": tag, "reason": reason,
                "salvage_usd": proceeds, "sold_shares": round(sold, 6),
                "sold_at_c": round(fill_c, 2) if fill_c is not None else None,
                "gross_pnl": pnl, "fee_usd": 0.0, "pnl_usd": pnl,
@@ -306,14 +354,18 @@ class WeatherExecutor:
             self.closed.append({**pos, **rec})
             self.closed = self.closed[-200:]
             self.session["settled"] += 1
+            self.session["wins"] += 1 if won else 0
+            # early exits never reveal whether the BUCKET was right, so they must
+            # not be counted as evidence for/against the model's calibration
+            self.session["early_exits"] = self.session.get("early_exits", 0) + 1
             self.session["realized_pnl"] = round(self.session["realized_pnl"] + pnl, 2)
             self.session["realized_gross"] = round(self.session["realized_gross"] + pnl, 2)
             self.session["staked_usd"] = round(
                 max(0.0, self.session["staked_usd"] - pos.get("cost_usd", 0.0)), 2)
         self._persist(rec)
-        self.on_log("✗", f"[weatherexec] DEAD-EXIT {pos['city']} {pos['label']} — {reason}; "
-                         f"salvaged ${proceeds:.2f} of ${pos.get('cost_usd',0):.2f} "
-                         f"({pnl:+.2f})")
+        self.on_log("✅" if pnl >= 0 else "✗",
+                    f"[weatherexec] {tag} {pos['city']} {pos['label']} — {reason}; "
+                    f"got ${proceeds:.2f} of ${pos.get('cost_usd',0):.2f} ({pnl:+.2f})")
 
     def _consider(self, entry):
         key = f"{entry['city']}|{entry['date']}|{entry.get('kind', 'high')}"
@@ -488,6 +540,7 @@ class WeatherExecutor:
                 self.closed = self.closed[-200:]
                 self.session["settled"] += 1
                 self.session["wins"] += 1 if won else 0
+                self.session["wins_held"] = self.session.get("wins_held", 0) + (1 if won else 0)
                 self.session["realized_pnl"] = round(self.session["realized_pnl"] + net, 2)
                 self.session["realized_gross"] = round(self.session["realized_gross"] + gross, 2)
                 self.session["fees_paid"] = round(self.session["fees_paid"] + fee, 2)
@@ -504,6 +557,11 @@ class WeatherExecutor:
         with self._lock:
             s = dict(self.session)
             s["win_rate"] = (s["wins"] / s["settled"]) if s["settled"] else None
+            # calibration must be judged ONLY on positions held to resolution —
+            # an early exit never reveals whether the bucket was actually right
+            held = s["settled"] - s.get("early_exits", 0)
+            s["settled_held"] = held
+            s["win_rate_held"] = (s.get("wins_held", 0) / held) if held else None
             avg_p = ([p for p in (c.get("model_p") for c in self.closed) if p is not None])
             return {
                 "mode": self.mode, "live": self.is_live, "env_armed": ENV_ARMED,
