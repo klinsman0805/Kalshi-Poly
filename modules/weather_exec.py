@@ -208,8 +208,11 @@ class WeatherExecutor:
                 reasons.append(f"confidence {p_now:.2f} < entry bar {P_MIN}")
             if not locked and age is not None:
                 reasons.append(f"lock BROKEN — new extreme {age:.0f}min ago, moving again")
-            if headroom is not None and headroom <= 0:
-                reasons.append(f"no headroom ({headroom:+.0f}°)")
+            # headroom == 0 is NORMAL for an exact-value bucket (lo==hi): sitting
+            # on your number is how you win it (Manila did exactly that). Only a
+            # NEGATIVE headroom means the extreme has passed us and it's dead.
+            if headroom is not None and headroom < 0:
+                reasons.append(f"extreme passed the bucket ({headroom:+.0f}°) — dead")
             health = {
                 "p_now": round(p_now, 4) if p_now is not None else None,
                 "p_entry": p_entry,
