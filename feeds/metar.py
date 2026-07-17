@@ -120,41 +120,68 @@ class MetarFeed:
         whole °F derived from that same tenths data.
         """
         local_today = now_utc.astimezone(tz).date()
-        max_c = min_c = latest = latest_ts = None
-        max_f = min_f = None
-        max_ts = min_ts = None
-        n_today = 0
-        # ASCENDING order matters: max_ts must be the FIRST time the current max
-        # was reached (plateau duration), not the last. That age is what tells us
-        # the peak is genuinely in rather than still climbing.
+        latest = latest_ts = None
         obs = sorted((o for o in rows
                       if self._obs_time(o) is not None and o.get("temp") is not None),
                      key=self._obs_time)
+        today = []          # [(ts, temp_c, maxT, minT)] for the local day, ascending
         for o in obs:
             ts = self._obs_time(o)
-            temp = o.get("temp")
             if latest_ts is None or ts > latest_ts:
-                latest, latest_ts = float(temp), ts
-            if ts.astimezone(tz).date() != local_today:
-                continue
-            n_today += 1
-            tc = float(temp)
-            tf = self._f(tc)
-            if max_c is None or tc > max_c:
-                max_c, max_f, max_ts = tc, tf, ts     # NEW max -> restart its clock
-            if min_c is None or tc < min_c:
-                min_c, min_f, min_ts = tc, tf, ts
-            # 6-hourly max/min groups (US stations): cover the preceding 6 h;
-            # only trust them for today when the report is ≥6 h into the day.
-            # We cannot know WHEN within that window the extreme occurred, so we
-            # stamp it at this report — conservative (reads as a fresh, unlocked
-            # max and blocks entry) rather than falsely claiming a long plateau.
+                latest, latest_ts = float(o["temp"]), ts
+            if ts.astimezone(tz).date() == local_today:
+                today.append((ts, float(o["temp"]), o.get("maxT"), o.get("minT")))
+        n_today = len(today)
+        if not today:
+            return {"icao": icao, "local_date": local_today.isoformat(),
+                    "local_hour": now_utc.astimezone(tz).hour + now_utc.astimezone(tz).minute / 60.0,
+                    "tz": str(tz), "temp_c": latest, "temp_f": self._f(latest),
+                    "max_c": None, "min_c": None, "max_f": None, "min_f": None,
+                    "max_age_min": None, "min_age_min": None, "obs_today": 0,
+                    "latest_obs_utc": latest_ts.isoformat() if latest_ts else None}
+
+        max_c = max(t for _, t, _, _ in today)
+        min_c = min(t for _, t, _, _ in today)
+        # 6-hourly groups (US stations) can prove an extreme the hourly obs missed.
+        # We cannot know WHEN inside that 6h window it occurred, so stamp it at the
+        # report: a correct LOWER bound on the age (conservative — never overstates
+        # how long the extreme has held).
+        six_max_ts = six_min_ts = None
+        for ts, _t, mx, mn in today:
             if ts.astimezone(tz).hour >= 6:
-                mx, mn = o.get("maxT"), o.get("minT")
                 if mx is not None and float(mx) > max_c:
-                    max_c, max_f, max_ts = float(mx), self._f(float(mx)), ts
+                    max_c, six_max_ts = float(mx), ts
                 if mn is not None and float(mn) < min_c:
-                    min_c, min_f, min_ts = float(mn), self._f(float(mn)), ts
+                    min_c, six_min_ts = float(mn), ts
+
+        # ── age of each extreme, measured over the CURRENT diurnal swing ──────
+        # Naively "first touch today" breaks when the day STARTS near its extreme:
+        # Chengdu opened at 27C (yesterday's leftover heat), cooled to 23, then
+        # climbed back to 27 by midday. First-touch said the max was 867min old and
+        # waved the trade through — while the temperature was at its peak and still
+        # rising. The honest clock starts at the overnight TROUGH: only the ascent
+        # since the daily min tells us whether today's peak is in.
+        def _first_touch(value, after_ts, want_max):
+            for ts, t, _mx, _mn in today:
+                if after_ts is not None and ts < after_ts:
+                    continue
+                if (t >= value - 1e-9) if want_max else (t <= value + 1e-9):
+                    return ts
+            return None
+
+        min_ts_raw = _first_touch(min_c, None, want_max=False) or today[0][0]
+        max_ts_raw = _first_touch(max_c, None, want_max=True) or today[0][0]
+        # max: clock runs from the first touch AT/AFTER the day's trough. If the max
+        # was only ever hit before the trough, the day has since cooled — genuinely
+        # locked — so keep the original (old) stamp.
+        max_ts = _first_touch(max_c, min_ts_raw, want_max=True) or max_ts_raw
+        # min: mirror image — measure the descent since the day's peak.
+        min_ts = _first_touch(min_c, max_ts_raw, want_max=False) or min_ts_raw
+        if six_max_ts is not None:
+            max_ts = six_max_ts
+        if six_min_ts is not None:
+            min_ts = six_min_ts
+        max_f, min_f = self._f(max_c), self._f(min_c)
 
         def _age(t):
             return None if t is None else (now_utc - t).total_seconds() / 60.0
