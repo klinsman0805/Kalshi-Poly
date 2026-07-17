@@ -101,6 +101,13 @@ class WeatherExecutor:
                                         "fee_usd": fee, "pnl_usd": net})
                     self.session["settled"] += 1
                     self.session["wins"] += 1 if rec.get("won") else 0
+                    # keep the calibration counters correct across restarts:
+                    # early exits don't reveal if the bucket was right; only
+                    # positions HELD to resolution count toward win_rate_held.
+                    if rec.get("closed_early"):
+                        self.session["early_exits"] = self.session.get("early_exits", 0) + 1
+                    elif rec.get("won"):
+                        self.session["wins_held"] = self.session.get("wins_held", 0) + 1
                     self.session["realized_pnl"] += net
                     self.session["realized_gross"] += gross
                     self.session["fees_paid"] += fee
