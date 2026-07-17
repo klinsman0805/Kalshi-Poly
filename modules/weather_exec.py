@@ -322,6 +322,20 @@ class WeatherExecutor:
                        if b.get("label") == pos.get("label")), {})
         bid_c = bucket.get("bid_c") or 0.0
         sold, proceeds, fill_c = 0.0, 0.0, None
+        # A LIVE position holds real shares. It may only be closed by a real sale
+        # (or by real settlement). If the executor has since been flipped to
+        # paper, the live-sell branch below is skipped — and paper-marking it out
+        # would book profit that does not exist while the shares sit untouched in
+        # the wallet. That happened: Chengdu+Istanbul booked a phantom +$1.96
+        # against zero USDC movement. Refuse, and say so.
+        if pos.get("mode") == "live" and not self.is_live:
+            if not pos.get("_exit_blocked"):
+                pos["_exit_blocked"] = True
+                self.on_log("!", f"[weatherexec] {tag} SKIPPED {pos['city']} {pos['label']} — "
+                                 f"live position, executor is PAPER. Not booking a "
+                                 f"simulated exit against real shares. Arm live to "
+                                 f"sell, or close it manually. ({reason})")
+            return
         if pos.get("mode") == "live" and self.is_live:
             try:
                 import polymarket
