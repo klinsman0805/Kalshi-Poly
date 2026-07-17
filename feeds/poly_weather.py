@@ -46,6 +46,21 @@ def taker_fee_c(price_c):
 CLOB_BOOK = "https://clob.polymarket.com/book"
 
 
+def fetch_book_bid_c(token_id, timeout=6):
+    """Best REAL bid in cents, or None. Needed to measure the true spread: the
+    ask we execute against comes from the live ladder, so pairing it with Gamma's
+    stale bid understates the spread badly (a Tokyo low showed gamma bid 40 / ask
+    49 = 9c, while the real ask was 70.67c => a 30c spread we never saw)."""
+    try:
+        r = requests.get(CLOB_BOOK, params={"token_id": token_id}, timeout=timeout)
+        r.raise_for_status()
+        bids = [float(b["price"]) * 100.0 for b in (r.json().get("bids") or [])]
+        return max(bids) if bids else None
+    except Exception as e:  # noqa: BLE001
+        log.debug("bid fetch failed %s: %s", str(token_id)[-8:], e)
+        return None
+
+
 def fetch_book_asks(token_id, timeout=6):
     """The REAL executable ask ladder from the CLOB, ascending [(price_c, size)].
 

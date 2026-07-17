@@ -35,7 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from feeds.poly_weather import (fetch_temperature_events, taker_fee_c,
-                                fetch_book_asks, vwap_for_size)
+                                fetch_book_asks, fetch_book_bid_c, vwap_for_size)
 
 log = logging.getLogger("modules.weather")
 
@@ -303,6 +303,21 @@ class WeatherEngine:
         best["book_depth"] = round(got, 2)
         best["shares_planned"] = shares
         best["gamma_ask_c"] = gamma_ask          # keep for drift visibility
+        # The spread gate in _gate() compared Gamma's bid to GAMMA's ask. We do not
+        # execute at Gamma's ask — we execute here, on the ladder. Re-measure the
+        # spread against the price we are actually paying, or an illiquid book
+        # sails through: a Tokyo low passed on gamma 40/49 (9c) while the real
+        # ask was 70.67c against a 40c bid — a 30c spread, and we'd have paid the
+        # ask for something the market mid-priced at ~55.
+        real_bid = fetch_book_bid_c(best["token_yes"])
+        if real_bid is None:
+            return "NO-BOOK", "no bid on the real book"
+        best["bid_c"] = round(real_bid, 2)
+        spread = best["ask_c"] - real_bid
+        if spread > MAX_SPREAD_C:
+            return "WIDE", (f"real spread {spread:.0f}c > {MAX_SPREAD_C:.0f}c "
+                            f"(bid {real_bid:.0f} / ask {best['ask_c']:.0f}; gamma implied "
+                            f"{gamma_ask:.0f}) — illiquid, we'd pay far above mid")
         # re-apply the money gates at the price we'd REALLY pay
         if best["ask_c"] < PRICE_MIN_C:
             return "MKT-LOCKED", f"real ask {best['ask_c']:.0f}c < {PRICE_MIN_C:.0f}c"
