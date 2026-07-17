@@ -172,7 +172,8 @@ function renderWeatherExec() {
     const rp = document.getElementById('wx-realpnl');
     rp.textContent = (a.real_pnl >= 0 ? '+$' : '-$') + Math.abs(a.real_pnl).toFixed(2);
     rp.style.color = a.real_pnl >= 0 ? 'var(--ok)' : 'var(--down)';
-    rp.title = `equity $${a.equity.toFixed(2)} (USDC $${a.usdc.toFixed(2)} + open cost $${a.open_cost.toFixed(2)}) − baseline $${a.baseline.toFixed(2)}`;
+    rp.title = `equity $${a.equity.toFixed(2)} = USDC $${a.usdc.toFixed(2)} + open marked-to-bid $${(a.open_value ?? a.open_cost).toFixed(2)}`
+      + ` (cost $${a.open_cost.toFixed(2)}, unrealized $${(a.unrealized ?? 0).toFixed(2)}) − baseline $${a.baseline.toFixed(2)}`;
     document.getElementById('wx-usdc').textContent = '$' + a.usdc.toFixed(2);
     // flag when modeled and real disagree by more than a cent or two
     const gap = a.real_pnl - (s.realized_pnl || 0);

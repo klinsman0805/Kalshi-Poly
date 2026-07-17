@@ -130,12 +130,33 @@ class WeatherExecutor:
 
     # ── entries (called by WeatherEngine.refresh) ────────────────────────────
     def on_refresh(self, rows):
+        self._mark_open(rows)           # mark positions to market before anything else
         self._close_dead(rows)          # bail out of provably-lost buckets first
         for row in rows:
             entry = row.get("entry")
             if not entry:
                 continue
             self._consider(entry)
+
+    # ── mark to market ───────────────────────────────────────────────────────
+    def _mark_open(self, rows):
+        """Stamp each open position with the current BID — what it's actually
+        worth right now, not what we paid.
+
+        Valuing open positions at cost silently reports a dead position as if it
+        still held its purchase value: with Miami worthless the dashboard showed
+        real P&L +$1.55 when the truth was -$6.50. Equity must mark to market.
+        """
+        by_key = {f"{r['city']}|{r['date']}|{r['kind']}": r for r in rows}
+        with self._lock:
+            for pos in self.open:
+                row = by_key.get(pos["key"])
+                if not row:
+                    continue
+                b = next((x for x in row.get("buckets", [])
+                          if x.get("label") == pos.get("label")), None)
+                if b is not None and b.get("bid_c") is not None:
+                    pos["mark_c"] = b["bid_c"]
 
     # ── dead-position exit ───────────────────────────────────────────────────
     def _close_dead(self, rows):
@@ -309,14 +330,26 @@ class WeatherExecutor:
                            "ts": datetime.now(timezone.utc).isoformat()})
             self.on_log("◆", f"[weatherexec] live USDC baseline set = ${usdc:.2f}")
         with self._lock:
-            open_cost = sum(p.get("cost_usd", 0.0) for p in self.open
-                            if p.get("mode") == "live")
+            live = [p for p in self.open if p.get("mode") == "live"]
+            open_cost = sum(p.get("cost_usd", 0.0) for p in live)
+            # MARK TO MARKET: a position is worth its current bid, not its cost.
+            # Costing it would report a dead position at face value (Miami showed
+            # +$1.55 against a true -$6.50). Fall back to cost only when unmarked.
+            open_value = sum(
+                (p["shares"] * p["mark_c"] / 100.0) if p.get("mark_c") is not None
+                else p.get("cost_usd", 0.0)
+                for p in live)
+            unmarked = sum(1 for p in live if p.get("mark_c") is None)
+        equity = usdc + open_value
         self._acct = {
             "usdc": round(usdc, 2),
             "open_cost": round(open_cost, 2),
-            "equity": round(usdc + open_cost, 2),
+            "open_value": round(open_value, 2),      # marked to the bid
+            "unrealized": round(open_value - open_cost, 2),
+            "unmarked": unmarked,                    # >0 => open_value part-guessed
+            "equity": round(equity, 2),
             "baseline": round(self._live_baseline, 2),
-            "real_pnl": round(usdc + open_cost - self._live_baseline, 2),
+            "real_pnl": round(equity - self._live_baseline, 2),
         }
 
     # ── settlement (poll Gamma for resolutions) ──────────────────────────────
