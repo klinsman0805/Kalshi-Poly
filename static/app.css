@@ -157,3 +157,14 @@ b{font-weight:600}
 
 .live-tag{color:var(--down);font-size:9px;letter-spacing:.05em}
 .paper-tag{color:var(--muted);font-size:9px;letter-spacing:.05em}
+
+/* ── signal group headers in the weather table ── */
+.data-tbl tr.grp td{padding:16px 12px 6px;border-bottom:1px solid var(--border2);
+  background:transparent}
+.data-tbl tr.grp:first-child td{padding-top:4px}
+.grp-l{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);font-weight:600}
+.grp-n{font-size:10px;color:var(--dim);margin-left:8px;border:1px solid var(--border2);
+  border-radius:9px;padding:1px 7px}
+.grp-h{font-size:10px;color:var(--dim);margin-left:10px;font-style:italic}
+.data-tbl tr.grp-hot .grp-l{color:var(--accent)}
+.data-tbl tr.grp-hot .grp-n{color:var(--accent);border-color:rgba(0,212,170,.4)}

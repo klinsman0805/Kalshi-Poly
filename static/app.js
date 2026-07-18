@@ -82,8 +82,32 @@ function renderWeather() {
     body.innerHTML = '<tr><td colspan="8"><div class="no-data">No temperature markets found (or engine still warming up).</div></td></tr>';
     return;
   }
-  // today's tradeable rows first (engine pre-sorts), dim monitor/tomorrow rows
+  // engine sorts into signal groups; insert a header whenever the group changes
+  const GROUP_LABEL = {
+    'actionable':     ['⚡ Actionable', 'passes every gate — the bot trades these'],
+    'market-blocked': ['Blocked by the market', 'model likes it; price, spread or depth says no'],
+    'not-yet':        ['Weather not settled', "the day's extreme isn't locked in yet"],
+    'no-data':        ['No data', 'not enough observations to judge'],
+    'other-day':      ['Other days', "not this station's local today"],
+    'untradeable':    ['Not tradeable', 'no climatology / unsupported settlement source'],
+  };
+  let lastGroup = null;
   body.innerHTML = S.weather.map(r => {
+    let hdr = '';
+    if (r.group !== lastGroup) {
+      lastGroup = r.group;
+      const n = S.weather.filter(x => x.group === r.group).length;
+      const [lbl, hint] = GROUP_LABEL[r.group] || [r.group, ''];
+      hdr = `<tr class="grp ${r.group === 'actionable' ? 'grp-hot' : ''}">
+               <td colspan="8"><span class="grp-l">${lbl}</span>
+               <span class="grp-n">${n}</span>
+               <span class="grp-h">${esc(hint)}</span></td></tr>`;
+    }
+    return hdr + rowHtml(r);
+  }).join('');
+}
+
+function rowHtml(r) {
     const dim = (!r.is_today || !r.tradeable) ? ' style="opacity:.55"' : '';
     let localH = '—';
     if (r.local_hour != null) {
@@ -108,7 +132,6 @@ function renderWeather() {
       <td><span class="${edgeCls}">${edge}</span></td>
       <td><span class="sig ${sc}" title="${esc(r.why||'')}">${esc(r.signal||'—')}</span></td>
     </tr>`;
-  }).join('');
 }
 
 function renderWeatherSummary() {

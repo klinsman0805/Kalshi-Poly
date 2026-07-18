@@ -94,6 +94,26 @@ MAX_SPREAD_C = float(os.getenv("WEATHER_MAX_SPREAD_C", "10"))
 BOOK_CONFIRM = os.getenv("WEATHER_BOOK_CONFIRM", "true").strip().lower() == "true"
 STAKE_USD = float(os.getenv("WEATHER_STAKE_USD", "5"))
 
+# ── signal grouping (dashboard ordering) ─────────────────────────────────────
+# Group by WHY a market is or isn't actionable, not alphabetically. Reading order
+# mirrors how you'd triage: tradeable now -> blocked only by price/liquidity (the
+# near-misses worth watching) -> weather hasn't settled yet -> data problems ->
+# other days -> not tradeable at all.
+_GROUPS = [
+    (0, "actionable",   ["ENTER"]),
+    # model likes it; the MARKET is the blocker — these can flip within minutes
+    (1, "market-blocked", ["THIN-EDGE", "PRICED", "TOO-GOOD", "WIDE",
+                           "NO-DEPTH", "NO-BOOK", "MKT-LOCKED"]),
+    # the day itself isn't decided yet — waiting on the weather, not the book
+    (2, "not-yet",      ["NOT-LOCKED", "NO-LOCK", "EARLY"]),
+    (3, "no-data",      ["NO-DATA"]),
+    (4, "other-day",    ["WAIT"]),
+    (5, "untradeable",  ["MONITOR"]),
+]
+SIGNAL_GROUP = {sig: (rank, name) for rank, name, sigs in _GROUPS for sig in sigs}
+SIGNAL_RANK = {sig: i for i, sig in
+               enumerate(s for _, _, sigs in _GROUPS for s in sigs)}
+
 
 class WeatherEngine:
     def __init__(self, metar, executor=None, on_log=None):
@@ -173,9 +193,12 @@ class WeatherEngine:
             row = self._compute_event(e)
             if row:
                 rows.append(row)
-        rows.sort(key=lambda r: (r["signal"] != "ENTER",
-                                 not (r["is_today"] and r["tradeable"]),
-                                 r["date"] or "9999", -(r["best_p"] or 0), r["city"]))
+        # Group by WHY a market is/isn't actionable, most actionable first, so the
+        # table reads as: what can I trade -> what's nearly there -> what's still
+        # cooking -> what's noise. Within a group, highest model confidence first.
+        rows.sort(key=lambda r: (SIGNAL_GROUP.get(r["signal"], (9, "other"))[0],
+                                 SIGNAL_RANK.get(r["signal"], 99),
+                                 -(r["best_p"] or 0), r["city"]))
         self.rows = rows
         self.last_refresh = time.time()
         if self.executor:
@@ -256,6 +279,7 @@ class WeatherEngine:
             "best_p": round(best["p"], 4) if best else None,
             "best_label": best["label"] if best else None,
             "signal": signal, "why": why,
+            "group": SIGNAL_GROUP.get(signal, (9, "other"))[1],
             "entry": ({\
                 "condition_id": best["condition_id"], "token_yes": best["token_yes"],
                 "label": best["label"], "ask_c": best["ask_c"], "bid_c": best["bid_c"],
