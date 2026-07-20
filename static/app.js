@@ -212,8 +212,19 @@ function renderWeatherExec() {
 
   const box = document.getElementById('wxexec-pos');
   const open = e.open || [];
-  if (!open.length) { box.innerHTML = ''; return; }
-  box.innerHTML = '<div class="pos-hd">Open positions</div>' + open.map(p => {
+  // Always render the section — "no active trades" is information, and a panel
+  // that vanishes when empty reads as broken rather than idle.
+  const nLive = open.filter(p => p.mode === 'live').length;
+  const hd = `<div class="pos-hd">Active trades`
+           + (open.length ? ` <span class="pos-count">${open.length}`
+               + (nLive ? ` · ${nLive} live` : '') + `</span>` : '')
+           + `</div>`;
+  if (!open.length) {
+    box.innerHTML = hd + '<div class="pos-empty">No active positions — '
+      + (e.live ? 'armed and waiting for a signal' : 'paper mode') + '</div>';
+    return;
+  }
+  box.innerHTML = hd + open.map(p => {
     const h = p.health || {};
     const broke = (h.breaks || []).length > 0;
     // live health: is the thesis we bought on still true?

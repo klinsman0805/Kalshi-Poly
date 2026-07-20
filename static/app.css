@@ -100,6 +100,9 @@ b{font-weight:600}
 .exec-stat{font-size:11px;color:var(--muted)}.exec-stat b{color:var(--text)}
 .exec-pos{margin-bottom:12px}
 .pos-hd{font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim);margin:2px 0 6px}
+.pos-count{color:var(--muted);letter-spacing:.06em}
+.pos-empty{font-size:11px;color:var(--dim);padding:12px 10px;border:1px dashed var(--border);
+  border-radius:5px;margin-bottom:5px;background:var(--surf)}
 .pos-row{display:flex;align-items:center;gap:12px;padding:7px 10px;border:1px solid var(--border);
   border-radius:5px;margin-bottom:5px;font-size:12px;background:var(--surf)}
 .pos-row.live{border-color:rgba(255,107,107,.4)}
