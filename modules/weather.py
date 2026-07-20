@@ -93,6 +93,25 @@ MAX_SPREAD_C = float(os.getenv("WEATHER_MAX_SPREAD_C", "10"))
 # (fast, but signals/paper fills can be fiction).
 BOOK_CONFIRM = os.getenv("WEATHER_BOOK_CONFIRM", "true").strip().lower() == "true"
 STAKE_USD = float(os.getenv("WEATHER_STAKE_USD", "5"))
+# An ask at or below this is dumping, not an offer — holders clearing a bucket
+# the market has already written off. Milan 30C sat at 1c with 1262 shares
+# offered and NO bid while the model still said 96.6%.
+DUST_ASK_C = float(os.getenv("WEATHER_DUST_ASK_C", "2"))
+
+
+def credible_quote(ask_c, bid_c):
+    """Is this quote worth computing an edge against?
+
+    Edge = p*100 - ask, so the DEADER a bucket is, the better the edge looks: a
+    market that has written the outcome off entirely prints the biggest number
+    on the board. Milan showed edge +95.5c on a bucket worth nothing. Only a
+    signal check stood between that and a real order, which means every future
+    caller that ranks or filters on edge has to remember the same trap.
+    So edge is None unless the quote is two-sided and above dust.
+    """
+    if ask_c is None or ask_c <= DUST_ASK_C:
+        return False
+    return bid_c is not None
 
 # ── signal grouping (dashboard ordering) ─────────────────────────────────────
 # Group by WHY a market is or isn't actionable, not alphabetically. Reading order
@@ -237,15 +256,19 @@ class WeatherEngine:
                                      st["local_hour"], ext, b["lo"], b["hi"])
             ask_c = b["ask"] * 100 if b["ask"] is not None else None
             bid_c = b["bid"] * 100 if b["bid"] is not None else None
-            # edge is NET of the taker fee we'd pay to enter at the ask
+            # edge is NET of the taker fee we'd pay to enter at the ask, and is
+            # only meaningful against a quote we could actually trade (see
+            # credible_quote — a dead bucket otherwise prints a huge edge)
             fee_c = taker_fee_c(ask_c)
-            edge_c = (p * 100 - ask_c - fee_c) if (p is not None and ask_c is not None) else None
+            liquid = credible_quote(ask_c, bid_c)
+            edge_c = (p * 100 - ask_c - fee_c) if (p is not None and liquid) else None
             bv = {
                 "label": self._label(b),
                 "lo": b["lo"], "hi": b["hi"], "unit": b["unit"],
                 "bid_c": bid_c, "ask_c": ask_c, "fee_c": round(fee_c, 2),
                 "p": round(p, 4) if p is not None else None,
                 "edge_c": round(edge_c, 1) if edge_c is not None else None,
+                "liquid": liquid,
                 "condition_id": b["condition_id"],
                 "token_yes": b["token_yes"],
                 "min_size": b["min_size"],
@@ -323,7 +346,6 @@ class WeatherEngine:
         best["ask_c"] = round(vwap, 2)          # what we'd PAY (cost/edge basis)
         best["limit_c"] = math.ceil(marginal)   # FOK limit must clear the WORST level
         best["fee_c"] = round(fee, 2)
-        best["edge_c"] = round(best["p"] * 100 - vwap - fee, 1)
         best["book_depth"] = round(got, 2)
         best["shares_planned"] = shares
         best["gamma_ask_c"] = gamma_ask          # keep for drift visibility
@@ -334,9 +356,18 @@ class WeatherEngine:
         # ask was 70.67c against a 40c bid — a 30c spread, and we'd have paid the
         # ask for something the market mid-priced at ~55.
         real_bid = fetch_book_bid_c(best["token_yes"])
-        if real_bid is None:
-            return "NO-BOOK", "no bid on the real book"
+        # Resolve liquidity BEFORE writing an edge. Ordered the other way round,
+        # a one-sided book still stamped `edge_c` on the row on its way out —
+        # which is how Milan 30C rendered "+95.5c" on the dashboard while the
+        # bucket was worthless and the signal said NO-BOOK.
+        best["liquid"] = credible_quote(best["ask_c"], real_bid)
+        if not best["liquid"]:
+            best["edge_c"] = None
+            if real_bid is None:
+                return "NO-BOOK", "no bid on the real book"
+            return "NO-BOOK", f"dust book — real ask {best['ask_c']:.1f}c ≤ {DUST_ASK_C:.0f}c"
         best["bid_c"] = round(real_bid, 2)
+        best["edge_c"] = round(best["p"] * 100 - vwap - fee, 1)
         spread = best["ask_c"] - real_bid
         if spread > MAX_SPREAD_C:
             return "WIDE", (f"real spread {spread:.0f}c > {MAX_SPREAD_C:.0f}c "

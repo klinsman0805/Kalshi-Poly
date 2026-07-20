@@ -32,6 +32,12 @@ log = logging.getLogger("modules.weather_exec")
 
 POS_LOG = Path(os.getenv("WEATHER_EXEC_LOG", "weather_positions.jsonl"))
 ENV_ARMED = os.getenv("WEATHER_LIVE", "false").strip().lower() == "true"
+# Boot straight into LIVE instead of waiting for the dashboard toggle. Only for
+# UNATTENDED hosts: a crash-restart or reboot otherwise comes back PAPER while
+# live positions are still open, and a paper executor refuses to close them
+# (see _exit_position) — so they'd sit with no dead-exit and no take-profit.
+# Still gated on WEATHER_LIVE; this cannot arm live trading on its own.
+START_LIVE = os.getenv("WEATHER_START_LIVE", "false").strip().lower() == "true"
 STAKE_USD = float(os.getenv("WEATHER_STAKE_USD", "5"))
 MAX_OPEN = int(os.getenv("WEATHER_MAX_OPEN", "10"))
 GAMMA_MARKETS = "https://gamma-api.polymarket.com/markets"
@@ -54,7 +60,7 @@ MIN_MAX_AGE_MIN = float(os.getenv("WEATHER_MIN_MAX_AGE_MIN", "120"))
 class WeatherExecutor:
     def __init__(self, on_log=None):
         self.on_log = on_log or (lambda i, m: None)
-        self.mode = "paper"
+        self.mode = "live" if (ENV_ARMED and START_LIVE) else "paper"
         self.stake_usd = STAKE_USD
         self.open = []            # position dicts
         self.closed = []
@@ -606,6 +612,7 @@ class WeatherExecutor:
                 }
             return {
                 "mode": self.mode, "live": self.is_live, "env_armed": ENV_ARMED,
+                "start_live": START_LIVE,   # boots live unattended? (see START_LIVE)
                 "stake_usd": self.stake_usd, "max_open": MAX_OPEN, "session": s,
                 "by_mode": by_mode,         # {live:{...}, paper:{...}}
                 "account": self._acct,      # REAL on-chain USDC / equity / P&L

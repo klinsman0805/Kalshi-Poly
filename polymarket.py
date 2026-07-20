@@ -90,6 +90,12 @@ POLY_WS    = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 # for silent/reconnecting WS feeds). Kept short so re-seeded snapshots stay
 # within the arb staleness gate's acceptance window.
 POLY_RESEED_INTERVAL = float(os.getenv("POLY_RESEED_INTERVAL", "2.0"))
+# The market-data WS + REST re-seed exist for the arb trader's subscribed books.
+# The weather strategy prices off REST (fetch_book_asks) and subscribes to
+# nothing, so on a weather-only host the socket connects, sits idle, gets dropped
+# by the server and reconnects every ~5s forever. Off = no streaming book.
+# Order placement is REST and is unaffected either way.
+POLY_WS_ENABLED = os.getenv("POLY_WS_ENABLED", "true").strip().lower() == "true"
 
 # Naked-leg unwind: balance-aware FAK sell. Each attempt re-reads the actual held
 # balance and sells exactly that, so it absorbs ledger-lag (held grows once the
@@ -368,10 +374,14 @@ class PolyClient:
         self._last_sell_proceeds_usd: Optional[float] = None
 
         # Start WS loop
-        self._ws_thread = threading.Thread(
-            target=self._ws_loop, name="poly-ws", daemon=True
-        )
-        self._ws_thread.start()
+        self._ws_thread = None
+        if POLY_WS_ENABLED:
+            self._ws_thread = threading.Thread(
+                target=self._ws_loop, name="poly-ws", daemon=True
+            )
+            self._ws_thread.start()
+        else:
+            log.info("Poly WS disabled (POLY_WS_ENABLED=false) — REST pricing only")
 
         # Periodic REST re-seed: safety net so a market whose WS feed is silent
         # (reconnect gap, missed snapshot) doesn't go permanently stale and get

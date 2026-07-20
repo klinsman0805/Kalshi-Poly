@@ -59,6 +59,10 @@ _copytrade_stop = threading.Event()
 
 # Weather NEAR-LOCK (Polymarket daily temperature markets) — on unless WEATHER_ENABLED=false.
 WEATHER_ENABLED = os.getenv("WEATHER_ENABLED", "true").strip().lower() == "true"
+# The Kalshi 15-min crypto scalper. Retired (no edge at n=135) and hard-wired to
+# DRY_RUN, but it still discovers markets and holds a websocket open — real CPU
+# and log noise for a decision that can never fire. Off = weather-only host.
+CRYPTO_ENGINE_ENABLED = os.getenv("CRYPTO_ENGINE_ENABLED", "true").strip().lower() == "true"
 _metar = MetarFeed()
 _weather_exec = WeatherExecutor()
 _weather = WeatherEngine(_metar, executor=_weather_exec)
@@ -161,13 +165,21 @@ def _start_bot():
     with _bot_lock:
         if _bot and _bot.is_running():
             return False, "already running"
-        engine.DRY_RUN = True
-        engine.USE_DEMO = False
-        _bot = engine.BotEngine(on_log=_on_log, on_prices=_on_prices, on_status=_on_status)
         BOT_STATE["started_at"] = datetime.now(timezone.utc).isoformat()
-        BOT_STATE["status"] = "starting"
-        threading.Thread(target=engine.pre_warm_connection, daemon=True, name="http-prewarm").start()
-        threading.Thread(target=_bot.start, daemon=True, name="bot-start").start()
+        if CRYPTO_ENGINE_ENABLED:
+            engine.DRY_RUN = True
+            engine.USE_DEMO = False
+            _bot = engine.BotEngine(on_log=_on_log, on_prices=_on_prices, on_status=_on_status)
+            BOT_STATE["status"] = "starting"
+            threading.Thread(target=engine.pre_warm_connection, daemon=True, name="http-prewarm").start()
+            threading.Thread(target=_bot.start, daemon=True, name="bot-start").start()
+        else:
+            # Scalping was retired (no edge at n=135), but BotEngine still drove
+            # the dashboard state dot — so with it off we own the status directly.
+            # Skipping it also drops the BTC/ETH/SOL discovery + WS reconnect loop.
+            _bot = None
+            _on_status("running")
+            _add_log("◆", "Kalshi crypto engine DISABLED (CRYPTO_ENGINE_ENABLED=false)")
         global _copytrade_thread
         if _copytrade.enabled and not (_copytrade_thread and _copytrade_thread.is_alive()):
             _copytrade_stop.clear()
@@ -180,7 +192,8 @@ def _start_bot():
             _weather_stop.clear()
             _weather_thread = threading.Thread(target=_weather_loop, daemon=True, name="weather-poll")
             _weather_thread.start()
-            _add_log("◆", "Weather NEAR-LOCK engine ENABLED (paper forward-test)")
+            _mode = "LIVE — real money" if _weather_exec.is_live else "paper forward-test"
+            _add_log("◆", f"Weather NEAR-LOCK engine ENABLED ({_mode})")
         _add_log("→", "Dashboard started — copy-trade + weather feeds live (dry-run)")
         return True, "ok"
 
@@ -190,12 +203,14 @@ def _stop_bot():
     with _bot_lock:
         _copytrade_stop.set()
         _weather_stop.set()
+        if BOT_STATE["status"] == "stopped":
+            return False, "not running"
         if _bot:
             _bot.stop()
-            BOT_STATE["status"] = "stopped"
-            _add_log("■", "Dashboard stopped")
-            return True, "ok"
-        return False, "not running"
+        BOT_STATE["status"] = "stopped"
+        _push("status", {"status": "stopped"})
+        _add_log("■", "Dashboard stopped")
+        return True, "ok"
 
 
 # ── SSE ───────────────────────────────────────────────────────────────────────
@@ -305,11 +320,15 @@ if __name__ == "__main__":
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
     creds_ok = bool(engine.KALSHI_KEY_ID and Path(engine.KALSHI_KEY_FILE).exists())
+    # The dashboard has NO auth and exposes the live/paper toggle, so on any
+    # public host bind loopback and reach it through a tunnel or ssh -L.
+    host = os.getenv("DASHBOARD_HOST", "0.0.0.0")
+    port = int(os.getenv("DASHBOARD_PORT", "5001"))
     print("\n" + "=" * 60)
     print("  DASHBOARD — Copy-trade + Weather (monitor + dry-run)")
-    print(f"  Dashboard → http://localhost:5001")
+    print(f"  Dashboard → http://{'localhost' if host == '0.0.0.0' else host}:{port}")
     print(f"  Kalshi WS creds: {'found' if creds_ok else 'MISSING (ticker-only data)'}")
     print("=" * 60 + "\n")
 
     _start_bot()
-    app.run(host="0.0.0.0", port=5001, debug=False, threaded=True, use_reloader=False)
+    app.run(host=host, port=port, debug=False, threaded=True, use_reloader=False)
