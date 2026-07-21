@@ -54,8 +54,21 @@ function updateStatus(st) {
   else if (['discovering', 'connecting', 'starting', 'reconnecting', 'waiting'].includes(st))
     dot.classList.add('disc');
   document.getElementById('slabel').textContent = (st || 'stopped').toUpperCase();
-  document.getElementById('btn-start').style.display = S.botRunning ? 'none' : '';
-  document.getElementById('btn-stop').style.display = S.botRunning ? '' : 'none';
+  if (!S.readonly) {
+    document.getElementById('btn-start').style.display = S.botRunning ? 'none' : '';
+    document.getElementById('btn-stop').style.display = S.botRunning ? '' : 'none';
+  }
+}
+
+// Latch the shared view into read-only: hide every control. CSS (body.readonly)
+// does the hiding so it survives re-renders; the handlers are also guarded on
+// S.readonly so a crafted click can't act even if an element is reached.
+function applyReadonly() {
+  S.readonly = true;
+  document.body.classList.add('readonly');
+  ['btn-start','btn-stop','wx-paper','wx-live'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.style.display = 'none';
+  });
 }
 
 // ── Weather render ────────────────────────────────────────────────────────────
@@ -64,6 +77,7 @@ function applyWeather(m) {
   S.weatherCfg = m.config || {};
   S.weatherExec = m.exec || null;
   S.lastDataTs = Date.now();
+  if (m.readonly && !S.readonly) applyReadonly();  // one-way latch
   renderWeatherSummary();
   renderWeatherExec();
   if (S.tab === 'weather') renderWeather();
@@ -146,6 +160,7 @@ function renderWeatherSummary() {
 }
 
 async function setWeatherMode(m) {
+  if (S.readonly) return;
   const e = S.weatherExec || {};
   if (m === 'live') {
     if (!e.env_armed) { alert('Live is locked. Set WEATHER_LIVE=true and restart to arm.'); return; }
@@ -193,7 +208,9 @@ function renderWeatherExec() {
   document.getElementById('wx-staked').textContent = '$' + (s.staked_usd || 0);
 
   // REAL on-chain P&L — only shown once live trading has a baseline
-  const a = e.account;
+  // account may be present but stripped of dollar fields when the server is in
+  // hide-balance mode for a shared view — treat that as "no balance to show"
+  const a = (e.account && e.account.real_pnl != null) ? e.account : null;
   const rBox = document.getElementById('wx-real-box'), uBox = document.getElementById('wx-usdc-box');
   if (a && rBox && uBox) {
     rBox.style.display = ''; uBox.style.display = '';
@@ -381,12 +398,14 @@ function toggleLog() {
 
 // ── Controls ──────────────────────────────────────────────────────────────────
 async function startBot() {
+  if (S.readonly) return;
   document.getElementById('slabel').textContent = 'STARTING';
   document.getElementById('sdot').className = 'sdot disc';
   await fetch('/api/start', {method:'POST'});
   connectSSE(); pollOnce();
 }
 async function stopBot() {
+  if (S.readonly) return;
   _sseOn = false; if (es) { try{es.close();}catch(e){} es=null; }
   setConn(false); updateStatus('stopped');
   await fetch('/api/stop', {method:'POST'});

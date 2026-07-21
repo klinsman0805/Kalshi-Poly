@@ -43,6 +43,14 @@ b{font-weight:600}
   border:1px solid rgba(77,166,255,.3);background:rgba(77,166,255,.08);
   padding:3px 9px;border-radius:12px}
 
+/* Read-only shared view: hide every control and the misleading dry-run pill.
+   Handlers are also guarded on S.readonly — this is presentation, not the gate. */
+body.readonly #btn-start,
+body.readonly #btn-stop,
+body.readonly .exec-toggle,
+body.readonly .dry-pill{display:none !important}
+body.readonly .exec-arm::after{content:" · view only";color:var(--muted)}
+
 /* ── Module area ── */
 .main{flex:1;overflow:hidden;min-height:0;display:flex;flex-direction:column}
 .view{flex:1;overflow-y:auto;padding:14px;display:none}

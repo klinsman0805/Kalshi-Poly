@@ -63,6 +63,13 @@ WEATHER_ENABLED = os.getenv("WEATHER_ENABLED", "true").strip().lower() == "true"
 # DRY_RUN, but it still discovers markets and holds a websocket open — real CPU
 # and log noise for a decision that can never fire. Off = weather-only host.
 CRYPTO_ENGINE_ENABLED = os.getenv("CRYPTO_ENGINE_ENABLED", "true").strip().lower() == "true"
+# Read-only dashboard for sharing with a client: the UI hides every control and
+# the server REFUSES the mutating routes (hiding a button is not security — the
+# POST endpoints are reachable directly). Data/SSE routes stay open.
+DASHBOARD_READONLY = os.getenv("DASHBOARD_READONLY", "false").strip().lower() == "true"
+# Hide the raw wallet balance and dollar P&L from a shared view; percentages,
+# win-rate and calibration still show. Independent of READONLY.
+DASHBOARD_HIDE_BALANCE = os.getenv("DASHBOARD_HIDE_BALANCE", "false").strip().lower() == "true"
 _metar = MetarFeed()
 _weather_exec = WeatherExecutor()
 _weather = WeatherEngine(_metar, executor=_weather_exec)
@@ -242,14 +249,23 @@ def stream():
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+def _readonly_block():
+    """403 for a mutating route when the dashboard is shared read-only."""
+    return jsonify({"ok": False, "msg": "dashboard is read-only"}), 403
+
+
 @app.route("/api/start", methods=["POST"])
 def api_start():
+    if DASHBOARD_READONLY:
+        return _readonly_block()
     ok, msg = _start_bot()
     return jsonify({"ok": ok, "msg": msg})
 
 
 @app.route("/api/stop", methods=["POST"])
 def api_stop():
+    if DASHBOARD_READONLY:
+        return _readonly_block()
     ok, msg = _stop_bot()
     return jsonify({"ok": ok, "msg": msg})
 
@@ -261,6 +277,13 @@ def api_weather():
     st["enabled"] = WEATHER_ENABLED
     st["exec"] = _weather_exec.state()
     st["metar"] = {"last_poll": _metar.last_poll_ts, "error": _metar.last_error}
+    st["readonly"] = DASHBOARD_READONLY
+    if DASHBOARD_HIDE_BALANCE and st["exec"].get("account"):
+        # keep the ratio (real vs modeled) but drop raw dollars and wallet size
+        acct = st["exec"]["account"]
+        for k in ("usdc", "baseline", "equity", "open_cost", "open_value",
+                  "real_pnl", "unrealized"):
+            acct.pop(k, None)
     return jsonify(st)
 
 
@@ -268,6 +291,8 @@ def api_weather():
 def api_weather_config():
     """Set the weather executor mode (paper|live). Live also requires
     WEATHER_LIVE=true in the environment (double gate) — set_mode enforces it."""
+    if DASHBOARD_READONLY:
+        return _readonly_block()
     data = request.get_json(silent=True) or {}
     if "mode" in data:
         _weather_exec.set_mode(data["mode"])
@@ -288,6 +313,8 @@ def api_copytrade_scan():
 
     Optional JSON body {metric, window} overrides the ranking before scanning.
     """
+    if DASHBOARD_READONLY:
+        return _readonly_block()
     data = request.get_json(silent=True) or {}
     if data.get("metric") in poly_leaderboard.VALID_METRICS:
         _copytrade.metric = data["metric"]
