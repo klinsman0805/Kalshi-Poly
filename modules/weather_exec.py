@@ -26,11 +26,16 @@ from pathlib import Path
 
 import requests
 
-from feeds.poly_weather import taker_fee_c
+from feeds.poly_weather import taker_fee_c, fetch_book_asks, fetch_book_bid_c, vwap_for_size
 
 log = logging.getLogger("modules.weather_exec")
 
 POS_LOG = Path(os.getenv("WEATHER_EXEC_LOG", "weather_positions.jsonl"))
+# Every live FOK miss is recorded here with the book at the miss instant, so we
+# can later tell "market ran away for a reason" (big gap, bucket often loses)
+# from "we under-priced by a cent and missed a still-good trade" (small gap).
+# The second kind is the argument for loosening the FOK; the first is not.
+MISS_LOG = Path(os.getenv("WEATHER_MISS_LOG", "weather_misses.jsonl"))
 ENV_ARMED = os.getenv("WEATHER_LIVE", "false").strip().lower() == "true"
 # Boot straight into LIVE instead of waiting for the dashboard toggle. Only for
 # UNATTENDED hosts: a crash-restart or reboot otherwise comes back PAPER while
@@ -75,7 +80,18 @@ class WeatherExecutor:
         self._acct = None
         self._acct_ts = 0.0
         self._lock = threading.Lock()
+        # live FOK misses, seeded from the log so the count survives restarts
+        self._misses = self._count_misses()
         self._rehydrate()
+
+    def _count_misses(self):
+        try:
+            with open(MISS_LOG) as f:
+                return sum(1 for line in f if line.strip())
+        except FileNotFoundError:
+            return 0
+        except Exception:  # noqa: BLE001
+            return 0
 
     # ── persistence ──────────────────────────────────────────────────────────
     def _rehydrate(self):
@@ -421,7 +437,7 @@ class WeatherExecutor:
             filled, fill_c = self._place_live(entry["token_yes"], limit_c, shares,
                                               entry.get("neg_risk"))
             if filled <= 0:
-                self.on_log("!", f"[weatherexec] LIVE FOK missed {entry['city']} {entry['label']}")
+                self._record_miss(entry, limit_c, shares)
                 return
             shares, mode = filled, "live"
             # record the ACTUAL average fill price the exchange gave us (a FOK
@@ -470,6 +486,47 @@ class WeatherExecutor:
         except Exception as e:  # noqa: BLE001
             self.on_log("✗", f"[weatherexec] live order failed: {e}")
             return 0.0, None
+
+    def _record_miss(self, entry, limit_c, shares):
+        """A live FOK returned nothing. Re-read the book RIGHT NOW and persist the
+        gap, so we can later separate a market that ran away (chase = buy losers)
+        from a fill we lost by a cent (the real 'missed opportunity').
+
+        gap_c = live best ask − our limit. Positive means the ask climbed above
+        our limit (we'd have needed to pay more); depth_ok says the size we
+        wanted is still there at all. The re-read is ~milliseconds after the
+        kill, so it is the closest picture we get of why it died — but it is
+        AFTER the fact, so treat it as diagnostic, not the exact fill book.
+        """
+        token = entry["token_yes"]
+        asks = fetch_book_asks(token)
+        bid = fetch_book_bid_c(token)
+        now_ask = asks[0][0] if asks else None
+        _, got, _ = vwap_for_size(asks, shares) if asks else (None, 0.0, None)
+        gap_c = round(now_ask - limit_c, 2) if now_ask is not None else None
+        rec = {
+            "type": "miss", "ts": datetime.now(timezone.utc).isoformat(),
+            "key": f"{entry['city']}|{entry['date']}|{entry.get('kind', 'high')}",
+            "city": entry.get("city"),
+            "label": entry.get("label"), "kind": entry.get("kind", "high"),
+            "p": entry.get("p"), "edge_c": entry.get("edge_c"),
+            "limit_c": round(limit_c, 2), "shares_wanted": shares,
+            # book at the miss instant
+            "now_ask_c": round(now_ask, 2) if now_ask is not None else None,
+            "now_bid_c": round(bid, 2) if bid is not None else None,
+            "gap_c": gap_c,                       # >0: ask climbed past our limit
+            "depth_ok": bool(asks) and got + 1e-9 >= shares,
+        }
+        try:
+            with open(MISS_LOG, "a") as f:
+                f.write(json.dumps(rec) + "\n")
+            self._misses += 1
+        except Exception as e:  # noqa: BLE001
+            log.warning("miss-log write failed: %s", e)
+        g = f"gap {gap_c:+.1f}c" if gap_c is not None else "book gone"
+        self.on_log("!", f"[weatherexec] LIVE FOK missed {entry['city']} "
+                         f"{entry['label']} — limit {limit_c:.0f}c, now ask "
+                         f"{'—' if now_ask is None else f'{now_ask:.0f}c'} ({g})")
 
     # ── real on-chain account (live truth, not modeled) ──────────────────────
     def _refresh_account(self):
@@ -614,6 +671,7 @@ class WeatherExecutor:
                 "mode": self.mode, "live": self.is_live, "env_armed": ENV_ARMED,
                 "start_live": START_LIVE,   # boots live unattended? (see START_LIVE)
                 "stake_usd": self.stake_usd, "max_open": MAX_OPEN, "session": s,
+                "misses": self._misses,     # live FOKs that found nothing to fill
                 "by_mode": by_mode,         # {live:{...}, paper:{...}}
                 "account": self._acct,      # REAL on-chain USDC / equity / P&L
 
