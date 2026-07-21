@@ -49,7 +49,9 @@ function handleMsg(m) {
 function updateStatus(st) {
   const dot = document.getElementById('sdot');
   dot.className = 'sdot';
-  S.botRunning = ['monitoring', 'connected'].includes(st);
+  // 'running' is the weather-only status (crypto engine disabled); the older
+  // 'monitoring'/'connected' came from the retired Kalshi engine.
+  S.botRunning = ['running', 'monitoring', 'connected'].includes(st);
   if (S.botRunning) dot.classList.add('run');
   else if (['discovering', 'connecting', 'starting', 'reconnecting', 'waiting'].includes(st))
     dot.classList.add('disc');
@@ -413,6 +415,13 @@ async function stopBot() {
 
 // fallback poll so panels fill immediately on load
 async function pollOnce() {
+  // Status too, not just data: SSE can be buffered behind a tunnel/proxy, so the
+  // status pill would otherwise sit on its stale HTML default ("STOPPED") even
+  // though the bot is running. This 5s poll is the reliable path.
+  try {
+    const s = await fetch('/api/state').then(r=>r.json());
+    updateStatus(s.status);
+  } catch(e){}
   try {
     const cp = await fetch('/api/copytrade').then(r=>r.json());
     applyCopy(cp);

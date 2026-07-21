@@ -70,6 +70,15 @@ DASHBOARD_READONLY = os.getenv("DASHBOARD_READONLY", "false").strip().lower() ==
 # Hide the raw wallet balance and dollar P&L from a shared view; percentages,
 # win-rate and calibration still show. Independent of READONLY.
 DASHBOARD_HIDE_BALANCE = os.getenv("DASHBOARD_HIDE_BALANCE", "false").strip().lower() == "true"
+# Serve a SECOND, read-only copy of this SAME dashboard on another port, from the
+# same process — so it mirrors the live executor's real state exactly (positions,
+# P&L, signals), just with the controls removed. A separate process can't do this:
+# it has its own executor memory and would show a divergent paper track. Requests
+# arriving on this port are read-only regardless of the global flag above.
+DASHBOARD_READONLY_PORT = os.getenv("DASHBOARD_READONLY_PORT", "").strip()
+# Even on the mirror, optionally blank the raw wallet $ (it's a public link).
+DASHBOARD_READONLY_HIDE_BALANCE = os.getenv(
+    "DASHBOARD_READONLY_HIDE_BALANCE", "false").strip().lower() == "true"
 _metar = MetarFeed()
 _weather_exec = WeatherExecutor()
 _weather = WeatherEngine(_metar, executor=_weather_exec)
@@ -249,6 +258,23 @@ def stream():
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+def _req_readonly():
+    """Is THIS request read-only? True if the global flag is set, or the request
+    arrived on the dedicated read-only mirror port (same process, second server)."""
+    if DASHBOARD_READONLY:
+        return True
+    return bool(DASHBOARD_READONLY_PORT) and \
+        request.environ.get("SERVER_PORT") == DASHBOARD_READONLY_PORT
+
+
+def _req_hide_balance():
+    """Blank the wallet $ for this request? Global setting, plus the mirror port's
+    own setting so the public link can hide balance while localhost:5001 shows it."""
+    if DASHBOARD_HIDE_BALANCE:
+        return True
+    return _req_readonly() and DASHBOARD_READONLY_HIDE_BALANCE
+
+
 def _readonly_block():
     """403 for a mutating route when the dashboard is shared read-only."""
     return jsonify({"ok": False, "msg": "dashboard is read-only"}), 403
@@ -256,7 +282,7 @@ def _readonly_block():
 
 @app.route("/api/start", methods=["POST"])
 def api_start():
-    if DASHBOARD_READONLY:
+    if _req_readonly():
         return _readonly_block()
     ok, msg = _start_bot()
     return jsonify({"ok": ok, "msg": msg})
@@ -264,7 +290,7 @@ def api_start():
 
 @app.route("/api/stop", methods=["POST"])
 def api_stop():
-    if DASHBOARD_READONLY:
+    if _req_readonly():
         return _readonly_block()
     ok, msg = _stop_bot()
     return jsonify({"ok": ok, "msg": msg})
@@ -277,8 +303,8 @@ def api_weather():
     st["enabled"] = WEATHER_ENABLED
     st["exec"] = _weather_exec.state()
     st["metar"] = {"last_poll": _metar.last_poll_ts, "error": _metar.last_error}
-    st["readonly"] = DASHBOARD_READONLY
-    if DASHBOARD_HIDE_BALANCE and st["exec"].get("account"):
+    st["readonly"] = _req_readonly()
+    if _req_hide_balance() and st["exec"].get("account"):
         # keep the ratio (real vs modeled) but drop raw dollars and wallet size
         acct = st["exec"]["account"]
         for k in ("usdc", "baseline", "equity", "open_cost", "open_value",
@@ -291,7 +317,7 @@ def api_weather():
 def api_weather_config():
     """Set the weather executor mode (paper|live). Live also requires
     WEATHER_LIVE=true in the environment (double gate) — set_mode enforces it."""
-    if DASHBOARD_READONLY:
+    if _req_readonly():
         return _readonly_block()
     data = request.get_json(silent=True) or {}
     if "mode" in data:
@@ -313,7 +339,7 @@ def api_copytrade_scan():
 
     Optional JSON body {metric, window} overrides the ranking before scanning.
     """
-    if DASHBOARD_READONLY:
+    if _req_readonly():
         return _readonly_block()
     data = request.get_json(silent=True) or {}
     if data.get("metric") in poly_leaderboard.VALID_METRICS:
@@ -358,4 +384,16 @@ if __name__ == "__main__":
     print("=" * 60 + "\n")
 
     _start_bot()
+
+    # Optional read-only mirror on a second port, SAME process → identical live
+    # state, controls removed. Requests on this port are read-only via _req_readonly.
+    if DASHBOARD_READONLY_PORT and DASHBOARD_READONLY_PORT != str(port):
+        from werkzeug.serving import make_server
+        ro_host = os.getenv("DASHBOARD_READONLY_HOST", host)
+        ro_srv = make_server(ro_host, int(DASHBOARD_READONLY_PORT), app, threaded=True)
+        threading.Thread(target=ro_srv.serve_forever, daemon=True,
+                         name="ro-mirror").start()
+        print(f"  Read-only mirror → http://{ro_host}:{DASHBOARD_READONLY_PORT}"
+              f"  (hide-balance={DASHBOARD_READONLY_HIDE_BALANCE})\n")
+
     app.run(host=host, port=port, debug=False, threaded=True, use_reloader=False)
