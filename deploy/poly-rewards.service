@@ -1,0 +1,31 @@
+[Unit]
+Description=Polymarket weather LP-reward scanner — read-only monitor, no orders
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/kalshi-poly
+# Read-only: scans public market/book endpoints and appends a JSONL snapshot.
+# Places no orders, holds no keys, never touches the live bot's state or ledgers.
+ExecStart=/opt/kalshi-poly/venv/bin/python scripts/monitor_poly_rewards.py
+Restart=always
+RestartSec=15
+Environment=PYTHONUNBUFFERED=1
+Environment=POLY_REWARDS_REFRESH_SEC=300
+Environment=POLY_REWARDS_MIN_RATE=5
+Environment=POLY_REWARDS_TOP_N=15
+# This droplet runs at ~28MB free / 458MB total with the live bot already
+# resident at ~160MB RSS — the live bot must win any OOM decision. MemoryMax
+# caps this unit's own growth (systemd kills+restarts it, not the box);
+# OOMScoreAdjust biases the kernel OOM-killer to take this process first if
+# it ever comes to that, instead of the live trading bot.
+MemoryHigh=100M
+MemoryMax=150M
+OOMScoreAdjust=500
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

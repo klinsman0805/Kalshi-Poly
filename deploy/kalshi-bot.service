@@ -1,0 +1,23 @@
+[Unit]
+Description=Edge Desk — Polymarket weather bot + dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/kalshi-poly
+# .env is read by load_dotenv() in app.py, not by systemd — systemd's parser is
+# stricter about quoting and would fail the unit on a file python-dotenv accepts.
+ExecStart=/opt/kalshi-poly/venv/bin/python app.py
+Restart=always
+RestartSec=15
+Environment=PYTHONUNBUFFERED=1
+# Loopback-only: the dashboard has no auth and carries the live/paper toggle.
+# Reached via cloudflared or `ssh -L 5001:localhost:5001`.
+Environment=DASHBOARD_HOST=127.0.0.1
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

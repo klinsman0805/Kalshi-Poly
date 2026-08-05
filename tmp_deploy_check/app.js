@@ -1,19 +1,21 @@
 // ── State ─────────────────────────────────────────────────────────────────────
 const S = {
   tab: 'weather', botRunning: false,
+  copy: [], copyCfg: {}, copyEnabled: false, copyScanning: false, copyExec: null,
   weather: [], weatherCfg: {}, weatherExec: null,
   kalshi: [], kalshiCfg: {}, kalshiExec: null, kalshiStale: null,
   lastDataTs: 0, logExpanded: false,
 };
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
-const TABS = ['weather', 'kalshi'];
+const TABS = ['weather', 'kalshi', 'copy'];
 function showTab(t) {
   S.tab = t;
   TABS.forEach(x => {
     document.getElementById('tab-' + x).classList.toggle('active', t === x);
     document.getElementById('view-' + x).classList.toggle('active', t === x);
   });
+  if (t === 'copy') renderCopy();
   if (t === 'weather') renderWeather();
   if (t === 'kalshi') renderKalshi();
 }
@@ -38,6 +40,8 @@ function handleMsg(m) {
     case 'init':     updateStatus(m.status); break;
     case 'status':   updateStatus(m.status); break;
     case 'log':      addLog(m); break;
+    case 'copytrade':
+      applyCopy(m); break;
     case 'weather':
       applyWeather(m); break;
   }
@@ -464,6 +468,118 @@ function renderKalshiExec() {
   }).join('');
 }
 
+// ── Copy-trade render ───────────────────────────────────────────────────────────
+function applyCopy(m) {
+  S.copyEnabled = !!m.enabled;
+  S.copy = m.rows || [];
+  S.copyCfg = m.config || {};
+  S.copyExec = m.exec || null;
+  // reveal the tab once the scanner is on
+  document.getElementById('tab-copy').style.display = S.copyEnabled ? '' : 'none';
+  // keep the metric/window selects in sync with backend config
+  const ms = document.getElementById('copy-metric'), ws = document.getElementById('copy-window');
+  if (S.copyCfg.metric && document.activeElement !== ms) ms.value = S.copyCfg.metric;
+  if (S.copyCfg.window && document.activeElement !== ws) ws.value = S.copyCfg.window;
+  S.lastDataTs = Date.now();
+  renderCopySummary();
+  renderCopyExec();
+  if (S.tab === 'copy') renderCopy();
+}
+
+function renderCopyExec() {
+  const e = S.copyExec; if (!e) return;
+  const s = e.session || {};
+  const mode = document.getElementById('copyexec-mode');
+  if (e.live)          { mode.textContent = '🔴 LIVE forward-test — REAL orders'; mode.className = 'exec-arm live'; }
+  else if (e.env_armed){ mode.textContent = '🟢 armed · paper forward-test'; mode.className = 'exec-arm ok'; }
+  else                 { mode.textContent = '📄 PAPER forward-test'; mode.className = 'exec-arm'; }
+  document.getElementById('cx-copied').textContent = s.copied || 0;
+  document.getElementById('cx-open').textContent = (e.open || []).length;
+  document.getElementById('cx-settled').textContent = s.settled || 0;
+  document.getElementById('cx-win').textContent = s.win_rate == null ? '—' : Math.round(s.win_rate*100) + '%';
+  const pnl = document.getElementById('cx-pnl');
+  pnl.textContent = (s.realized_pnl >= 0 ? '+$' : '-$') + Math.abs(s.realized_pnl||0).toFixed(2);
+  pnl.style.color = (s.realized_pnl||0) >= 0 ? 'var(--ok)' : 'var(--down)';
+  document.getElementById('cx-slip').textContent = s.avg_slippage_c == null ? '—' : (s.avg_slippage_c>0?'+':'') + s.avg_slippage_c + '¢';
+  document.getElementById('cx-follow').textContent = (e.follow || []).length;
+
+  const box = document.getElementById('copyexec-pos');
+  const open = e.open || [];
+  if (!open.length) { box.innerHTML = ''; return; }
+  box.innerHTML = '<div class="pos-hd">Open paper copies</div>' + open.map(p =>
+    `<div class="pos-row ${p.mode}">
+       <span class="pos-mode">${p.mode === 'live' ? 'LIVE' : 'PAPER'}</span>
+       <span class="pos-match">${esc(p.title||'')}</span>
+       <span class="pos-buy">${esc(p.outcome||'')} @ ${p.entry}¢ ×${p.filled}</span>
+       <span class="pos-cost">$${p.cost_usd}</span>
+       <span class="pos-chip">slip ${p.slippage_c>0?'+':''}${p.slippage_c}¢</span>
+     </div>`).join('');
+}
+
+const money = v => v == null ? '—' : (v < 0 ? '-$' : '$') + Math.abs(v).toLocaleString(undefined, {maximumFractionDigits: 0});
+const pctOrDash = v => v == null ? '—' : (v * 100).toFixed(0) + '%';
+
+function renderCopy() {
+  const body = document.getElementById('copy-body');
+  const note = document.getElementById('copy-note');
+  const scanBtn = document.getElementById('copy-scan');
+  scanBtn.textContent = S.copyScanning ? '… scanning' : '⟳ Re-scan';
+  if (!S.copyEnabled) {
+    body.innerHTML = '<tr><td colspan="8"><div class="no-data">Copy-trade scanner is off — set COPYTRADE_ENABLED=true and restart.</div></td></tr>';
+    note.textContent = '';
+    return;
+  }
+  note.innerHTML = '⚠ Profit & Real Win% are the trustworthy signals · ROI inflates when history is capped (*) · winrate ≠ profitable';
+  const onlyCopyable = document.getElementById('copy-only').checked;
+  let rows = S.copy.slice();
+  if (onlyCopyable) rows = rows.filter(r => r.copyable);
+  if (!rows.length) {
+    body.innerHTML = `<tr><td colspan="8"><div class="no-data">${S.copyScanning ? 'Scanning leaderboard…' : 'No traders match.'}</div></td></tr>`;
+    return;
+  }
+  body.innerHTML = rows.map(r => {
+    const cap = r.realized_capped ? '<span class="basis-tag" title="History capped at max_events — partial">*</span>' : '';
+    const roiCls = r.realized_roi == null ? '' : r.realized_roi >= 0 ? 'up' : 'dn';
+    const profCls = r.profit >= 0 ? 'up' : 'dn';
+    const wr = r.realized_winrate;
+    const wrCls = wr == null ? '' : wr >= 0.6 ? 'up' : wr < 0.45 ? 'dn' : '';
+    return `<tr>
+      <td class="l"><div class="match"><a href="${r.url}" target="_blank" rel="noopener">${esc(r.name)}</a></div>
+        <div class="kickoff">${r.wallet.slice(0,8)}…${r.wallet.slice(-4)}</div></td>
+      <td><span class="${profCls}">${money(r.profit)}</span></td>
+      <td><span class="${wrCls}">${pctOrDash(wr)}</span>${cap}</td>
+      <td><span class="${roiCls}">${r.realized_roi == null ? '—' : (r.realized_roi*100).toFixed(0)+'%'}</span></td>
+      <td>${r.resolved_markets == null ? '—' : r.resolved_markets}</td>
+      <td>${money(r.avg_trade_usd)}</td>
+      <td>${r.open_positions}</td>
+      <td>${r.copyable ? '<span class="vchip cross">✓ copyable</span>' : '<span class="vchip none">size</span>'}</td>
+    </tr>`;
+  }).join('');
+}
+
+function renderCopySummary() {
+  const cfg = S.copyCfg || {};
+  const copyable = S.copy.filter(r => r.copyable).length;
+  const deep = cfg.deep ? `deep · lifetime winrate (≤${cfg.max_events} evts)` : 'shallow · snapshot only';
+  document.getElementById('copy-summary').innerHTML =
+    `Polymarket leaderboard · copy-trade candidates &nbsp;·&nbsp; ` +
+    `${S.copy.length} ranked by <b>${cfg.metric||'profit'}</b>/${cfg.window||'all'} · ` +
+    `<b style="color:var(--accent)">${copyable}</b> copyable &nbsp;·&nbsp; ${deep}`;
+}
+
+async function copyRescan() {
+  if (!S.copyEnabled || S.copyScanning) return;
+  S.copyScanning = true; renderCopy();
+  const metric = document.getElementById('copy-metric').value;
+  const window = document.getElementById('copy-window').value;
+  try {
+    const r = await fetch('/api/copytrade/scan', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({metric, window})}).then(r=>r.json());
+    applyCopy(r);
+  } catch(e){}
+  S.copyScanning = false; renderCopy(); renderCopySummary();
+}
+
 // ── Log ───────────────────────────────────────────────────────────────────────
 function addLog(e) {
   const cls = e.icon==='✗'?'err':e.icon==='✅'?'ok':e.icon==='→'?'dim':e.icon==='!'?'warn':e.icon==='◆'?'sig':'';
@@ -506,6 +622,10 @@ async function pollOnce() {
     updateStatus(s.status);
   } catch(e){}
   try {
+    const cp = await fetch('/api/copytrade').then(r=>r.json());
+    applyCopy(cp);
+  } catch(e){}
+  try {
     const wx = await fetch('/api/weather').then(r=>r.json());
     applyWeather(wx);
   } catch(e){}
@@ -532,7 +652,7 @@ function renderPerTrade(elId, cfg, stakeUsd, minShares) {
 }
 
 setInterval(() => {
-  // weather pushes on 60s cadence — anything within ~1.5 cycles is live
+  // weather/copytrade push on 60s cadence — anything within ~1.5 cycles is live
   const fresh = S.lastDataTs && (Date.now() - S.lastDataTs) < 90000;
   document.getElementById('data-dot').classList.toggle('live', fresh);
   document.getElementById('data-label').textContent = fresh ? 'Live' : 'No data';

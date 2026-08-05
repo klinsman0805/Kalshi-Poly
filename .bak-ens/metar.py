@@ -122,14 +122,6 @@ class MetarFeed:
         whole °F derived from that same tenths data.
         """
         local_today = now_utc.astimezone(tz).date()
-        # station position, straight off the observation — the ensemble feed
-        # anchors on these so it can never point at a different site than the
-        # one the market settles to
-        lat = lon = None
-        for o in rows:
-            if o.get("lat") is not None and o.get("lon") is not None:
-                lat, lon = float(o["lat"]), float(o["lon"])
-                break
         latest = latest_ts = None
         obs = sorted((o for o in rows
                       if self._obs_time(o) is not None and o.get("temp") is not None),
@@ -145,11 +137,9 @@ class MetarFeed:
         if not today:
             return {"icao": icao, "local_date": local_today.isoformat(),
                     "local_hour": now_utc.astimezone(tz).hour + now_utc.astimezone(tz).minute / 60.0,
-                    "tz": str(tz), "lat": lat, "lon": lon,
-                    "temp_c": latest, "temp_f": self._f(latest),
+                    "tz": str(tz), "temp_c": latest, "temp_f": self._f(latest),
                     "max_c": None, "min_c": None, "max_f": None, "min_f": None,
                     "max_age_min": None, "min_age_min": None, "obs_today": 0,
-                    "today_obs": [],
                     "latest_obs_utc": latest_ts.isoformat() if latest_ts else None}
 
         max_c = max(t for _, t, _, _ in today)
@@ -202,7 +192,6 @@ class MetarFeed:
             "local_date": local_today.isoformat(),
             "local_hour": now_utc.astimezone(tz).hour + now_utc.astimezone(tz).minute / 60.0,
             "tz": str(tz),
-            "lat": lat, "lon": lon,
             "temp_c": latest,
             "temp_f": self._f(latest),
             "max_c": max_c, "min_c": min_c,
@@ -213,9 +202,6 @@ class MetarFeed:
             "max_age_min": _age(max_ts),
             "min_age_min": _age(min_ts),
             "obs_today": n_today,
-            # the local day's observations, ascending — the ensemble feed
-            # bias-corrects each member against these (see feeds/gfs_ensemble)
-            "today_obs": [[ts.isoformat(), t] for ts, t, _mx, _mn in today],
             "latest_obs_utc": latest_ts.isoformat() if latest_ts else None,
             # weather-regime signals from the SAME obs (precip / ceiling /
             # convection / trend). SHADOW ONLY — recorded on every entry so the

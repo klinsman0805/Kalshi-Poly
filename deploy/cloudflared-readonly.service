@@ -1,0 +1,15 @@
+[Unit]
+Description=Cloudflare quick tunnel for the read-only dashboard mirror
+After=network-online.target kalshi-bot.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/cloudflared tunnel --url http://127.0.0.1:5002 --no-autoupdate
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

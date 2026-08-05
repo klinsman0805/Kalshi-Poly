@@ -1,10 +1,8 @@
 """
-app.py — Trading dashboard: COPY-TRADE + WEATHER NEAR-LOCK (Polymarket).
+app.py — Trading dashboard: WEATHER NEAR-LOCK (Polymarket).
 
-Monitor + dry-run signals (no real orders in this build).
-  • Copy-trade: Polymarket leaderboard scanner + forward-test executor.
-  • Weather: Polymarket daily-high-temperature markets vs live METAR at the
-    settlement station — NEAR-LOCK convergence signals + paper forward test.
+Weather: Polymarket daily-high-temperature markets vs live METAR at the
+settlement station — NEAR-LOCK convergence signals + paper forward test.
 
 Run:  python app.py     →  http://localhost:5001
 """
@@ -34,12 +32,10 @@ except ImportError:
     sys.modules["websocket"] = MagicMock()
 
 import engine
-from feeds import poly_leaderboard
 from feeds.metar import MetarFeed
-from modules.copytrader import CopyTraderEngine
-from modules.copytrade_exec import CopyTradeExecutor
 from modules.weather import WeatherEngine
 from modules.weather_exec import WeatherExecutor
+from modules import client_chat
 
 from flask import Flask, Response, jsonify, render_template, request
 
@@ -50,12 +46,6 @@ app.config["SECRET_KEY"] = os.urandom(24)
 _bot: engine.BotEngine = None
 _bot_lock = threading.Lock()
 _event_queue: queue.Queue = queue.Queue(maxsize=500)
-
-# Copy-trade scanner (Polymarket only, read-only) — off unless COPYTRADE_ENABLED=true.
-_copytrade = CopyTraderEngine()
-_copytrade_exec = CopyTradeExecutor()   # forward-test executor (paper by default)
-_copytrade_thread = None
-_copytrade_stop = threading.Event()
 
 # Weather NEAR-LOCK (Polymarket daily temperature markets) — on unless WEATHER_ENABLED=false.
 WEATHER_ENABLED = os.getenv("WEATHER_ENABLED", "true").strip().lower() == "true"
@@ -109,8 +99,6 @@ def _add_log(icon: str, msg: str):
     _push("log", entry)
 
 
-_copytrade.on_log = _add_log
-_copytrade_exec.on_log = _add_log
 _metar.on_log = _add_log
 _weather.on_log = _add_log
 _weather_exec.on_log = _add_log
@@ -149,32 +137,6 @@ def _weather_loop():
         _weather_stop.wait(WEATHER_REFRESH_SEC)
 
 
-# ── Copy-trade poll loop (Polymarket scan) ────────────────────────────────────
-def _copytrade_loop():
-    while not _copytrade_stop.is_set():
-        try:
-            _copytrade.refresh()
-            # keep the forward-test executor following the scanner's copyable set
-            _copytrade_exec.follow_from_scan(_copytrade.rows)
-            st = _copytrade.state()
-            st["exec"] = _copytrade_exec.state()
-            _push("copytrade", st)
-        except Exception as e:  # noqa: BLE001
-            _add_log("✗", f"copytrade refresh error: {e}")
-        _copytrade_stop.wait(_copytrade.refresh_sec)
-
-
-# Executor polls faster than the scanner — catch new trades / settlements promptly.
-def _copytrade_exec_loop():
-    interval = int(os.getenv("COPYTRADE_EXEC_INTERVAL", "60"))
-    while not _copytrade_stop.is_set():
-        try:
-            _copytrade_exec.poll()
-        except Exception as e:  # noqa: BLE001
-            _add_log("✗", f"copytrade exec error: {e}")
-        _copytrade_stop.wait(interval)
-
-
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
 def _start_bot():
     global _bot
@@ -196,13 +158,6 @@ def _start_bot():
             _bot = None
             _on_status("running")
             _add_log("◆", "Kalshi crypto engine DISABLED (CRYPTO_ENGINE_ENABLED=false)")
-        global _copytrade_thread
-        if _copytrade.enabled and not (_copytrade_thread and _copytrade_thread.is_alive()):
-            _copytrade_stop.clear()
-            _copytrade_thread = threading.Thread(target=_copytrade_loop, daemon=True, name="copytrade-poll")
-            _copytrade_thread.start()
-            threading.Thread(target=_copytrade_exec_loop, daemon=True, name="copytrade-exec").start()
-            _add_log("◆", "Copy-trade scanner + forward-test executor ENABLED (paper)")
         global _weather_thread
         if WEATHER_ENABLED and not (_weather_thread and _weather_thread.is_alive()):
             _weather_stop.clear()
@@ -210,14 +165,13 @@ def _start_bot():
             _weather_thread.start()
             _mode = "LIVE — real money" if _weather_exec.is_live else "paper forward-test"
             _add_log("◆", f"Weather NEAR-LOCK engine ENABLED ({_mode})")
-        _add_log("→", "Dashboard started — copy-trade + weather feeds live (dry-run)")
+        _add_log("→", "Dashboard started — weather feed live (dry-run)")
         return True, "ok"
 
 
 def _stop_bot():
     global _bot
     with _bot_lock:
-        _copytrade_stop.set()
         _weather_stop.set()
         if BOT_STATE["status"] == "stopped":
             return False, "not running"
@@ -313,6 +267,26 @@ def api_weather():
     return jsonify(st)
 
 
+KALSHI_STATE_FILE = os.getenv("KALSHI_WEATHER_STATE", "kalshi_weather_state.json")
+
+
+@app.route("/api/kalshi")
+def api_kalshi():
+    """Kalshi weather paper-test snapshot. The Kalshi engine runs in a SEPARATE
+    process (kalshi-paper.service) which writes its state to KALSHI_STATE_FILE
+    each cycle; the dashboard just reads it — no engine in this process. Read-only
+    by nature (paper), so it's served identically on the read-only mirror."""
+    try:
+        with open(KALSHI_STATE_FILE) as f:
+            st = json.load(f)
+    except (FileNotFoundError, ValueError):
+        return jsonify({"rows": [], "exec": None, "unavailable": True,
+                        "note": "Kalshi paper service not running or no snapshot yet"})
+    st["readonly"] = True                 # nothing to control here; always view-only
+    st["stale_sec"] = (time.time() - st.get("last_refresh")) if st.get("last_refresh") else None
+    return jsonify(st)
+
+
 @app.route("/api/weather_config", methods=["POST"])
 def api_weather_config():
     """Set the weather executor mode (paper|live). Live also requires
@@ -325,29 +299,44 @@ def api_weather_config():
     return jsonify(_weather_exec.state())
 
 
-@app.route("/api/copytrade")
-def api_copytrade():
-    """Copy-trade scan results + forward-test executor state."""
-    st = _copytrade.state()
-    st["exec"] = _copytrade_exec.state()
-    return jsonify(st)
+@app.route("/api/ask", methods=["POST"])
+def api_ask():
+    """Read-only client chat — only reachable on the read-only mirror. Answers
+    are generated from a curated text snapshot of current state; there is no
+    write path from a question to any live action."""
+    if not _req_readonly():
+        return jsonify({"ok": False, "msg": "chat is only available on the shared dashboard"}), 404
+    if not client_chat.GEMINI_API_KEY:
+        return jsonify({"ok": False, "msg": "chat isn't configured yet — ask the operator"}), 503
 
-
-@app.route("/api/copytrade/scan", methods=["POST"])
-def api_copytrade_scan():
-    """Force an immediate re-scan (respects the flag; no-op when disabled).
-
-    Optional JSON body {metric, window} overrides the ranking before scanning.
-    """
-    if _req_readonly():
-        return _readonly_block()
     data = request.get_json(silent=True) or {}
-    if data.get("metric") in poly_leaderboard.VALID_METRICS:
-        _copytrade.metric = data["metric"]
-    if data.get("window") in poly_leaderboard.VALID_WINDOWS:
-        _copytrade.window = data["window"]
-    rows = _copytrade.refresh()
-    return jsonify({"ok": _copytrade.enabled, "count": len(rows), **_copytrade.state()})
+    question = (data.get("question") or "").strip()
+    if not question:
+        return jsonify({"ok": False, "msg": "ask a question first"}), 400
+    if len(question) > client_chat.MAX_QUESTION_CHARS:
+        return jsonify({"ok": False, "msg": f"keep it under {client_chat.MAX_QUESTION_CHARS} characters"}), 400
+    if not client_chat.rate_limiter.allow():
+        return jsonify({"ok": False, "msg": "the chat is busy right now — try again in a bit"}), 429
+
+    w_state = _weather_exec.state()
+    weather_rows = _weather.state().get("rows") or []
+    try:
+        with open(KALSHI_STATE_FILE) as f:
+            k_full = json.load(f)
+            k_state = k_full.get("exec") or {}
+            kalshi_rows = k_full.get("rows") or []
+    except (FileNotFoundError, ValueError):
+        k_state, kalshi_rows = {}, []
+
+    context = client_chat.build_context(
+        w_state, k_state, BOT_STATE["log"],
+        weather_rows=weather_rows, kalshi_rows=kalshi_rows,
+        hide_balance=_req_hide_balance())
+    try:
+        answer = client_chat.ask(question, context)
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"ok": False, "msg": f"couldn't get an answer just now ({e})"}), 502
+    return jsonify({"ok": True, "answer": answer})
 
 
 @app.route("/api/state")
@@ -378,7 +367,7 @@ if __name__ == "__main__":
     host = os.getenv("DASHBOARD_HOST", "0.0.0.0")
     port = int(os.getenv("DASHBOARD_PORT", "5001"))
     print("\n" + "=" * 60)
-    print("  DASHBOARD — Copy-trade + Weather (monitor + dry-run)")
+    print("  DASHBOARD — Weather (monitor + dry-run)")
     print(f"  Dashboard → http://{'localhost' if host == '0.0.0.0' else host}:{port}")
     print(f"  Kalshi WS creds: {'found' if creds_ok else 'MISSING (ticker-only data)'}")
     print("=" * 60 + "\n")

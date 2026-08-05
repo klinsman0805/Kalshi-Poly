@@ -480,35 +480,17 @@ class PolyClient:
     # ── Order placement ──────────────────────────────────────────────────────
 
     @staticmethod
-    def _filled_shares(resp: dict, fallback_size: float, side: str = "BUY") -> float:
+    def _filled_shares(resp: dict, fallback_size: float) -> float:
         """
-        Extract filled share count from a v2 post_order response.
-
-        The v2 API's makingAmount/takingAmount meaning FLIPS with order side:
-          BUY:  takingAmount = shares received (what we're buying)
-          SELL: makingAmount = shares given (what we're selling);
-                takingAmount = USDC received, NOT shares.
-
-        Every SELL call site used to call this with the default (BUY)
-        assumption, so it read takingAmount and reported real dollar proceeds
-        AS IF they were a share count. On a $0.63 sell of 7 real shares, this
-        function returned 0.63 "shares filled" — the retry loop then believed
-        6+ shares were still unsold on an already-fully-cleared position, kept
-        retrying, and the resulting confusion is what let a stale $2.61
-        proceeds figure survive into the final settle record (Shenzhen
-        2026-07-29, real trade was a clean SELL 7 @ 9c = $0.63, booked as
-        sold_shares=6.63 / salvage=$2.61). Pass side="SELL" from every sell
-        path; BUY stays the default so place_fok/place_fak are unaffected.
-
-        A FOK that fully fills returns status=matched with the relevant amount
-        populated; a kill returns status=live/unmatched with empty amounts.
+        Extract filled share count from a v2 post_order response. A FOK that
+        fully fills returns status=matched with takingAmount = shares received;
+        a kill returns status=live/unmatched with empty amounts.
         """
         status = (resp.get("status") or "").lower()
-        field = "makingAmount" if side.upper() == "SELL" else "takingAmount"
-        amount = resp.get(field, "")
-        if amount not in ("", None):
+        taking = resp.get("takingAmount", "")
+        if taking not in ("", None):
             try:
-                return float(amount)
+                return float(taking)
             except (TypeError, ValueError):
                 pass
         # No explicit amount — infer from status (matched → full, else 0).
@@ -610,120 +592,6 @@ class PolyClient:
                       token_id[-6:], price_cents, e)
             return 0.0
 
-    def place_gtc(self, token_id: str, price_cents: float,
-                  size: float, side: str = "BUY",
-                  neg_risk: Optional[bool] = None) -> Optional[str]:
-        """
-        Place a GTC (Good-Til-Cancelled) RESTING limit order — the order type
-        the weather bot never needed, because every weather entry/exit is a
-        take-it-now decision (FOK/FAK). LP rewards are the opposite: they only
-        pay for an order that SITS in the book, unfilled, within the market's
-        max-spread band. This is the first resting-order path in this file.
-
-        Returns the order ID on success (None on failure) — unlike
-        place_fok/place_fak there is no "filled" quantity to report; a GTC
-        order accepted by the book has filled=0 by design.
-        """
-        if DRY_RUN:
-            log.info("[DRY RUN] Poly GTC %s token=...%s price=%.1fc x%s (resting, not filled)",
-                     side, token_id[-6:], price_cents, size)
-            return "dry-run-order-id"
-
-        if self._clob is None:
-            log.error("Poly v2 client unavailable — cannot place GTC order")
-            return None
-
-        try:
-            from py_clob_client_v2.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
-            from py_clob_client_v2.order_builder.constants import BUY, SELL
-        except ImportError:
-            log.error("py-clob-client-v2 not installed")
-            return None
-
-        try:
-            args = OrderArgs(price=price_cents / 100.0, size=size,
-                             side=BUY if side.upper() == "BUY" else SELL,
-                             token_id=token_id)
-            opts = (PartialCreateOrderOptions(neg_risk=neg_risk)
-                    if neg_risk is not None else None)
-            signed = self._clob.create_order(args, opts)
-            resp = self._clob.post_order(signed, OrderType.GTC)
-            order_id = resp.get("orderID") or resp.get("orderId")
-            log.info("Poly GTC %s token=...%s price=%.1fc x%s → order %s",
-                     side, token_id[-6:], price_cents, size, order_id)
-            return order_id
-        except Exception as e:
-            log.error("Poly GTC %s error token=...%s price=%.1fc: %s",
-                      side, token_id[-6:], price_cents, e)
-            return None
-
-    def place_fak(self, token_id: str, price_cents: int,
-                  size: int, fee_bps: int, neg_risk: Optional[bool] = None) -> float:
-        """
-        Place a FAK buy order for `size` shares at `price_cents` via CLOB v2.
-        Takes whatever is available up to `size` and kills the remainder —
-        unlike place_fok(), a partial fill is a normal, expected outcome here,
-        not a failure. Returns filled share count as float (0.0 if nothing
-        was available at/better than price_cents).
-
-        Use this instead of place_fok() specifically where "grab whatever's
-        there" is genuinely correct: win-add (_maximize_confirmed_win) wants
-        as many of the available shares as the book offers, not all-or-
-        nothing — the trade is already close to risk-free (window closed,
-        outcome confirmed), so a partial fill is still exactly as good a
-        trade, just smaller. Do NOT use this for a fresh entry decision,
-        where all-or-nothing (place_fok) is the deliberate choice.
-        """
-        self._last_fill_price_cents = None
-        if DRY_RUN:
-            log.info(
-                "[DRY RUN] Poly FAK buy token=...%s price=%dc x%d",
-                token_id[-6:], price_cents, size,
-            )
-            self._last_fill_price_cents = float(price_cents)
-            return float(size)
-
-        if self._clob is None:
-            log.error("Poly v2 client unavailable — cannot place FAK buy")
-            return 0.0
-
-        try:
-            from py_clob_client_v2.clob_types import (OrderArgs, OrderType,
-                                                      PartialCreateOrderOptions)
-            from py_clob_client_v2.order_builder.constants import BUY
-        except ImportError:
-            log.error("py-clob-client-v2 not installed")
-            return 0.0
-
-        try:
-            args   = OrderArgs(price=price_cents / 100.0, size=size,
-                               side=BUY, token_id=token_id)
-            opts   = (PartialCreateOrderOptions(neg_risk=neg_risk)
-                      if neg_risk is not None else None)
-            signed = self._clob.create_order(args, opts)
-            resp   = self._clob.post_order(signed, OrderType.FAK)
-            filled = self._filled_shares(resp, size)
-            self._last_fill_price_cents = self._filled_price_cents(resp)
-            if filled == 0:
-                log.info(
-                    "Poly FAK buy token=...%s price=%dc x%d — nothing available "
-                    "at/better than limit, no exposure",
-                    token_id[-6:], price_cents, size,
-                )
-            else:
-                fp = self._last_fill_price_cents
-                partial = " (partial)" if filled < size else ""
-                log.info(
-                    "Poly FAK token=...%s limit=%dc x%d → filled=%s%s @ %s",
-                    token_id[-6:], price_cents, size, filled, partial,
-                    f"{fp:.2f}c" if fp is not None else "?",
-                )
-            return filled
-        except Exception as e:
-            log.error("Poly FAK buy error token=...%s price=%dc: %s",
-                      token_id[-6:], price_cents, e)
-            return 0.0
-
     def _held_shares(self, token_id: str) -> Optional[float]:
         """
         Actual conditional-token balance we hold for `token_id`, in whole shares
@@ -790,7 +658,7 @@ class PolyClient:
                       if neg_risk is not None else None)
             signed = self._clob.create_order(args, opts)
             resp   = self._clob.post_order(signed, OrderType.FAK)
-            filled = self._filled_shares(resp, sz, side="SELL")
+            filled = self._filled_shares(resp, sz)
             # Capture what we ACTUALLY got. A 1c-limit FAK sweeps whatever bids
             # exist, so the realised price is nothing like the limit — a dead
             # Shenzhen bucket sold into stale 90c bids. Callers that price the
@@ -920,7 +788,7 @@ class PolyClient:
                 if neg_risk is not None else None)
         signed = self._clob.create_order(args, opts)
         resp = self._clob.post_order(signed, OrderType.FOK)
-        filled = self._filled_shares(resp, want, side="SELL")
+        filled = self._filled_shares(resp, want)
         if filled <= 0:
             return 0.0
         # On a SELL, makingAmount = shares given, takingAmount = USDC received

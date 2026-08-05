@@ -59,7 +59,7 @@ body.readonly .exec-arm::after{content:" · view only";color:var(--muted)}
 
 .section-lbl{font-size:8px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim);
   margin:4px 0 8px}
-#scalp-summary,#copy-summary{font-size:12px;letter-spacing:.02em;text-transform:none;color:var(--muted);margin:2px 0 12px}
+#scalp-summary{font-size:12px;letter-spacing:.02em;text-transform:none;color:var(--muted);margin:2px 0 12px}
 .no-data{color:var(--muted);font-size:11px;padding:34px 16px;text-align:center;line-height:1.9}
 
 /* ── Scalping cards ── */
@@ -75,6 +75,7 @@ body.readonly .exec-arm::after{content:" · view only";color:var(--muted)}
 .sig.enter{background:rgba(34,197,94,.16);color:var(--ok);border:1px solid rgba(34,197,94,.35)}
 .sig.blocked{background:rgba(245,166,35,.14);color:var(--warn);border:1px solid rgba(245,166,35,.3)}
 .sig.settling{background:rgba(167,139,250,.14);color:var(--purple);border:1px solid rgba(167,139,250,.3)}
+.sig.paused{background:rgba(77,166,255,.14);color:var(--up);border:1px solid rgba(77,166,255,.3)}
 .sig.flat{background:var(--surf2);color:var(--muted);border:1px solid var(--border)}
 
 .spot-row{display:flex;align-items:baseline;gap:10px;padding:9px 13px 4px}
@@ -116,25 +117,30 @@ body.readonly .exec-arm::after{content:" · view only";color:var(--muted)}
 .pos-row.live{border-color:rgba(255,107,107,.4)}
 .pos-mode{font-size:9px;font-weight:600;padding:2px 7px;border-radius:3px;background:var(--surf2);color:var(--up)}
 .pos-row.live .pos-mode{background:rgba(255,107,107,.15);color:var(--down)}
+.pos-mode.mode-live{background:rgba(255,107,107,.15);color:var(--down)}
 .pos-match{font-weight:600;flex:1}.pos-buy{color:var(--up)}.pos-cost{color:var(--text)}
 .pos-chip{font-size:10px;color:var(--accent)}
+.stale-dot{font-size:8px;letter-spacing:.08em;text-transform:uppercase;color:var(--warn);
+  border:1px solid rgba(245,166,35,.35);border-radius:3px;padding:1px 4px;margin-left:3px}
 
-/* ── Data table (copy-trade, weather-to-be) ── */
+/* ── Data table (weather / kalshi) ── */
+.tbl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
 .data-tbl{width:100%;border-collapse:collapse;font-size:14px}
 .data-tbl th{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);
   text-align:center;padding:10px 12px;border-bottom:1px solid var(--border);font-weight:400}
 .data-tbl th.l{text-align:left}
 .data-tbl td{padding:12px 12px;border-bottom:1px solid var(--border);text-align:center;vertical-align:top}
 .data-tbl td.l{text-align:left}
+/* Freeze the identifying first column (City / Trader) while scrolling the
+   rest horizontally — both the header AND the data cells, so swiping right
+   never loses track of which row (or which column it's still labeling)
+   you're looking at. Needs its own opaque background since sticky cells
+   sit visually "above" whatever scrolls underneath them. */
+.data-tbl th.l,.data-tbl td.l{position:sticky;left:0;z-index:1;background:var(--surf)}
+.data-tbl th.l{background:var(--surf2);z-index:2}
 .data-tbl tr:hover{background:rgba(255,255,255,.02)}
 .match{font-weight:600;font-size:15px}.match small{color:var(--muted);font-weight:400;font-size:12px}
 .kickoff{font-size:11px;color:var(--muted);margin-top:3px}
-.basis-tag{color:var(--muted);font-weight:400}
-.vchip{font-size:11px;font-weight:600;letter-spacing:.04em;padding:4px 9px;border-radius:4px;
-  display:inline-block;white-space:nowrap}
-.vchip.cross{background:rgba(0,212,170,.14);color:var(--accent);border:1px solid rgba(0,212,170,.3)}
-.vchip.none{color:var(--muted);border:1px solid var(--border)}
-.chipcol{min-width:160px}
 
 /* ── Log panel ── */
 #log-panel{border-top:2px solid var(--border2);background:var(--surf);flex-shrink:0;
@@ -153,15 +159,6 @@ body.readonly .exec-arm::after{content:" · view only";color:var(--muted)}
 .le-msg.err{color:var(--down)}.le-msg.ok{color:var(--ok)}.le-msg.dim{color:var(--muted)}
 .le-msg.warn{color:var(--warn)}.le-msg.sig{color:var(--accent)}
 
-/* Copy-trade tab */
-.exec-bar select{background:#10141c;color:var(--text,#e6edf3);border:1px solid rgba(255,255,255,.12);
-  border-radius:5px;padding:3px 6px;font-family:inherit;font-size:11px;margin-left:5px;cursor:pointer}
-.copy-only label{display:inline-flex;align-items:center;gap:5px;cursor:pointer}
-.copy-tbl td .match a{color:var(--accent);text-decoration:none}
-.copy-tbl td .match a:hover{text-decoration:underline}
-.copy-tbl td{font-variant-numeric:tabular-nums}
-.copy-tbl .up{color:var(--ok)}.copy-tbl .dn{color:var(--down)}
-
 /* on-chain (real money) stats — distinguish from modeled */
 .exec-stat.wx-real{color:var(--accent)}
 .exec-stat.wx-real b{color:var(--text)}
@@ -173,9 +170,91 @@ body.readonly .exec-arm::after{content:" · view only";color:var(--muted)}
 .data-tbl tr.grp td{padding:16px 12px 6px;border-bottom:1px solid var(--border2);
   background:transparent}
 .data-tbl tr.grp:first-child td{padding-top:4px}
+.grp-caret{font-size:8px;color:var(--dim);margin-right:6px;display:inline-block}
+.data-tbl tr.grp:hover .grp-l{color:var(--text)}
 .grp-l{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);font-weight:600}
 .grp-n{font-size:10px;color:var(--dim);margin-left:8px;border:1px solid var(--border2);
   border-radius:9px;padding:1px 7px}
 .grp-h{font-size:10px;color:var(--dim);margin-left:10px;font-style:italic}
 .data-tbl tr.grp-hot .grp-l{color:var(--accent)}
+
+/* ── Mobile / narrow viewport ──────────────────────────────────────────────
+   The layout above assumes a desktop-width terminal window (fixed 100vh
+   shell, non-wrapping topbar/exec-bar, 8-column tables). None of that holds
+   on a phone, so below this breakpoint: let the page scroll instead of
+   locking to the viewport height (mobile browser chrome resizes the visible
+   area as you scroll, which fights a hard 100vh/overflow:hidden layout),
+   let the topbar and stat bars wrap onto multiple lines instead of
+   overflowing, and shrink the always-scrollable tables' padding/font so more
+   of a row is visible before the horizontal scroll (.tbl-wrap) kicks in. */
+@media (max-width: 768px){
+  html,body{height:auto;overflow:visible}
+  .shell{height:auto;min-height:100vh}
+  .main{overflow:visible}
+  .view{overflow-y:visible;padding:10px}
+
+  .topbar{flex-wrap:wrap;height:auto;padding:8px 10px;gap:8px 10px}
+  .logo{font-size:13px}
+  .tabs{order:3;width:100%}
+  .tab{flex:1;padding:7px 4px;font-size:9px;text-align:center}
+  .spacer{display:none}
+  .data-dot-wrap{margin-left:auto}
+
+  .exec-bar{flex-wrap:wrap;gap:6px 12px;font-size:11px}
+  .exec-toggle{width:100%;order:-1}
+  .exec-stat{font-size:10px}
+
+  .pos-row{flex-wrap:wrap;gap:6px 10px}
+  .pos-match{flex:1 1 100%;order:-1}
+
+  .data-tbl{font-size:11px}
+  .data-tbl th,.data-tbl td{padding:7px 8px;white-space:nowrap}
+  .chipcol{min-width:0}
+
+  #log-panel.expanded{height:180px}
+}
+
+@media (max-width: 480px){
+  .logo{letter-spacing:.1em}
+  .tab{font-size:8px;padding:6px 2px}
+  .btn{padding:5px 10px;font-size:9px}
+  .dry-pill{display:none}
+}
 .data-tbl tr.grp-hot .grp-n{color:var(--accent);border-color:rgba(0,212,170,.4)}
+
+/* ── Client chat ────────────────────────────────────────────────────────── */
+#chat-widget{position:fixed;right:20px;bottom:20px;z-index:50;font-size:13px}
+#chat-fab{width:48px;height:48px;border-radius:50%;border:1px solid var(--border2);
+  background:var(--surf2);color:var(--accent);font-size:20px;cursor:pointer;
+  box-shadow:0 4px 14px rgba(0,0,0,.4);transition:transform .15s}
+#chat-fab:hover{transform:scale(1.06);border-color:var(--accent)}
+#chat-panel{position:absolute;right:0;bottom:60px;width:320px;max-height:70vh;
+  display:flex;flex-direction:column;background:var(--surf);border:1px solid var(--border2);
+  border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,.5);
+  opacity:0;pointer-events:none;transform:translateY(8px);transition:all .15s}
+#chat-panel.open{opacity:1;pointer-events:auto;transform:translateY(0)}
+.chat-hd{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;
+  border-bottom:1px solid var(--border);font-weight:600;color:var(--text);
+  letter-spacing:.02em}
+.chat-close{background:none;border:none;color:var(--muted);cursor:pointer;font-size:13px}
+.chat-close:hover{color:var(--text)}
+.chat-msgs{flex:1;overflow-y:auto;padding:10px 12px;display:flex;flex-direction:column;
+  gap:8px;min-height:120px;max-height:44vh}
+.chat-msg{padding:7px 10px;border-radius:8px;line-height:1.45;white-space:pre-wrap;
+  max-width:92%}
+.chat-msg.chat-bot{background:var(--surf2);color:var(--text);align-self:flex-start;
+  border:1px solid var(--border)}
+.chat-msg.chat-user{background:rgba(0,212,170,.14);color:var(--text);align-self:flex-end;
+  border:1px solid rgba(0,212,170,.3)}
+.chat-input-row{display:flex;gap:6px;padding:10px;border-top:1px solid var(--border)}
+#chat-input{flex:1;background:var(--surf2);border:1px solid var(--border2);border-radius:5px;
+  color:var(--text);padding:7px 9px;font-size:12px;font-family:inherit}
+#chat-input:focus{outline:none;border-color:var(--accent)}
+.chat-input-row button{padding:6px 12px;border-radius:5px;border:1px solid var(--border2);
+  background:transparent;color:var(--accent);cursor:pointer;font-size:12px}
+.chat-input-row button:hover{border-color:var(--accent)}
+.chat-input-row button:disabled{opacity:.5;cursor:default}
+
+@media (max-width: 480px){
+  #chat-panel{width:calc(100vw - 32px);right:-4px}
+}

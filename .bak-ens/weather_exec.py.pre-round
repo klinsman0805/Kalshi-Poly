@@ -11,9 +11,9 @@ One position per event (city+date): the near-lock trade buys the single
 highest-probability bucket, not a ladder.
 
 LIVE mode exists but is double-gated (WEATHER_LIVE=true env AND set_mode) and
-routes through polymarket.PolyClient.place_fok. Do not arm until the paper
-forward-test is calibrated (target: n ≥ 100 settlements, win rate within a
-few points of model p).
+routes through polymarket.PolyClient.place_fok — same pattern as
+copytrade_exec. Do not arm until the paper forward-test is calibrated
+(target: n ≥ 100 settlements, win rate within a few points of model p).
 """
 
 import json
@@ -21,8 +21,7 @@ import logging
 import os
 import threading
 import time
-import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -53,9 +52,6 @@ ENV_ARMED = os.getenv("WEATHER_LIVE", "false").strip().lower() == "true"
 START_LIVE = os.getenv("WEATHER_START_LIVE", "false").strip().lower() == "true"
 STAKE_USD = float(os.getenv("WEATHER_STAKE_USD", "5"))
 MAX_OPEN = int(os.getenv("WEATHER_MAX_OPEN", "10"))
-# How many times a single market (city|date|kind) may be re-entered after a
-# THESIS BREAK stopped us out of an earlier bucket. 0 restores the old
-# behaviour (a dead position blocks the market for the rest of the day).
 GAMMA_MARKETS = "https://gamma-api.polymarket.com/markets"
 # USDC balance immediately BEFORE live trading began. Set this to capture P&L
 # from the very first live trade; otherwise the baseline is snapped on first read
@@ -70,23 +66,9 @@ RECHECK_SEC = float(os.getenv("WEATHER_RECHECK_SEC", "1200"))     # 20 min
 # is a different decision than entering; this only guards against overwriting
 # a good mark with a thin/stale outlier, not a fresh entry decision.
 MARK_MAX_SPREAD_C = float(os.getenv("WEATHER_MARK_MAX_SPREAD_C", "20"))
-# Shadow-only stop-loss threshold — logs what a "sell while there's still a
-# bid" rule would have salvaged, gates nothing. Deliberately keyed off mark_c
-# (the credible mark from _mark_open, already refuses a bid this far below the
-# ask), not the raw bid — a raw-bid rule would panic-sell into a stale, thin
-# quote on a position the market hasn't actually repriced (see _mark_open's
-# own docstring: a wide spread with a healthy ask is the OPPOSITE signature of
-# a real bust). No stored price history for past positions to backtest this
-# against directly, so it accumulates forward instead — see
-# scripts/stop_shadow_report.py once there's enough data to judge it.
-STOP_SHADOW_MARK_C = float(os.getenv("WEATHER_STOP_SHADOW_MARK_C", "50"))
 # Close once the market has converged this far. The edge is the convergence; the
 # last few cents carry the entire downside. 0 disables.
 TAKE_PROFIT_BID_C = float(os.getenv("WEATHER_TAKE_PROFIT_BID_C", "90"))
-# Keep taking profit AFTER the measurement window has closed? Default no: at
-# that point the extreme is fixed and selling below 100c gives away certain
-# money. Set true only to restore the old always-on behaviour.
-TP_AFTER_WINDOW = os.getenv("WEATHER_TP_AFTER_WINDOW", "false").strip().lower() == "true"
 # Take-profit exits default to the same FAK-at-1c sweep used for emergency
 # dead-bucket salvage, which is why Warsaw/Milan take-profits filled well
 # below their trigger bid (see the weather-lows-never-fill / FOK-vs-FAK
@@ -118,12 +100,6 @@ MIN_MAX_AGE_MIN = float(os.getenv("WEATHER_MIN_MAX_AGE_MIN", "120"))
 # real deaths; it only filters the conversion-rounding false alarms.
 DEAD_EXIT_BUFFER_DEG = float(os.getenv("WEATHER_DEAD_EXIT_BUFFER_DEG", "1.0"))
 
-# A dead position with a dry book (no bids anywhere) can't be sold no matter how
-# often we ask — Wuhan 2026-07-30 retried every refresh cycle for hours against
-# an empty book, spamming ~5 failed CLOB requests per attempt for nothing. Once
-# a sell attempt finds no bid, wait this long before trying again.
-DEAD_EXIT_RETRY_COOLDOWN_SEC = float(os.getenv("WEATHER_DEAD_EXIT_RETRY_COOLDOWN_SEC", "300"))
-
 
 class WeatherExecutor:
     # log prefix, so shared methods can name the venue they're running for
@@ -135,12 +111,6 @@ class WeatherExecutor:
     # control arm. Defaulting to 0 also means a missing or mistyped .env line
     # can only ever be a no-op, never a silent change to live trading behaviour.
     DECLINE_GATE_DEG = float(os.getenv("WEATHER_DECLINE_GATE_DEG", "0"))
-    # How many times a single market (city|date|kind) may be re-entered after a
-    # THESIS BREAK stopped us out of an earlier bucket. 0 disables re-entry —
-    # that's the base/Poly default; the Kalshi subclass overrides its own
-    # constant independently (see kalshi_weather_exec.py), the same
-    # per-venue-override pattern as DECLINE_GATE_DEG above.
-    MAX_REENTRIES = int(os.getenv("WEATHER_MAX_REENTRIES", "0"))
 
     def __init__(self, on_log=None):
         self.on_log = on_log or (lambda i, m: None)
@@ -169,13 +139,6 @@ class WeatherExecutor:
         # markets currently held back by the decline gate, so the "held" line
         # logs once per episode instead of every cycle {key: first_held_utc}
         self._decline_held = {}
-        # DIAGNOSTIC (2026-08-04): a persistent ENTER signal was observed
-        # never converting to a position or a miss record, with no way from
-        # the outside to see which early-return branch in _consider() was
-        # silently firing. Logs once per key (already date-scoped) so it
-        # doesn't spam every ~90s cycle a signal holds. Pure logging, no
-        # behavior change.
-        self._consider_block_logged = set()
         self._rehydrate()
 
     def _count_misses(self):
@@ -188,32 +151,10 @@ class WeatherExecutor:
             return 0
 
     # ── persistence ──────────────────────────────────────────────────────────
-    @staticmethod
-    def _pid(pos):
-        """Stable identity for a POSITION — distinct from pos["key"], which is
-        the MARKET it trades (city|date|kind) and can be shared by two
-        positions after a re-entry (see MAX_REENTRIES). Every position opened
-        from here on carries a real "pos_id"; records written before this
-        field existed fall back to the market key, which WAS a safe identity
-        then because only one open position per market could ever exist.
-
-        This function is the one place that decision lives — every place that
-        needs to tell positions apart (removing one from self.open, matching a
-        settle record back to the position it closes, rehydrating from the
-        ledger) must call this rather than reading pos["key"] directly. A NYC
-        low market held two positions overnight on 2026-07-27/28 (a dead
-        original plus a re-entry); with identity keyed on the market alone,
-        closing either one from a plain `p["key"] != pos["key"]` filter would
-        have silently dropped BOTH from self.open, and a restart's rehydrate
-        collapsed them to whichever "open" record came last in the file,
-        orphaning the other with no way to ever settle it.
-        """
-        return pos.get("pos_id") or pos["key"]
-
     def _rehydrate(self):
         if not POS_LOG.exists():
             return
-        by_id = {}
+        by_key = {}
         try:
             for line in POS_LOG.read_text().splitlines():
                 if not line.strip():
@@ -224,20 +165,9 @@ class WeatherExecutor:
                     if not BASELINE_ENV:
                         self._live_baseline = rec.get("live_baseline_usd")
                 elif rec.get("type") == "open":
-                    by_id[self._pid(rec)] = rec
-                elif rec.get("type") == "win_add" and self._pid(rec) in by_id:
-                    # Kalshi's _maximize_confirmed_win bought MORE of an
-                    # already-open position. Without this branch, a restart
-                    # would rebuild the position from its original "open"
-                    # record alone — silently reverting shares/cost_usd to
-                    # pre-add and losing the _win_adds count, letting the cap
-                    # be exceeded on the next add after every restart.
-                    pos = by_id[self._pid(rec)]
-                    pos["shares"] = round(pos.get("shares", 0.0) + rec.get("filled", 0.0), 6)
-                    pos["cost_usd"] = round(pos.get("cost_usd", 0.0) + rec.get("cost_usd", 0.0), 2)
-                    pos["_win_adds"] = rec.get("add_num", pos.get("_win_adds", 0))
-                elif rec.get("type") == "settle" and self._pid(rec) in by_id:
-                    pos = by_id.pop(self._pid(rec))
+                    by_key[rec["key"]] = rec
+                elif rec.get("type") == "settle" and rec.get("key") in by_key:
+                    pos = by_key.pop(rec["key"])
                     # backfill net/gross/fee for pre-fee-accounting settle records
                     gross = rec.get("gross_pnl")
                     if gross is None:
@@ -264,15 +194,15 @@ class WeatherExecutor:
                     self.session["realized_gross"] += gross
                     self.session["fees_paid"] += fee
         except Exception as e:  # noqa: BLE001
-            self.on_log("✗", f"[{self.LOG_TAG}] rehydrate failed: {e}")
+            self.on_log("✗", f"[weatherexec] rehydrate failed: {e}")
             return
-        self.open = list(by_id.values())
+        self.open = list(by_key.values())
         self.session["opened"] = self.session["settled"] + len(self.open)
         self.session["staked_usd"] = round(
             sum(p.get("cost_usd", 0.0) for p in self.open), 2)
         self.closed = self.closed[-200:]
         if self.open or self.closed:
-            self.on_log("→", f"[{self.LOG_TAG}] recovered {len(self.open)} open / "
+            self.on_log("→", f"[weatherexec] recovered {len(self.open)} open / "
                              f"{self.session['settled']} settled from {POS_LOG}")
 
     def _persist(self, rec):
@@ -286,11 +216,11 @@ class WeatherExecutor:
     def set_mode(self, mode):
         mode = (mode or "paper").lower()
         if mode == "live" and not ENV_ARMED:
-            self.on_log("!", f"[{self.LOG_TAG}] LIVE requested but WEATHER_LIVE!=true — staying PAPER")
+            self.on_log("!", "[weatherexec] LIVE requested but WEATHER_LIVE!=true — staying PAPER")
             mode = "paper"
         if mode != self.mode:
             self.mode = mode
-            self.on_log("◆", f"[{self.LOG_TAG}] mode → {mode.upper()}")
+            self.on_log("◆", f"[weatherexec] mode → {mode.upper()}")
 
     @property
     def is_live(self):
@@ -301,90 +231,13 @@ class WeatherExecutor:
         self._mark_open(rows)           # mark positions to market before anything else
         self._recheck_open(rows)        # is the thesis we bought on still true?
         self._watch_decline_confirm(rows)  # shadow-measure the wait-for-pullback rule
-        self._watch_stop_shadow(rows)   # shadow-measure a sell-while-there's-still-a-bid rule
         self._close_dead(rows)          # bail out of provably-lost buckets
         self._take_profit(rows)         # and out of ones the market already agrees with
-        self._maximize_confirmed_win(rows)  # and buy more of ones already DECIDED won
         for row in rows:
             entry = row.get("entry")
             if not entry:
                 continue
             self._consider(entry)
-
-    # ── maximize confirmed wins ──────────────────────────────────────────────
-    # Once the station's measurement window has closed (_window_closed) the
-    # daily extreme cannot change — only the settlement print is outstanding.
-    # If our own read already shows the position inside its bucket at that
-    # point, buying more below WIN_ADD_MAX_ASK_C is no longer a weather bet;
-    # it's a bet that the venue correctly processes data that already exists.
-    # Close to risk-free but not literally zero: METAR-vs-CLI has disagreed
-    # with our read 3 times this week (see _cli_crosscheck), always so far in
-    # a direction that would have helped, never hurt — but "so far" is 3
-    # cases. Capped in size (normal per-trade stake, never sized up) and count
-    # for that residual reason.
-    #
-    # Deliberately NOT applied to still-open positions that merely "look"
-    # confirmed: Atlanta 2026-07-26 entered on a 2° pullback and 97.7% model
-    # confidence — the strongest lock signal in the dataset — and still lost
-    # the full stake while the window was open. Only a closed window turns
-    # "looks decided" into "is decided".
-    #
-    # Verified empirically 2026-07-28 that this generalizes across venues:
-    # Kalshi's close_time trails local midnight by exactly 1h; Polymarket's
-    # Istanbul and London markets both stopped accepting orders ~42min after
-    # their own local midnight (closedTime vs station local-day rollover,
-    # checked against real settled markets) — so both venues keep trading
-    # open a while past the window closing, this is not Kalshi-specific.
-    MAXIMIZE_WINS = os.getenv("WEATHER_MAXIMIZE_WINS", "true").strip().lower() == "true"
-    MAX_WIN_ADDS = int(os.getenv("WEATHER_MAX_WIN_ADDS", "3"))
-    WIN_ADD_MAX_ASK_C = float(os.getenv("WEATHER_WIN_ADD_MAX_ASK_C", "97"))
-
-    def _maximize_confirmed_win(self, rows):
-        if not self.MAXIMIZE_WINS or not self.is_live:
-            return
-        by_key = {f"{r['city']}|{r['date']}|{r['kind']}": r for r in rows}
-        with self._lock:
-            open_pos = list(self.open)
-        for pos in open_pos:
-            if pos.get("dead_since"):
-                continue                        # DEAD-EXIT handles this side
-            row = by_key.get(pos["key"])
-            if not row or not self._window_closed(pos, row):
-                continue                        # still live — Atlanta proved
-                                                 # "looks confirmed" isn't; do not add
-            ext = row.get("ext_c")
-            if ext is None:
-                continue
-            r_ext = round(ext)
-            lo, hi = pos.get("lo"), pos.get("hi")
-            confirmed_win = (lo is None or r_ext >= lo) and (hi is None or r_ext <= hi)
-            if not confirmed_win:
-                continue                        # window closed but this is a LOSS
-            bucket = next((b for b in row.get("buckets", [])
-                           if b.get("label") == pos.get("label")), {})
-            ask_c = bucket.get("ask_c")
-            if ask_c is None or ask_c <= 0 or ask_c > self.WIN_ADD_MAX_ASK_C:
-                continue                        # no real edge left, or no live quote
-            adds = pos.get("_win_adds", 0)
-            if adds >= self.MAX_WIN_ADDS:
-                continue
-            shares = max(1, round(self.stake_usd / (ask_c / 100.0)))
-            filled, fill_c = self._place_live_fak(pos["token_yes"], ask_c, shares, pos.get("neg_risk"))
-            if filled <= 0:
-                continue
-            cost = round(filled * fill_c / 100.0 + self._entry_fee_usd(filled, fill_c), 2)
-            rec = {"type": "win_add", "key": pos["key"], "pos_id": self._pid(pos),
-                   "filled": filled, "fill_c": fill_c, "cost_usd": cost,
-                   "add_num": adds + 1, "ts": datetime.now(timezone.utc).isoformat()}
-            with self._lock:
-                pos["shares"] = round(pos.get("shares", 0.0) + filled, 6)
-                pos["cost_usd"] = round(pos.get("cost_usd", 0.0) + cost, 2)
-                pos["_win_adds"] = adds + 1
-                self.session["staked_usd"] = round(self.session["staked_usd"] + cost, 2)
-            self._persist(rec)
-            self.on_log("◆", f"[{self.LOG_TAG}] WIN-ADD {pos['city']} {pos['label']} — "
-                             f"+{filled:.2f} sh @ {fill_c:.0f}c (add {adds + 1}/"
-                             f"{self.MAX_WIN_ADDS}), outcome confirmed, window closed")
 
     # ── mark to market ───────────────────────────────────────────────────────
     def _mark_open(self, rows):
@@ -445,19 +298,6 @@ class WeatherExecutor:
             row = by_key.get(pos["key"])
             if not row:
                 continue
-            if not row.get("is_today"):
-                # The station has rolled to a NEW local day, but METAR only
-                # keeps one snapshot per station — the engine still returns a
-                # row for OUR (now stale) date, but its ext_c/ext_age_min are
-                # already tracking TOMORROW's fresh, unrelated reading. Without
-                # this guard, Philadelphia 2026-07-29 fired a false "lock
-                # BROKEN, exit window is NOW" on a position that was actually
-                # sitting at a 99c mark (near-certain win) — the diagnostic
-                # was comparing our bucket against a different day's weather.
-                # Settlement (poll()) and _maximize_confirmed_win take over
-                # once the window closes; this live-monitoring check has
-                # nothing correct left to say after that point.
-                continue
             kind = pos.get("kind", "high")
             ext, age = row.get("ext_c"), row.get("ext_age_min")
             bucket = next((b for b in row.get("buckets", [])
@@ -500,13 +340,13 @@ class WeatherExecutor:
             if broke and not was_broken:
                 # fire the moment it breaks — a bid may still exist right now
                 mk = pos.get("mark_c")
-                self.on_log("!", f"[{self.LOG_TAG}] ⚠ THESIS BREAK {pos['city']} {pos['label']}: "
+                self.on_log("!", f"[weatherexec] ⚠ THESIS BREAK {pos['city']} {pos['label']}: "
                                  f"{'; '.join(reasons)} | bid {mk if mk is not None else '?'}c "
                                  f"vs entry {pos['entry_c']:.0f}c — exit window is NOW, "
                                  f"dead-exit will be too late")
                 pos["_recheck_ts"] = now
             elif due:
-                self.on_log("→", f"[{self.LOG_TAG}] recheck {pos['city']} {pos['label']}: "
+                self.on_log("→", f"[weatherexec] recheck {pos['city']} {pos['label']}: "
                                  f"max {ext}° headroom {headroom if headroom is not None else '?'}° "
                                  f"| p {p_entry}→{health['p_now']} | "
                                  f"{'locked' if locked else 'UNLOCKED'} {health['age_min']}min "
@@ -532,60 +372,19 @@ class WeatherExecutor:
             row = by_key.get(pos["key"])
             if not row or row.get("ext_c") is None:
                 continue
-            if not row.get("is_today"):
-                # Same stale-row hazard as _recheck_open, but here it's not
-                # just a diagnostic — this method PLACES SELL ORDERS. Once the
-                # station has rolled to a new local day, row["ext_c"] tracks
-                # tomorrow's reading, not the outcome of THIS position. Selling
-                # a genuinely won bucket because a different day's temperature
-                # happened to fall outside our old bounds would be a real,
-                # live-money mistake, not a cosmetic one. Settlement (poll())
-                # and _maximize_confirmed_win own this position from here.
-                continue
             ext, lo, hi = row["ext_c"], pos.get("lo"), pos.get("hi")
             kind = pos.get("kind", "high")
-            # ── round to the grain the market actually settles on ────────────
-            # Bucket edges are whole degrees and so is the settlement number.
-            # Our observed extreme is NOT: US stations measure in °F, encode to
-            # °C-tenths for METAR, and we convert back — a round trip that lands
-            # on 71.96 or 82.04 where the true reading was 72 or 82. Comparing
-            # that raw value against an integer edge is a category error, and it
-            # sold three winners on 2026-07-25 (Dallas 98, Washington DC 82, San
-            # Francisco 71 — each settled EXACTLY at its ceiling per the NWS CLI
-            # product, which is where a few hundredths flips the decision).
-            # bucket_prob() has always rounded before doing its maths; this makes
-            # the exit agree with the model instead of contradicting it.
-            ext_s = round(ext)
             # >= not >: a clean 1-degree break (Shanghai, Mexico City, Atlanta —
-            # all genuine) must still trigger.
-            if kind == "high" and hi is not None and ext_s - hi >= DEAD_EXIT_BUFFER_DEG:
-                self._exit_dead(pos, row, f"max {ext_s}° (obs {ext:.2f}°) > bucket "
-                                          f"ceiling {hi}° "
+            # all genuine) must still trigger. Only a SUB-degree excess (the
+            # conversion-rounding false positives) gets filtered.
+            if kind == "high" and hi is not None and ext - hi >= DEAD_EXIT_BUFFER_DEG:
+                self._exit_dead(pos, row, f"max {ext:.1f}° > bucket ceiling {hi}° "
                                           f"(+{DEAD_EXIT_BUFFER_DEG}° buffer cleared)")
-            elif kind == "low" and lo is not None and lo - ext_s >= DEAD_EXIT_BUFFER_DEG:
-                self._exit_dead(pos, row, f"min {ext_s}° (obs {ext:.2f}°) < bucket "
-                                          f"floor {lo}° "
+            elif kind == "low" and lo is not None and lo - ext >= DEAD_EXIT_BUFFER_DEG:
+                self._exit_dead(pos, row, f"min {ext:.1f}° < bucket floor {lo}° "
                                           f"(-{DEAD_EXIT_BUFFER_DEG}° buffer cleared)")
 
     # ── take profit once the market has converged ────────────────────────────
-    @staticmethod
-    def _window_closed(pos, row):
-        """Has the station's local day moved past this market's date?
-
-        True means the daily extreme can no longer change — the market is
-        waiting only on the settlement source to publish. Defensive: an
-        unparseable or missing date returns False, so a bad read can never
-        silently disable take-profit on a live, still-uncertain position.
-        """
-        sld, mkt = row.get("station_local_date"), pos.get("date")
-        if not sld or not mkt:
-            return False
-        try:
-            return (datetime.fromisoformat(sld).date()
-                    > datetime.fromisoformat(mkt).date())
-        except (TypeError, ValueError):
-            return False
-
     def _take_profit(self, rows):
         """Close positions the market has already repriced to (near) certainty.
 
@@ -610,23 +409,6 @@ class WeatherExecutor:
             row = by_key.get(pos["key"])
             if not row:
                 continue
-            # ── the window has closed: stop discounting a risk that is gone ──
-            # Everything above assumes the outcome is still uncertain. Once the
-            # station's local day has rolled past this market's date, the
-            # extreme is FIXED and only the settlement print is outstanding —
-            # so every cent below 100 that we accept here is a pure giveaway.
-            # NYC 2026-07-27: window shut at midnight with the low locked at
-            # 68.0F inside a 67-68F bucket, and trading stayed open another
-            # hour with the bid at 88c. Selling would have handed over ~$0.90
-            # of a $1.25 win to avoid nothing at all.
-            if not TP_AFTER_WINDOW and self._window_closed(pos, row):
-                if not pos.get("_tp_window_logged"):
-                    pos["_tp_window_logged"] = True
-                    self.on_log("→", f"[{self.LOG_TAG}] TP off {pos['city']} "
-                                     f"{pos['label']} — measurement window closed "
-                                     f"({row.get('station_local_date')} > {pos['date']}); "
-                                     f"outcome fixed, holding to settlement")
-                continue
             bid = pos.get("mark_c")
             if bid is None or bid < TAKE_PROFIT_BID_C:
                 continue
@@ -642,21 +424,7 @@ class WeatherExecutor:
                         f"risks {risk:.0f}c to win {upside:.0f}c"))
 
     def _exit_dead(self, pos, row, reason):
-        """Sell out of a dead bucket (or write it off when nothing bids).
-
-        Stamp it dead FIRST. A daily extreme is monotonic, so once the reading
-        has passed the bucket this position can never recover — it is awaiting
-        settlement, not in play. When the sale fails for want of a bid it stays
-        in self.open, and without this stamp it goes on reserving the market
-        slot: NYC 2026-07-27 held a worthless 69–70°F low with no bid while the
-        67–68°F bucket showed a +27c edge on the same market, and the bot
-        silently skipped it for hours. See _consider.
-        """
-        retry_after = pos.get("_dead_retry_after")
-        if retry_after and datetime.now(timezone.utc) < datetime.fromisoformat(retry_after):
-            return
-        pos["dead_since"] = pos.get("dead_since") or datetime.now(timezone.utc).isoformat()
-        pos["dead_reason"] = reason
+        """Sell out of a dead bucket (or write it off when nothing bids)."""
         self._exit_position(pos, row, won=False, tag="DEAD-EXIT", reason=reason)
 
     def _exit_position(self, pos, row, won, tag, reason):
@@ -674,7 +442,7 @@ class WeatherExecutor:
         if pos.get("mode") == "live" and not self.is_live:
             if not pos.get("_exit_blocked"):
                 pos["_exit_blocked"] = True
-                self.on_log("!", f"[{self.LOG_TAG}] {tag} SKIPPED {pos['city']} {pos['label']} — "
+                self.on_log("!", f"[weatherexec] {tag} SKIPPED {pos['city']} {pos['label']} — "
                                  f"live position, executor is PAPER. Not booking a "
                                  f"simulated exit against real shares. Arm live to "
                                  f"sell, or close it manually. ({reason})")
@@ -695,17 +463,17 @@ class WeatherExecutor:
                     if sold <= 0:
                         n = pos["_tp_fok_misses"] = pos.get("_tp_fok_misses", 0) + 1
                         if n >= TAKE_PROFIT_FOK_MAX_MISSES:
-                            self.on_log("!", f"[{self.LOG_TAG}] TAKE-PROFIT FOK missed "
+                            self.on_log("!", f"[weatherexec] TAKE-PROFIT FOK missed "
                                              f"{pos['city']} {pos['label']} @ {bid_c:.0f}c "
                                              f"{n}x — falling back to FAK from here")
                         else:
-                            self.on_log("→", f"[{self.LOG_TAG}] TAKE-PROFIT FOK missed "
+                            self.on_log("→", f"[weatherexec] TAKE-PROFIT FOK missed "
                                              f"{pos['city']} {pos['label']} @ {bid_c:.0f}c "
                                              f"({n}/{TAKE_PROFIT_FOK_MAX_MISSES}) — holding for next check")
                         return               # position stays open, untouched
                 else:
                     if stuck and tag == "TAKE-PROFIT" and TAKE_PROFIT_FOK:
-                        self.on_log("→", f"[{self.LOG_TAG}] TAKE-PROFIT {pos['city']} "
+                        self.on_log("→", f"[weatherexec] TAKE-PROFIT {pos['city']} "
                                          f"{pos['label']} — using FAK (stuck after "
                                          f"{pos['_tp_fok_misses']} FOK misses)")
                     sold = client.place_sell_fok(pos["token_yes"], float(pos["shares"]),
@@ -718,7 +486,7 @@ class WeatherExecutor:
                 fill_c = getattr(client, "_last_fill_price_cents", None)
                 proceeds = round(real if real is not None else sold * bid_c / 100.0, 2)
             except Exception as e:  # noqa: BLE001
-                self.on_log("✗", f"[{self.LOG_TAG}] {tag} sell failed {pos['city']}: {e}")
+                self.on_log("✗", f"[weatherexec] {tag} sell failed {pos['city']}: {e}")
                 return                       # keep the position; retry next refresh
             if sold <= 0:
                 # A completely dry book (no bids anywhere) is not the same as
@@ -731,15 +499,9 @@ class WeatherExecutor:
                 # open — _close_dead / _take_profit will retry the sell next
                 # cycle, and poll()'s Gamma check is the final backstop if it
                 # never manages to sell before real settlement.
-                if tag == "DEAD-EXIT":
-                    pos["_dead_retry_after"] = (
-                        datetime.now(timezone.utc)
-                        + timedelta(seconds=DEAD_EXIT_RETRY_COOLDOWN_SEC)
-                    ).isoformat()
-                self.on_log("!", f"[{self.LOG_TAG}] {tag} {pos['city']} {pos['label']} — "
+                self.on_log("!", f"[weatherexec] {tag} {pos['city']} {pos['label']} — "
                                  f"sell found nothing to fill, still holding "
-                                 f"{pos['shares']:.2f} sh naked; retrying in "
-                                 f"{DEAD_EXIT_RETRY_COOLDOWN_SEC:.0f}s")
+                                 f"{pos['shares']:.2f} sh naked; retrying next cycle")
                 return
         else:
             sold = float(pos["shares"])          # paper: mark out at the bid
@@ -756,14 +518,14 @@ class WeatherExecutor:
             pos["_exit_sold_shares"] = pos.get("_exit_sold_shares", 0.0) + sold
             pos["_exit_proceeds_usd"] = round(pos.get("_exit_proceeds_usd", 0.0) + proceeds, 2)
             pos["shares"] = remaining
-            self.on_log("→", f"[{self.LOG_TAG}] {tag} {pos['city']} {pos['label']} — partial fill "
+            self.on_log("→", f"[weatherexec] {tag} {pos['city']} {pos['label']} — partial fill "
                              f"{sold:.2f} sh (${proceeds:.2f}); {remaining:.2f} sh still held, "
                              f"retrying next cycle")
             return                            # keep the position open for the remainder
         sold = pos.get("_exit_sold_shares", 0.0) + sold
         proceeds = round(pos.get("_exit_proceeds_usd", 0.0) + proceeds, 2)
         pnl = round(proceeds - pos.get("cost_usd", 0.0), 2)
-        rec = {"type": "settle", "key": pos["key"], "pos_id": self._pid(pos), "won": won,
+        rec = {"type": "settle", "key": pos["key"], "won": won,
                "mode": pos.get("mode"),
                "closed_early": True, "exit": tag, "reason": reason,
                "salvage_usd": proceeds, "sold_shares": round(sold, 6),
@@ -771,7 +533,7 @@ class WeatherExecutor:
                "gross_pnl": pnl, "fee_usd": 0.0, "pnl_usd": pnl,
                "settled": datetime.now(timezone.utc).isoformat()}
         with self._lock:
-            self.open = [p for p in self.open if self._pid(p) != self._pid(pos)]
+            self.open = [p for p in self.open if p["key"] != pos["key"]]
             self.closed.append({**pos, **rec})
             self.closed = self.closed[-200:]
             self.session["settled"] += 1
@@ -785,68 +547,29 @@ class WeatherExecutor:
                 max(0.0, self.session["staked_usd"] - pos.get("cost_usd", 0.0)), 2)
         self._persist(rec)
         self.on_log("✅" if pnl >= 0 else "✗",
-                    f"[{self.LOG_TAG}] {tag} {pos['city']} {pos['label']} — {reason}; "
+                    f"[weatherexec] {tag} {pos['city']} {pos['label']} — {reason}; "
                     f"got ${proceeds:.2f} of ${pos.get('cost_usd',0):.2f} ({pnl:+.2f})")
-
-    def _log_block(self, key, reason, detail=""):
-        """DIAGNOSTIC (2026-08-04, see __init__) — logs the first time a given
-        market is silently blocked from entry this way, so a persistent
-        ENTER signal that never converts to a position is explainable from
-        the outside instead of just disappearing into a bare `return`."""
-        tag = f"{key}|{reason}"
-        if tag in self._consider_block_logged:
-            return
-        self._consider_block_logged.add(tag)
-        self.on_log("→", f"[{self.LOG_TAG}] BLOCKED {key} — {reason}" +
-                         (f" ({detail})" if detail else ""))
 
     def _consider(self, entry):
         key = f"{entry['city']}|{entry['date']}|{entry.get('kind', 'high')}"
         with self._lock:
             if len(self.open) >= MAX_OPEN:
-                self._log_block(key, "max_open", f"{len(self.open)}/{MAX_OPEN}")
                 return
-            # ── one LIVE position per market, but a dead one frees the slot ──
-            # A position whose bucket the reading has already passed cannot
-            # recover (the daily extreme only moves one way). Letting it keep
-            # the market reserved cost us a real trade: NYC 2026-07-27 sat on a
-            # worthless 69–70°F low with no bid to sell into, while 67–68°F on
-            # the SAME market showed +27c. Only a still-live position blocks.
-            held = [p for p in self.open if p["key"] == key]
-            if any(not p.get("dead_since") for p in held):
-                self._log_block(key, "already_open_and_live")
+            if any(p["key"] == key for p in self.open):
                 return
-            # Closed positions still block — with one exception. A market we
-            # took profit on or that settled naturally is finished for the day;
-            # re-entering it would be double-dipping. A market we were stopped
-            # out of on a THESIS BREAK is a different bucket on a live market,
-            # which is exactly the case worth re-examining.
-            done = [c for c in self.closed if c.get("key") == key]
-            if any(c.get("exit") != "DEAD-EXIT" for c in done):
-                self._log_block(key, "already_closed_this_market_today",
-                               ",".join(c.get("exit", "?") for c in done))
-                return
-            # Cap replacements. Without this, a station falling through bucket
-            # after bucket would have us buy each one on the way down — the
-            # uncapped-re-entry mistake that stacked one arb 9 times and
-            # orphaned the legs. One replacement per market per day by default.
-            if len(held) + len(done) > self.MAX_REENTRIES:
-                self._log_block(key, "reentry_cap_exhausted",
-                               f"{len(held)+len(done)} used > {self.MAX_REENTRIES} allowed")
+            if any(c.get("key") == key for c in self.closed):
                 return
             # cooling down after repeated misses on this market? skip re-firing.
             until = self._cooldown_until.get(key, 0)
             if until and time.time() < until:
-                self._log_block(key, "cooling_down", f"until {until}")
                 return
             if until:  # window elapsed — clear it and give this key a fresh try
                 self._cooldown_until.pop(key, None)
                 self._miss_streak.pop(key, None)
         if not self._decline_gate_ok(entry):
-            return   # already logs its own "decline gate held" line
+            return
         ask_c = entry["ask_c"]
         if ask_c is None or ask_c <= 0:
-            self._log_block(key, "no_ask_quote", f"ask_c={ask_c}")
             return
         # Prefer the size the engine actually verified depth for on the real
         # book; fall back to stake/price only if the book wasn't confirmed.
@@ -867,7 +590,7 @@ class WeatherExecutor:
                 self._miss_streak[key] = n
                 if n >= MISS_COOLDOWN_AFTER:
                     self._cooldown_until[key] = time.time() + MISS_COOLDOWN_SEC
-                    self.on_log("!", f"[{self.LOG_TAG}] {key} cooling down "
+                    self.on_log("!", f"[weatherexec] {key} cooling down "
                                 f"{MISS_COOLDOWN_SEC // 60}min after {n} misses")
                 return
             shares, mode = filled, "live"
@@ -884,12 +607,7 @@ class WeatherExecutor:
         # ~5% of the reported profit). _entry_fee_usd is a no-op unless overridden.
         cost = round(shares * filled_c / 100.0 + self._entry_fee_usd(shares, filled_c), 2)
         pos = {
-            "type": "open",
-            # pos_id, not "key", is this position's identity — see _pid.
-            # "key" stays the MARKET (city|date|kind) it trades, unchanged and
-            # still what row-matching and the re-entry cap key off.
-            "pos_id": uuid.uuid4().hex,
-            "key": key, "mode": mode, "kind": entry.get("kind", "high"),
+            "type": "open", "key": key, "mode": mode, "kind": entry.get("kind", "high"),
             "city": entry["city"], "date": entry["date"], "station": entry["station"],
             "label": entry["label"], "condition_id": entry["condition_id"],
             "token_yes": entry["token_yes"], "slug": entry["slug"],
@@ -956,7 +674,7 @@ class WeatherExecutor:
             agree = max(ens["members_cold"], ens["members_warm"])
             ens_txt = (f" · gfs {agree}/{n} {side} "
                        f"{ens['bias_med_c']:+.1f}C")
-        self.on_log("◆", f"[{self.LOG_TAG}] {mode.upper()} ENTER {entry['city']} {entry['label']} "
+        self.on_log("◆", f"[weatherexec] {mode.upper()} ENTER {entry['city']} {entry['label']} "
                          f"@ {filled_c:.0f}c ×{shares} (p={entry['p']}, edge +{entry['edge_c']}c)"
                          f"{cond_txt}{ens_txt}")
 
@@ -1091,59 +809,10 @@ class WeatherExecutor:
                    "ts": datetime.now(timezone.utc).isoformat()}
             self._persist(rec)
             ask = bucket.get("ask_c")
-            self.on_log("→", f"[{self.LOG_TAG}] decline confirmed {pos['city']} "
+            self.on_log("→", f"[weatherexec] decline confirmed {pos['city']} "
                              f"{pos['label']} {mins:.0f}min after entry — waited "
                              f"entry would pay {ask if ask is not None else '—'}c "
                              f"vs our {pos.get('entry_c')}c")
-
-    def _watch_stop_shadow(self, rows):
-        """Shadow measurement: would selling once the CREDIBLE mark (not the
-        raw bid — see _mark_open) drops below STOP_SHADOW_MARK_C have salvaged
-        more than waiting for the arithmetic dead-exit?
-
-        Keyed off mark_c/mark_stale specifically so a temporarily wide, thin
-        book — which _mark_open already refuses to trust — can't fire this
-        either; the mark only moves when the book backs it up, same
-        protection take-profit already relies on. Fires once per position,
-        logs what we WOULD have sold at, takes no action and holds the real
-        position untouched. There's no stored historical price series to
-        backtest this against past losses directly, so it has to accumulate
-        forward — join these records against the eventual settle (same
-        pos_id) once there's enough of them; see scripts/stop_shadow_report.py.
-        """
-        if STOP_SHADOW_MARK_C <= 0:
-            return
-        by_key = {f"{r['city']}|{r['date']}|{r['kind']}": r for r in rows}
-        with self._lock:
-            open_pos = list(self.open)
-        for pos in open_pos:
-            if pos.get("_stop_shadow_logged"):
-                continue
-            if pos.get("mark_stale"):
-                continue
-            mark = pos.get("mark_c")
-            if mark is None or mark >= STOP_SHADOW_MARK_C:
-                continue
-            row = by_key.get(pos["key"])
-            if row is not None and not row.get("is_today"):
-                continue  # same stale-day hazard as _close_dead — don't log noise
-            pos["_stop_shadow_logged"] = True
-            opened = datetime.fromisoformat(pos["opened"])
-            mins = round((datetime.now(timezone.utc) - opened).total_seconds() / 60, 1)
-            would_salvage = round(pos["shares"] * mark / 100.0, 2)
-            rec = {"type": "stop_shadow", "pos_id": self._pid(pos), "key": pos["key"],
-                   "city": pos["city"], "kind": pos.get("kind", "high"),
-                   "label": pos.get("label"), "mode": pos.get("mode"),
-                   "entry_c": pos.get("entry_c"), "mark_c_at_trigger": mark,
-                   "shares": pos["shares"], "cost_usd": pos.get("cost_usd"),
-                   "would_salvage_usd": would_salvage,
-                   "minutes_after_entry": mins,
-                   "ts": datetime.now(timezone.utc).isoformat()}
-            self._persist(rec)
-            self.on_log("→", f"[{self.LOG_TAG}] STOP-SHADOW {pos['city']} {pos['label']} — "
-                             f"credible mark {mark:.0f}c < {STOP_SHADOW_MARK_C:.0f}c "
-                             f"{mins:.0f}min after entry; would salvage ${would_salvage:.2f} "
-                             f"of ${pos.get('cost_usd', 0):.2f} (not acted on)")
 
     def _place_live(self, token_id, ask_c, shares, neg_risk=None):
         """Place a live FOK buy. Returns (filled_shares, avg_fill_price_cents);
@@ -1156,27 +825,7 @@ class WeatherExecutor:
                                       neg_risk=neg_risk)
             return filled, getattr(client, "_last_fill_price_cents", None)
         except Exception as e:  # noqa: BLE001
-            self.on_log("✗", f"[{self.LOG_TAG}] live order failed: {e}")
-            return 0.0, None
-
-    def _place_live_fak(self, token_id, ask_c, shares, neg_risk=None):
-        """Place a live FAK buy — take whatever's available up to `shares`,
-        partial fill is a normal outcome, not a failure. Used by
-        _maximize_confirmed_win: that trade is already close to risk-free
-        (window closed, outcome confirmed), so grabbing 4 of 7 available
-        shares is still exactly as good a trade, just smaller — unlike a
-        fresh entry, where all-or-nothing (_place_live/FOK) is deliberate.
-        Base/Poly implementation; Kalshi overrides this to reuse _place_live,
-        because Kalshi's only live mechanism (IOC) is already FAK-shaped."""
-        try:
-            import polymarket
-            client = self._poly()
-            fee = polymarket.fetch_live_fee_bps(token_id) or 0
-            filled = client.place_fak(token_id, int(round(ask_c)), float(shares), fee,
-                                      neg_risk=neg_risk)
-            return filled, getattr(client, "_last_fill_price_cents", None)
-        except Exception as e:  # noqa: BLE001
-            self.on_log("✗", f"[{self.LOG_TAG}] live FAK order failed: {e}")
+            self.on_log("✗", f"[weatherexec] live order failed: {e}")
             return 0.0, None
 
     def _record_miss(self, entry, limit_c, shares):
@@ -1219,7 +868,7 @@ class WeatherExecutor:
         except Exception as e:  # noqa: BLE001
             log.warning("miss-log write failed: %s", e)
         g = f"gap {gap_c:+.1f}c" if gap_c is not None else "book gone"
-        self.on_log("!", f"[{self.LOG_TAG}] LIVE FOK missed {entry['city']} "
+        self.on_log("!", f"[weatherexec] LIVE FOK missed {entry['city']} "
                          f"{entry['label']} — limit {limit_c:.0f}c, now ask "
                          f"{'—' if now_ask is None else f'{now_ask:.0f}c'} ({g})")
 
@@ -1246,14 +895,14 @@ class WeatherExecutor:
                 BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
             usdc = int(bal.get("balance", 0)) / 1_000_000.0
         except Exception as e:  # noqa: BLE001
-            self.on_log("!", f"[{self.LOG_TAG}] account read failed: {e}")
+            self.on_log("!", f"[weatherexec] account read failed: {e}")
             return
         self._acct_ts = now
         if self._live_baseline is None:
             self._live_baseline = usdc
             self._persist({"type": "baseline", "live_baseline_usd": usdc,
                            "ts": datetime.now(timezone.utc).isoformat()})
-            self.on_log("◆", f"[{self.LOG_TAG}] live USDC baseline set = ${usdc:.2f}")
+            self.on_log("◆", f"[weatherexec] live USDC baseline set = ${usdc:.2f}")
         with self._lock:
             live = [p for p in self.open if p.get("mode") == "live"]
             open_cost = sum(p.get("cost_usd", 0.0) for p in live)
@@ -1311,7 +960,7 @@ class WeatherExecutor:
                 r.raise_for_status()
                 trades = r.json()
             except Exception as e:  # noqa: BLE001
-                self.on_log("!", f"[{self.LOG_TAG}] manual-close check failed "
+                self.on_log("!", f"[weatherexec] manual-close check failed "
                                  f"{pos['city']}: {e}")
                 continue
             opened_ts = datetime.fromisoformat(pos["opened"]).timestamp()
@@ -1323,38 +972,16 @@ class WeatherExecutor:
                 continue        # dust with no matching sell — leave it, don't guess
             pnl = round(proceeds - pos.get("cost_usd", 0.0), 2)
             avg_sold_c = round(proceeds / sold_shares * 100.0, 2) if sold_shares else None
-            # This label is INFERRED, not observed — all we directly know is that
-            # real shares vanished and real USDC arrived; WHY is a guess from the
-            # price. A sale at/above our own take-profit threshold is almost
-            # certainly our own TAKE-PROFIT order firing correctly on-chain while
-            # the code path that was supposed to record it as such errored out
-            # before writing the settle record (Shenzhen 2026-07-28: sold at 96c
-            # against a 90c threshold, in the same minute as a run of "not enough
-            # balance" order failures — the price match is too exact to be
-            # coincidence, and there was no human at the keyboard). Below that
-            # threshold there's no such signature to go on, so it stays
-            # MANUAL-CLOSE — genuinely unexplained, not necessarily a person.
-            if avg_sold_c is not None and avg_sold_c >= TAKE_PROFIT_BID_C:
-                exit_tag = "TAKE-PROFIT"
-                reason = (f"reconciled from real Polymarket trade history — sold at "
-                          f"{avg_sold_c:.0f}c, at/above our {TAKE_PROFIT_BID_C:.0f}c "
-                          f"take-profit threshold; almost certainly our own order "
-                          f"whose settle record failed to write, not a manual close")
-            else:
-                exit_tag = "MANUAL-CLOSE"
-                sold_txt = f"sold at {avg_sold_c:.0f}c" if avg_sold_c is not None else "sold"
-                reason = (f"reconciled from real Polymarket trade history — {sold_txt}, "
-                          f"below our take-profit threshold; genuinely unexplained by "
-                          f"our own strategy logic (could still be a dead-exit we also "
-                          f"failed to record, not necessarily a person)")
-            rec = {"type": "settle", "key": pos["key"], "pos_id": self._pid(pos), "won": pnl >= 0,
+            rec = {"type": "settle", "key": pos["key"], "won": pnl >= 0,
                    "mode": pos.get("mode"),
-                   "closed_early": True, "exit": exit_tag, "reason": reason,
+                   "closed_early": True, "exit": "MANUAL-CLOSE",
+                   "reason": "closed manually outside the bot; reconciled from "
+                             "real Polymarket trade history",
                    "salvage_usd": proceeds, "sold_shares": sold_shares,
                    "sold_at_c": avg_sold_c, "gross_pnl": pnl, "fee_usd": 0.0,
                    "pnl_usd": pnl, "settled": datetime.now(timezone.utc).isoformat()}
             with self._lock:
-                self.open = [p for p in self.open if self._pid(p) != self._pid(pos)]
+                self.open = [p for p in self.open if p["key"] != pos["key"]]
                 self.closed.append({**pos, **rec})
                 self.closed = self.closed[-200:]
                 self.session["settled"] += 1
@@ -1366,9 +993,8 @@ class WeatherExecutor:
                     max(0.0, self.session["staked_usd"] - pos.get("cost_usd", 0.0)), 2)
             self._persist(rec)
             self.on_log("✅" if pnl >= 0 else "✗",
-                        f"[{self.LOG_TAG}] {exit_tag} (reconciled) {pos['city']} "
-                        f"{pos['label']} — got ${proceeds:.2f} of "
-                        f"${pos.get('cost_usd',0):.2f} ({pnl:+.2f})")
+                        f"[weatherexec] MANUAL-CLOSE {pos['city']} {pos['label']} — "
+                        f"got ${proceeds:.2f} of ${pos.get('cost_usd',0):.2f} ({pnl:+.2f})")
 
     # ── settlement (poll Gamma for resolutions) ──────────────────────────────
     def poll(self):
@@ -1389,7 +1015,7 @@ class WeatherExecutor:
             r.raise_for_status()
             markets = {m.get("conditionId"): m for m in r.json()}
         except Exception as e:  # noqa: BLE001
-            self.on_log("!", f"[{self.LOG_TAG}] settle poll failed: {e}")
+            self.on_log("!", f"[weatherexec] settle poll failed: {e}")
             return
         for pos in open_pos:
             m = markets.get(pos.get("condition_id"))
@@ -1411,12 +1037,12 @@ class WeatherExecutor:
             # -$7.89 recorded vs -$7.80 true, Chicago -$7.82 vs -$7.68 true).
             fee = 0.0
             net = round(gross - fee, 2)
-            rec = {"type": "settle", "key": pos["key"], "pos_id": self._pid(pos), "won": won,
+            rec = {"type": "settle", "key": pos["key"], "won": won,
                    "mode": pos.get("mode"),
                    "gross_pnl": gross, "fee_usd": fee, "pnl_usd": net,
                    "settled": datetime.now(timezone.utc).isoformat()}
             with self._lock:
-                self.open = [p for p in self.open if self._pid(p) != self._pid(pos)]
+                self.open = [p for p in self.open if p["key"] != pos["key"]]
                 self.closed.append({**pos, **rec})
                 self.closed = self.closed[-200:]
                 self.session["settled"] += 1
@@ -1429,7 +1055,7 @@ class WeatherExecutor:
                     max(0.0, self.session["staked_usd"] - pos.get("cost_usd", 0.0)), 2)
             self._persist(rec)
             self.on_log("✅" if won else "✗",
-                        f"[{self.LOG_TAG}] SETTLE {pos['city']} {pos['date']} {pos['label']} "
+                        f"[weatherexec] SETTLE {pos['city']} {pos['date']} {pos['label']} "
                         f"{'WIN' if won else 'LOSS'} net {net:+.2f} USD (gross {gross:+.2f} − fee {fee:.2f}, "
                         f"model p was {pos['model_p']})")
 

@@ -326,11 +326,6 @@ class WeatherEngine:
             "date": e["date"].isoformat() if e["date"] else None,
             "station": icao, "source": e["source"], "slug": e["slug"],
             "tradeable": tradeable, "is_today": is_today,
-            # the station's CURRENT local date. Once this is past the market's
-            # date the measurement window has closed and the outcome is fixed —
-            # see weather_exec._take_profit, which stops selling at a discount
-            # to a risk that no longer exists.
-            "station_local_date": (st or {}).get("local_date"),
             "local_hour": round(st["local_hour"], 2) if st else None,
             "temp_c": temp_now,          # value shown "now" in the market's unit
             "ext_c": ext,                # observed extreme in the market's unit

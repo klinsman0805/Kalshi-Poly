@@ -1,0 +1,2 @@
+7 3 * * * cd /opt/kalshi-poly && /opt/kalshi-poly/venv/bin/python scripts/climo_backtest.py --append --out climo_backtest_results.jsonl >> climo_backtest.log 2>&1
+15 0 * * * /opt/kalshi-poly/scripts/daily_lp_check.sh >> /opt/kalshi-poly/daily_lp_check.log 2>&1
