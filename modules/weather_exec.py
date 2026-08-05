@@ -16,6 +16,7 @@ forward-test is calibrated (target: n ≥ 100 settlements, win rate within a
 few points of model p).
 """
 
+import functools
 import json
 import logging
 import os
@@ -123,6 +124,56 @@ DEAD_EXIT_BUFFER_DEG = float(os.getenv("WEATHER_DEAD_EXIT_BUFFER_DEG", "1.0"))
 # an empty book, spamming ~5 failed CLOB requests per attempt for nothing. Once
 # a sell attempt finds no bid, wait this long before trying again.
 DEAD_EXIT_RETRY_COOLDOWN_SEC = float(os.getenv("WEATHER_DEAD_EXIT_RETRY_COOLDOWN_SEC", "300"))
+
+# ── graceful shutdown ────────────────────────────────────────────────────────
+# systemd sends SIGTERM on restart/stop and the process dies wherever it stands.
+# The window that matters is between an order EXECUTING at the exchange and its
+# record reaching the ledger: the fill is real, nothing on disk knows it, and
+# _rehydrate — which trusts the ledger absolutely and never asks the exchange
+# what we hold — would never see that position again. It would sit unmanaged
+# forever, never marked, never exited, never settled.
+#
+# So: order-placing methods run under @_uninterruptible, which counts them in
+# flight, and begin_shutdown() stops new activity and then waits for any
+# already-running one to reach its _persist before the process exits.
+_shutdown = threading.Event()
+_inflight = threading.Condition()
+_inflight_n = 0
+
+
+def _uninterruptible(fn):
+    """Mark fn as an order→ledger critical section that shutdown must wait for."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        global _inflight_n
+        with _inflight:
+            _inflight_n += 1
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            with _inflight:
+                _inflight_n -= 1
+                _inflight.notify_all()
+    return wrapper
+
+
+def shutting_down():
+    return _shutdown.is_set()
+
+
+def begin_shutdown(timeout=30.0):
+    """Stop starting new order activity, then wait for in-flight orders to land.
+
+    Returns True if everything drained, False if the timeout expired with an
+    order still in flight — in which case the caller should log loudly, because
+    that is exactly the case that can orphan a position.
+    """
+    _shutdown.set()
+    deadline = time.time() + timeout
+    with _inflight:
+        while _inflight_n > 0 and time.time() < deadline:
+            _inflight.wait(0.5)
+        return _inflight_n == 0
 
 
 class WeatherExecutor:
@@ -275,6 +326,87 @@ class WeatherExecutor:
             self.on_log("→", f"[{self.LOG_TAG}] recovered {len(self.open)} open / "
                              f"{self.session['settled']} settled from {POS_LOG}")
 
+    def reconcile_against_exchange(self, positions):
+        """Compare exchange truth against the rehydrated ledger.
+
+        _rehydrate trusts the ledger absolutely — it reconstructs from the
+        journal and never asks the venue what we actually hold. That is fine
+        until a process dies between a fill and its ledger write; after that the
+        ledger is quietly wrong and nothing downstream can notice.
+
+        Takes the position list rather than fetching it, so this stays pure and
+        testable and the caller owns the API cost (same shape as
+        poly_rewards_supervisor.reconcile). Returns {"orphans", "ghosts", "ok"}.
+
+        REPORTS ONLY — never mutates self.open. An orphan is real money in a
+        market nothing is managing; a ghost is a position the ledger still
+        believes in. Both want a human decision, not an automatic trade.
+        """
+        # Paper positions have no on-chain existence, so comparing them against
+        # the exchange would flag every one of them as a ghost.
+        live = [p for p in self.open if p.get("mode") == "live"]
+        ledger_tokens = {str(p.get("token_yes")) for p in live if p.get("token_yes")}
+
+        exchange_tokens, orphans = set(), []
+        for p in positions or []:
+            # Only weather is this executor's to explain. The two-leg LP
+            # strategy also trades temperature markets from the same wallet —
+            # if it is ever armed, its holdings will surface here as orphans.
+            if "temperature" not in (p.get("title") or "").lower():
+                continue
+            token = str(p.get("asset") or p.get("token_id") or "")
+            if not token:
+                continue
+            exchange_tokens.add(token)
+            if token not in ledger_tokens:
+                orphans.append(p)
+
+        ghosts = [p for p in live if str(p.get("token_yes")) not in exchange_tokens]
+        return {"orphans": orphans, "ghosts": ghosts,
+                "ok": not orphans and not ghosts}
+
+    def fetch_exchange_positions(self):
+        """Open positions for this executor's wallet, or None if unavailable.
+
+        None means "could not check" and is deliberately distinct from [] —
+        an empty list would otherwise read as "you hold nothing" and turn every
+        real open position into a ghost.
+        """
+        try:
+            client = self._poly()
+            r = requests.get("https://data-api.polymarket.com/positions",
+                             params={"user": client._funder, "sizeThreshold": 0.9},
+                             headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+            r.raise_for_status()
+            return [p for p in r.json() if not p.get("redeemable")]
+        except Exception as e:  # noqa: BLE001
+            log.warning("[%s] position fetch failed: %s", self.LOG_TAG, e)
+            return None
+
+    def reconcile_on_start(self):
+        """Fetch exchange state and log any divergence from the ledger."""
+        if not self.is_live:
+            return None
+        positions = self.fetch_exchange_positions()
+        if positions is None:
+            self.on_log("!", f"[{self.LOG_TAG}] startup reconcile SKIPPED — could not "
+                             f"reach the exchange. Ledger state is unverified.")
+            return None
+        result = self.reconcile_against_exchange(positions)
+        if result["ok"]:
+            self.on_log("→", f"[{self.LOG_TAG}] reconcile OK — {len(self.open)} ledger "
+                             f"position(s) match the exchange")
+            return result
+        for p in result["orphans"]:
+            self.on_log("✗", f"[{self.LOG_TAG}] ORPHAN {p.get('title')} "
+                             f"size={p.get('size')} — held on the exchange, NOT in the "
+                             f"ledger. Nothing is managing it: no mark, no exit, no settle.")
+        for p in result["ghosts"]:
+            self.on_log("✗", f"[{self.LOG_TAG}] GHOST {p.get('city')} {p.get('date')} "
+                             f"{p.get('label')} — ledger holds it, exchange does not "
+                             f"(sold or settled without the ledger seeing it).")
+        return result
+
     def _persist(self, rec):
         try:
             with open(POS_LOG, "a") as f:
@@ -298,6 +430,11 @@ class WeatherExecutor:
 
     # ── entries (called by WeatherEngine.refresh) ────────────────────────────
     def on_refresh(self, rows):
+        # Draining for shutdown: start nothing new. Orders already in flight are
+        # protected by @_uninterruptible and will finish; this just stops the
+        # poll loop opening a fresh one into a process that is about to exit.
+        if shutting_down():
+            return
         self._mark_open(rows)           # mark positions to market before anything else
         self._recheck_open(rows)        # is the thesis we bought on still true?
         self._watch_decline_confirm(rows)  # shadow-measure the wait-for-pullback rule
@@ -339,6 +476,7 @@ class WeatherExecutor:
     MAX_WIN_ADDS = int(os.getenv("WEATHER_MAX_WIN_ADDS", "3"))
     WIN_ADD_MAX_ASK_C = float(os.getenv("WEATHER_WIN_ADD_MAX_ASK_C", "97"))
 
+    @_uninterruptible
     def _maximize_confirmed_win(self, rows):
         if not self.MAXIMIZE_WINS or not self.is_live:
             return
@@ -659,6 +797,7 @@ class WeatherExecutor:
         pos["dead_reason"] = reason
         self._exit_position(pos, row, won=False, tag="DEAD-EXIT", reason=reason)
 
+    @_uninterruptible
     def _exit_position(self, pos, row, won, tag, reason):
         """Shared exit: sell into whatever bids exist and book the REAL proceeds."""
         bucket = next((b for b in row.get("buckets", [])
@@ -800,6 +939,7 @@ class WeatherExecutor:
         self.on_log("→", f"[{self.LOG_TAG}] BLOCKED {key} — {reason}" +
                          (f" ({detail})" if detail else ""))
 
+    @_uninterruptible
     def _consider(self, entry):
         key = f"{entry['city']}|{entry['date']}|{entry.get('kind', 'high')}"
         with self._lock:

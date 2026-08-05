@@ -19,6 +19,7 @@ Env:  KALSHI_WEATHER_STAKE_USD (default 8), KALSHI_WEATHER_CITIES (csv, optional
 """
 
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -53,8 +54,10 @@ os.environ.pop("WEATHER_LIVE_BASELINE_USD", None)   # no Polymarket live baselin
 from feeds.metar import MetarFeed                                # noqa: E402
 from modules.kalshi_weather_exec import KalshiWeatherExecutor    # noqa: E402
 from modules.kalshi_weather import KalshiWeatherEngine           # noqa: E402
+from modules import weather_exec as weather_exec_mod             # noqa: E402
 
 REFRESH_SEC = int(os.getenv("WEATHER_REFRESH_SEC", "60"))
+SHUTDOWN_DRAIN_SEC = float(os.getenv("SHUTDOWN_DRAIN_SEC", "30"))
 SETTLE_EVERY = 300
 # Snapshot the engine+executor state here each cycle so the (separate) dashboard
 # process can render a Kalshi tab without running its own engine. Atomic write.
@@ -92,6 +95,23 @@ def main():
     _log("◆" if not execu.is_live else "🔴",
          f"Kalshi forward-test up — mode={mode_txt} · stake ${execu.stake_usd} · "
          f"cities={cities or 'all-with-climo'} · ledger={os.environ['WEATHER_EXEC_LOG']}")
+
+    # This process places REAL Kalshi orders whenever KALSHI_WEATHER_LIVE is set,
+    # regardless of the "paper" in its name and its unit file. So it needs the
+    # same SIGTERM drain as the Polymarket bot: without it a restart can kill it
+    # between a fill and its ledger write, orphaning the position.
+    def _on_sigterm(signum, frame):
+        _log("◆", "SIGTERM — draining in-flight orders")
+        if weather_exec_mod.begin_shutdown(timeout=SHUTDOWN_DRAIN_SEC):
+            _log("→", "drained cleanly, exiting")
+        else:
+            _log("✗", f"SHUTDOWN TIMEOUT after {SHUTDOWN_DRAIN_SEC}s with an order STILL "
+                      f"IN FLIGHT — a fill may be unrecorded; reconcile before resuming")
+        _write_state(engine, execu)
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    signal.signal(signal.SIGINT, _on_sigterm)
 
     last_settle = 0.0
     while True:

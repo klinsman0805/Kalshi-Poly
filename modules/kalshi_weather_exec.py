@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 
 import requests
 
-from modules.weather_exec import WeatherExecutor
+from modules.weather_exec import WeatherExecutor, _uninterruptible
 from feeds import kalshi_order
 from feeds.kalshi_stations import KALSHI_STATIONS
 from feeds.kalshi_weather import taker_fee_c as kalshi_taker_fee_c
@@ -56,6 +56,13 @@ class KalshiWeatherExecutor(WeatherExecutor):
     @property
     def is_live(self):
         return self.mode == "live" and KALSHI_ENV_ARMED
+
+    def fetch_exchange_positions(self):
+        # The inherited implementation queries Polymarket's data API against a
+        # Polymarket wallet — wrong exchange, wrong account. "Could not check" is
+        # the only honest answer until a Kalshi /portfolio/positions equivalent
+        # is wired up; returning [] would make every real position look like a ghost.
+        return None
 
     def _place_live(self, token_id, ask_c, shares, neg_risk=None):
         """Live buy via Kalshi IOC. token_id is the market ticker (that's what
@@ -288,6 +295,7 @@ class KalshiWeatherExecutor(WeatherExecutor):
                                  f"{pos['label']} — NWS actual {kind}={actual_extreme}F "
                                  f"agrees with our read")
 
+    @_uninterruptible
     def _exit_position(self, pos, row, won, tag, reason):
         """Mirror of WeatherExecutor._exit_position, Kalshi sell path (single
         IOC sweep — no FOK/FAK distinction to make, see module docstring)."""

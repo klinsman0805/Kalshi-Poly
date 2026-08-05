@@ -10,6 +10,7 @@ Run:  python app.py     →  http://localhost:5001
 import json
 import os
 import queue
+import signal
 import threading
 import time
 from datetime import datetime, timezone
@@ -34,6 +35,7 @@ except ImportError:
 import engine
 from feeds.metar import MetarFeed
 from modules.weather import WeatherEngine
+from modules import weather_exec as weather_exec_mod
 from modules.weather_exec import WeatherExecutor
 from modules import client_chat
 
@@ -75,6 +77,10 @@ _weather = WeatherEngine(_metar, executor=_weather_exec)
 _weather_thread = None
 _weather_stop = threading.Event()
 WEATHER_REFRESH_SEC = int(os.getenv("WEATHER_REFRESH_SEC", "60"))
+# How long SIGTERM waits for an in-flight order to reach the ledger before
+# giving up and exiting anyway. Must stay below the unit's TimeoutStopSec, or
+# systemd SIGKILLs us mid-drain and the wait bought nothing.
+SHUTDOWN_DRAIN_SEC = float(os.getenv("SHUTDOWN_DRAIN_SEC", "30"))
 
 BOT_STATE = {
     "status": "stopped",
@@ -122,6 +128,12 @@ def _on_status(status):
 
 # ── Weather poll loop (Polymarket temp markets + METAR) ───────────────────────
 def _weather_loop():
+    # Runs here, not in _start_bot, so a slow or hung exchange call cannot stall
+    # startup — and so it happens after the ledger has been rehydrated.
+    try:
+        _weather_exec.reconcile_on_start()
+    except Exception as e:  # noqa: BLE001
+        _add_log("✗", f"startup reconcile error: {e}")
     settle_every, last_settle = 300, 0.0
     while not _weather_stop.is_set():
         try:
@@ -371,6 +383,27 @@ if __name__ == "__main__":
     print(f"  Dashboard → http://{'localhost' if host == '0.0.0.0' else host}:{port}")
     print(f"  Kalshi WS creds: {'found' if creds_ok else 'MISSING (ticker-only data)'}")
     print("=" * 60 + "\n")
+
+    # systemd sends SIGTERM on restart/stop. Without this the process dies
+    # wherever it stands — including with a live order in flight, which orphans
+    # the fill (see the graceful-shutdown block in modules/weather_exec.py).
+    def _on_sigterm(signum, frame):
+        _add_log("◆", "SIGTERM — draining in-flight orders")
+        drained = weather_exec_mod.begin_shutdown(timeout=SHUTDOWN_DRAIN_SEC)
+        if drained:
+            _add_log("→", "drained cleanly, exiting")
+        else:
+            # Deliberately loud: this is the case that can leave a filled
+            # position with no ledger record. Reconcile before trusting state.
+            log_msg = (f"SHUTDOWN TIMEOUT after {SHUTDOWN_DRAIN_SEC}s with an order "
+                       f"STILL IN FLIGHT — a fill may be unrecorded. Run the startup "
+                       f"reconcile and check the exchange before resuming.")
+            _add_log("✗", log_msg)
+            logging.getLogger("app").error(log_msg)
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    signal.signal(signal.SIGINT, _on_sigterm)
 
     _start_bot()
 

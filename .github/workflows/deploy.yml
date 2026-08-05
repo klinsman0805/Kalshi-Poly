@@ -1,8 +1,15 @@
 name: Deploy to VPS
 
+# Manual trigger only. The droplet runs live trading with real money; a deploy
+# restarts those processes mid-session, so it is a decision someone makes on
+# purpose, not a side effect of merging to main.
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
+    inputs:
+      restart:
+        description: "Restart the trading services after updating code"
+        type: boolean
+        default: true
 
 jobs:
   deploy:
@@ -14,11 +21,48 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
+          command_timeout: 10m
           script: |
-            set -e
-            cd ~/kalshi-bot
-            git pull origin main
-            source venv/bin/activate
-            pip install -r requirements.txt -q
-            systemctl restart kalshi-bot
+            set -euo pipefail
+            cd /opt/kalshi-poly
+
+            test -f .env || { echo "FATAL: .env missing — refusing to deploy"; exit 1; }
+
+            BEFORE=$(git rev-parse HEAD)
+            git fetch --prune origin main
+            AFTER=$(git rev-parse origin/main)
+
+            # --hard is safe here and --merge is not: ledgers, .env and *_state.json
+            # are gitignored, so they are untracked as far as git is concerned and
+            # reset never touches them. What it does guarantee is that the droplet
+            # ends up byte-identical to origin/main instead of in some half-merged
+            # state nobody can reproduce.
+            git reset --hard "$AFTER"
+
+            # Only reinstall when the manifest actually changed. This box is 512MB
+            # with no swap; an unnecessary pip run can OOM the live bot.
+            if ! git diff --quiet "$BEFORE" "$AFTER" -- requirements.txt; then
+              echo "requirements.txt changed — installing"
+              ./venv/bin/pip install -r requirements.txt -q
+            else
+              echo "requirements.txt unchanged — skipping pip"
+            fi
+
+            # Catch a syntax error now, while the old code is still running, rather
+            # than discovering it from a crash-looping unit after the restart.
+            ./venv/bin/python -m compileall -q app.py modules scripts feeds
+
+            if [ "${{ inputs.restart }}" = "true" ]; then
+              # Each unit has TimeoutStopSec covering the SIGTERM order drain in
+              # weather_exec.begin_shutdown, so restart waits for any in-flight
+              # order to reach the ledger before the process dies.
+              systemctl restart kalshi-bot kalshi-paper poly-rewards
+              sleep 10
+              systemctl is-active --quiet kalshi-bot   || { echo "kalshi-bot FAILED";   journalctl -u kalshi-bot   -n 40 --no-pager; exit 1; }
+              systemctl is-active --quiet kalshi-paper || { echo "kalshi-paper FAILED"; journalctl -u kalshi-paper -n 40 --no-pager; exit 1; }
+              systemctl is-active --quiet poly-rewards || { echo "poly-rewards FAILED"; journalctl -u poly-rewards -n 40 --no-pager; exit 1; }
+            else
+              echo "restart=false — code updated, services left running the OLD code"
+            fi
+
             echo "Deploy complete — $(git log -1 --format='%h %s')"

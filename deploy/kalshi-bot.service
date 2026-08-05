@@ -10,6 +10,10 @@ WorkingDirectory=/opt/kalshi-poly
 # .env is read by load_dotenv() in app.py, not by systemd — systemd's parser is
 # stricter about quoting and would fail the unit on a file python-dotenv accepts.
 ExecStart=/opt/kalshi-poly/venv/bin/python app.py
+# SIGTERM triggers weather_exec.begin_shutdown, which waits up to
+# SHUTDOWN_DRAIN_SEC (default 30) for an in-flight order to reach the ledger.
+# This must stay comfortably above it, or systemd SIGKILLs us mid-drain.
+TimeoutStopSec=45
 Restart=always
 RestartSec=15
 Environment=PYTHONUNBUFFERED=1

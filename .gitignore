@@ -8,6 +8,10 @@ positions.json
 *.jsonl
 arb_trades.csv
 *.log
+# Live position state, rewritten continuously by the running bots. Tracking
+# these means every deploy starts from a dirty tree and every pull is a
+# potential merge conflict against real open positions.
+*_state.json
 __pycache__/
 *.pyc
 .pytest_cache/

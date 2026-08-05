@@ -10,6 +10,10 @@ WorkingDirectory=/opt/kalshi-poly
 # Paper-only by construction: the runner forces WEATHER_LIVE=false before the
 # executor imports, and asserts is_live is false at startup. Places no orders.
 ExecStart=/opt/kalshi-poly/venv/bin/python scripts/run_kalshi_paper.py
+# SIGTERM triggers weather_exec.begin_shutdown, which waits up to
+# SHUTDOWN_DRAIN_SEC (default 30) for an in-flight order to reach the ledger.
+# This must stay comfortably above it, or systemd SIGKILLs us mid-drain.
+TimeoutStopSec=45
 Restart=always
 RestartSec=15
 Environment=PYTHONUNBUFFERED=1
