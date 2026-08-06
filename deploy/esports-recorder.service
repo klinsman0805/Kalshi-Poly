@@ -1,0 +1,33 @@
+[Unit]
+Description=LoL esports Phase-0 recorder — passive data capture, PLACES NO ORDERS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/kalshi-poly
+# Read-only by construction: scripts/record_esports.py imports only
+# feeds/poly_esports.py and feeds/riot_livestats.py, neither of which can place
+# an order — there is no CLOB client, no wallet, and no private key on any path
+# reachable from here. Unlike kalshi-paper, that claim is checkable: grep the
+# two feed modules for a signer and you will not find one.
+ExecStart=/opt/kalshi-poly/venv/bin/python scripts/record_esports.py
+Restart=always
+RestartSec=20
+Environment=PYTHONUNBUFFERED=1
+Environment=ESPORTS_RECORD_LOG=/opt/kalshi-poly/esports_data/esports_frames.jsonl
+Environment=ESPORTS_RECORD_STATE=/opt/kalshi-poly/esports_data/esports_recorder_state.json
+# This box runs live trading with ~95MB headroom. The recorder is the least
+# important process on it, so cap it and make the OOM killer pick it FIRST —
+# losing research data is survivable, losing the live bot is not.
+MemoryHigh=90M
+MemoryMax=120M
+OOMScoreAdjust=500
+# Nothing in flight to drain; the loop exits at the end of its current cycle.
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

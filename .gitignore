@@ -23,6 +23,10 @@ venv/
 # Weather climatology (regenerate with scripts/build_weather_climo.py)
 data/weather_climo.json
 
+# Esports Phase-0 capture. Grows continuously and is raw observation, not
+# source — the analysis scripts that consume it are what belong in git.
+esports_data/
+
 # Belt-and-suspenders: ignore any .env variant (backups etc.)
 .env*
 *.pid
