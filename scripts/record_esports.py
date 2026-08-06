@@ -114,10 +114,26 @@ def _pair_match(poly_teams, riot_teams):
             (_team_match(p1, r2) and _team_match(p2, r1)))
 
 
+def _path_for(day):
+    """esports_frames.jsonl -> esports_frames-2026-08-06.jsonl
+
+    One file per UTC day. At six concurrent games this writes ~200MB/day, and
+    the droplet has under 5GB free — rolling by date lets a cron gzip finished
+    days (JSONL compresses ~10x) without ever touching the file the recorder
+    still holds open. Rotating a single open file would not work: the recorder
+    would keep appending to the unlinked inode and the rotated copy would stop
+    growing, silently.
+    """
+    return LOG_PATH.with_name(f"{LOG_PATH.stem}-{day}{LOG_PATH.suffix}")
+
+
 class Recorder:
     def __init__(self):
         self.riot = RiotLivestatsFeed(on_log=_log)
-        self.fh = LOG_PATH.open("a", encoding="utf-8")
+        self.day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self.path = _path_for(self.day)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fh = self.path.open("a", encoding="utf-8")
         self.pairs = []            # active poly<->riot joins
         self.last_discover = 0.0
         self.n_records = 0
@@ -126,7 +142,14 @@ class Recorder:
 
     # ── output ───────────────────────────────────────────────────────────────
     def emit(self, rec):
-        rec["ts"] = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc)
+        day = now.strftime("%Y-%m-%d")
+        if day != self.day:
+            self.fh.close()
+            self.day, self.path = day, _path_for(day)
+            self.fh = self.path.open("a", encoding="utf-8")
+            _log("◆", f"rolled to {self.path.name}")
+        rec["ts"] = now.isoformat()
         self.fh.write(json.dumps(rec, default=str) + "\n")
         self.fh.flush()
         self.n_records += 1
@@ -143,8 +166,10 @@ class Recorder:
                      "game_id": p.get("game_id"), "game_number": p.get("game_number"),
                      "last_lag_sec": p.get("last_lag_sec")}
                     for p in self.pairs],
-                "log": str(LOG_PATH),
-                "log_bytes": LOG_PATH.stat().st_size if LOG_PATH.exists() else 0,
+                "log": str(self.path),
+                "log_bytes": self.path.stat().st_size if self.path.exists() else 0,
+                "disk_free_mb": round(os.statvfs(str(self.path.parent)).f_bavail
+                                      * os.statvfs(str(self.path.parent)).f_frsize / 1e6),
             }
             tmp = STATE_PATH.with_suffix(".tmp")
             tmp.write_text(json.dumps(st, indent=1), encoding="utf-8")
@@ -268,7 +293,7 @@ def main():
     signal.signal(signal.SIGINT, _on_sig)
 
     rec = Recorder()
-    _log("▶", f"esports recorder up — log={LOG_PATH} snap={SNAP_SEC}s "
+    _log("▶", f"esports recorder up — log={rec.path} snap={SNAP_SEC}s "
               f"discover={DISCOVER_SEC}s · PLACES NO ORDERS")
 
     while not _stop:
@@ -290,7 +315,7 @@ def main():
 
     rec.write_state()
     rec.fh.close()
-    _log("■", f"stopped — {rec.n_records} records written to {LOG_PATH}")
+    _log("■", f"stopped — {rec.n_records} records written to {rec.path}")
 
 
 if __name__ == "__main__":
