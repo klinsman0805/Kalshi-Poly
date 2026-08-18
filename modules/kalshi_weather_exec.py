@@ -94,6 +94,11 @@ class KalshiWeatherExecutor(WeatherExecutor):
     # same partial-fill bug in both files until 2026-07-26). Only the threshold
     # and the log prefix differ.
     DECLINE_GATE_DEG = float(os.getenv("KALSHI_WEATHER_DECLINE_GATE_DEG", "1.0"))
+    # Kalshi's own slot limit. Falls back to Polymarket's WEATHER_MAX_OPEN when
+    # unset, so removing this line restores the old shared-global behaviour.
+    # Set independently to run one venue live while the other stays shut.
+    MAX_OPEN = int(os.getenv("KALSHI_WEATHER_MAX_OPEN",
+                             os.getenv("WEATHER_MAX_OPEN", "10")))
 
     # Re-entry (see WeatherExecutor.MAX_REENTRIES): Poly defaults OFF (0) and
     # stays the control arm; Kalshi runs it live from 2026-07-28 as the

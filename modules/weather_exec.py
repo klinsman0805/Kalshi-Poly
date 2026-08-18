@@ -53,7 +53,6 @@ ENV_ARMED = os.getenv("WEATHER_LIVE", "false").strip().lower() == "true"
 # Still gated on WEATHER_LIVE; this cannot arm live trading on its own.
 START_LIVE = os.getenv("WEATHER_START_LIVE", "false").strip().lower() == "true"
 STAKE_USD = float(os.getenv("WEATHER_STAKE_USD", "5"))
-MAX_OPEN = int(os.getenv("WEATHER_MAX_OPEN", "10"))
 # How many times a single market (city|date|kind) may be re-entered after a
 # THESIS BREAK stopped us out of an earlier bucket. 0 restores the old
 # behaviour (a dead position blocks the market for the rest of the day).
@@ -191,6 +190,16 @@ class WeatherExecutor:
     # that's the base/Poly default; the Kalshi subclass overrides its own
     # constant independently (see kalshi_weather_exec.py), the same
     # per-venue-override pattern as DECLINE_GATE_DEG above.
+    # Concurrent open positions allowed at this venue. 0 is a hard OFF (the gate
+    # is len(open) >= MAX_OPEN, so 0 blocks every entry) — NOT unlimited.
+    #
+    # This was a module-level global until 2026-08-18, which meant one number
+    # silently governed BOTH venues: raising it to trade Kalshi also re-armed
+    # Polymarket, and closing Polymarket also closed Kalshi. Now it follows the
+    # same per-venue class-attribute pattern as DECLINE_GATE_DEG and
+    # MAX_REENTRIES above. Kalshi falls back to WEATHER_MAX_OPEN when its own
+    # override is unset, so behaviour is unchanged until someone sets it.
+    MAX_OPEN = int(os.getenv("WEATHER_MAX_OPEN", "10"))
     MAX_REENTRIES = int(os.getenv("WEATHER_MAX_REENTRIES", "0"))
 
     def __init__(self, on_log=None):
@@ -943,8 +952,8 @@ class WeatherExecutor:
     def _consider(self, entry):
         key = f"{entry['city']}|{entry['date']}|{entry.get('kind', 'high')}"
         with self._lock:
-            if len(self.open) >= MAX_OPEN:
-                self._log_block(key, "max_open", f"{len(self.open)}/{MAX_OPEN}")
+            if len(self.open) >= self.MAX_OPEN:
+                self._log_block(key, "max_open", f"{len(self.open)}/{self.MAX_OPEN}")
                 return
             # ── one LIVE position per market, but a dead one frees the slot ──
             # A position whose bucket the reading has already passed cannot
@@ -1606,7 +1615,7 @@ class WeatherExecutor:
                 "mode": self.mode, "live": self.is_live, "env_armed": ENV_ARMED,
                 "start_live": START_LIVE,   # boots live unattended? (see START_LIVE)
                 "take_profit_fok": TAKE_PROFIT_FOK,
-                "stake_usd": self.stake_usd, "max_open": MAX_OPEN, "session": s,
+                "stake_usd": self.stake_usd, "max_open": self.MAX_OPEN, "session": s,
                 "misses": self._misses,     # live FOKs that found nothing to fill
                 "cooling_down": sorted(k for k, t in self._cooldown_until.items()
                                        if t > time.time()),
