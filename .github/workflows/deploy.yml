@@ -52,6 +52,14 @@ jobs:
             # than discovering it from a crash-looping unit after the restart.
             ./venv/bin/python -m compileall -q app.py modules scripts feeds
 
+            # Pure-logic tests: no network, no exchange, no credentials, so they
+            # are safe to run on a box holding live positions. They cover the
+            # things that are expensive to get wrong here — the SIGTERM order
+            # drain, startup reconciliation, the per-venue slot gates, and the
+            # settlement-clock boundary that cost ~$16 in August. A failure
+            # aborts before any unit is restarted.
+            ./venv/bin/python -m pytest tests -q
+
             if [ "${{ inputs.restart }}" = "true" ]; then
               # Each unit has TimeoutStopSec covering the SIGTERM order drain in
               # weather_exec.begin_shutdown, so restart waits for any in-flight
