@@ -3,3 +3,6 @@
 # Compress finished esports capture days. -mtime +0 skips the file the
 # recorder still holds open, so this never truncates a live write.
 40 4 * * * find /opt/kalshi-poly/esports_data -name "*.jsonl" -mtime +0 -exec gzip -q {} \; >/dev/null 2>&1
+# Compress finished candidate-capture days (same -mtime +0 rule: never the
+# file the running executor still holds open).
+45 4 * * * find /opt/kalshi-poly/candidate_data -name "*.jsonl" -mtime +0 -exec gzip -q {} \; >/dev/null 2>&1
