@@ -86,9 +86,9 @@ def main():
           + (f"   venue={args.venue}" if args.venue else ""))
     print(f"signal mix: {C.signal_mix(records)}\n")
 
-    for probs, name in ((model_p, "model_p (as shipped)"),
-                        (market_p, "market price")):
-        ev = C.evaluate(probs, market_p, outcomes, label=name)
+    for probs, name, is_bench in ((model_p, "model_p (as shipped)", False),
+                                  (market_p, "market price", True)):
+        ev = C.evaluate(probs, market_p, outcomes, label=name, benchmark=is_bench)
         print(f"── {name} ──")
         print(f"   n {ev['n']}   base rate {_fmt(ev['base_rate'])}   "
               f"mean predicted {_fmt(ev['mean_predicted'])}   "

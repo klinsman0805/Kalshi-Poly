@@ -6,3 +6,7 @@
 # Compress finished candidate-capture days (same -mtime +0 rule: never the
 # file the running executor still holds open).
 45 4 * * * find /opt/kalshi-poly/candidate_data -name "*.jsonl" -mtime +0 -exec gzip -q {} \; >/dev/null 2>&1
+# Label recorded candidates against the venues own settlement sources.
+# CLI publishes the morning after, so run a few times a day; idempotent, and
+# unresolved markets are simply retried on the next pass.
+20 8,14,20 * * * cd /opt/kalshi-poly && ./venv/bin/python scripts/label_candidates.py >> candidate_data/label.log 2>&1

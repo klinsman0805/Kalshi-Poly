@@ -167,3 +167,12 @@ def test_break_even_flags_a_band_that_wins_less_than_its_price_requires():
 def test_break_even_skips_bands_with_no_trades():
     assert C.break_even_by_price([{"ask_c": 50.0}], [True],
                                  bands=((80, 101),)) == []
+
+
+def test_the_market_is_scored_as_a_benchmark_not_a_candidate():
+    """Comparing the price against itself gives an identical Brier, which would
+    otherwise print as a rejection of the thing being used as the bar."""
+    outcomes = [True, True, False, False]
+    market = [0.9, 0.8, 0.2, 0.3]
+    ev = C.evaluate(market, market, outcomes, benchmark=True)
+    assert ev["verdict"].startswith("BENCHMARK")

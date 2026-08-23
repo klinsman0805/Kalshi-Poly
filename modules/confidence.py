@@ -132,7 +132,8 @@ def expected_value_c(p, ask_c, fee_c=0.0):
 
 # ── acceptance ───────────────────────────────────────────────────────────────
 
-def evaluate(model_probs, market_probs, outcomes, label="model"):
+def evaluate(model_probs, market_probs, outcomes, label="model",
+             benchmark=False):
     """Score a set of forecasts against outcomes and against the market.
 
     Returns the three numbers that decide whether the model ships, plus the
@@ -149,7 +150,13 @@ def evaluate(model_probs, market_probs, outcomes, label="model"):
     beats_base = b_model is not None and b_base is not None and b_model < b_base
     beats_market = b_market is not None and b_model is not None and b_model < b_market
 
-    if not beats_base:
+    if benchmark:
+        # Scoring the market against itself. It is the bar, not a candidate.
+        verdict = ("BENCHMARK — this is the bar a model has to clear"
+                   + ("" if beats_base else "; note it does not beat the base rate here,"
+                                            " so the sample is too small or too odd to"
+                                            " read much into"))
+    elif not beats_base:
         verdict = "REJECT — does not beat the base rate; the score carries no information"
     elif not beats_market:
         verdict = "REJECT — beats the base rate but not the price; no edge over the market"
