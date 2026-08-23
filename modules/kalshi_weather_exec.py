@@ -89,6 +89,10 @@ class KalshiWeatherExecutor(WeatherExecutor):
         overstating every live Kalshi trade's reported P&L by the entry fee."""
         return round(shares * kalshi_taker_fee_c(filled_c) / 100.0, 4)
 
+    # Kalshi settles on the NWS CLI, which bounds its day in local STANDARD
+    # time. See WeatherExecutor.SETTLEMENT_STANDARD_TIME for what this cost.
+    SETTLEMENT_STANDARD_TIME = True
+
     # The gate itself lives in WeatherExecutor._decline_gate_ok — shared, so the
     # two venues cannot drift apart (the duplicated _exit_position carried the
     # same partial-fill bug in both files until 2026-07-26). Only the threshold

@@ -331,6 +331,10 @@ class WeatherEngine:
             # see weather_exec._take_profit, which stops selling at a discount
             # to a risk that no longer exists.
             "station_local_date": (st or {}).get("local_date"),
+            # zone name, so the executor can re-derive the settlement source's own
+            # day boundary — Kalshi's CLI runs on local STANDARD time, which is an
+            # hour off this local_date all summer. See _settlement_today.
+            "station_tz": (st or {}).get("tz"),
             "local_hour": round(st["local_hour"], 2) if st else None,
             "temp_c": temp_now,          # value shown "now" in the market's unit
             "ext_c": ext,                # observed extreme in the market's unit

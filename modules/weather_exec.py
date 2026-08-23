@@ -24,6 +24,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import requests
@@ -715,16 +716,53 @@ class WeatherExecutor:
                                           f"(-{DEAD_EXIT_BUFFER_DEG}° buffer cleared)")
 
     # ── take profit once the market has converged ────────────────────────────
-    @staticmethod
-    def _window_closed(pos, row):
-        """Has the station's local day moved past this market's date?
+    # Which clock the SETTLEMENT SOURCE uses to bound its day.
+    #
+    # False (Polymarket): Wunderground's daily history page reports "the highest
+    # temperature recorded for all times on this day" against the station's local
+    # CLOCK day — daylight time where it applies. station_local_date already is
+    # that, so nothing to adjust.
+    #
+    # True (Kalshi): the NWS Climatological Report runs midnight-to-midnight in
+    # local STANDARD time. Every summer that is an hour behind the local clock,
+    # and reading the DST-aware date made the bot declare the outcome fixed 60
+    # minutes early — which simultaneously disarms take-profit and (when win-adds
+    # were on) invited adding to a position that could still lose. Both of
+    # August's large Kalshi losses fired inside that hour: Seattle 2026-08-21 and
+    # Minneapolis 2026-08-22, each at 00:02 local daylight = 23:02 LST, with 58
+    # minutes of the settlement day still to run. -$8.30 and ~-$8.00.
+    SETTLEMENT_STANDARD_TIME = False
+
+    def _settlement_today(self, row):
+        """Today's date on the settlement source's own clock, ISO, or None.
+
+        None means "cannot tell" and every caller must treat that as "window
+        still open" — never as closed.
+        """
+        if not self.SETTLEMENT_STANDARD_TIME:
+            return row.get("station_local_date")
+        tzname = row.get("station_tz")
+        if not tzname:
+            return None
+        try:
+            tz = ZoneInfo(tzname)
+        except Exception:  # noqa: BLE001
+            return None
+        now = datetime.now(timezone.utc)
+        local = now.astimezone(tz)
+        # standard offset = current offset minus whatever DST is adding right now
+        std = local.utcoffset() - (local.dst() or timedelta(0))
+        return (now + std).date().isoformat()
+
+    def _window_closed(self, pos, row):
+        """Has the settlement source's day moved past this market's date?
 
         True means the daily extreme can no longer change — the market is
         waiting only on the settlement source to publish. Defensive: an
         unparseable or missing date returns False, so a bad read can never
         silently disable take-profit on a live, still-uncertain position.
         """
-        sld, mkt = row.get("station_local_date"), pos.get("date")
+        sld, mkt = self._settlement_today(row), pos.get("date")
         if not sld or not mkt:
             return False
         try:
