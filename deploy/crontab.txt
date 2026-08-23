@@ -10,3 +10,5 @@
 # CLI publishes the morning after, so run a few times a day; idempotent, and
 # unresolved markets are simply retried on the next pass.
 20 8,14,20 * * * cd /opt/kalshi-poly && ./venv/bin/python scripts/label_candidates.py >> candidate_data/label.log 2>&1
+# Weekly state-of-the-pipeline snapshot -> candidate_data/weekly.log
+10 9 * * 1 /opt/kalshi-poly/scripts/weekly_confidence.sh
