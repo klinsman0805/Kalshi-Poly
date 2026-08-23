@@ -179,6 +179,8 @@ def begin_shutdown(timeout=30.0):
 class WeatherExecutor:
     # log prefix, so shared methods can name the venue they're running for
     LOG_TAG = "weatherexec"
+    # short venue name, used to tag shadow-recorded rows
+    VENUE = "poly"
     # Minimum pullback (in the market's unit) from the running extreme before an
     # entry is allowed. 0 disables the gate. See _decline_gate_ok — the evidence
     # for it is much weaker than it first looked, so the DEFAULT IS OFF: this
@@ -205,6 +207,11 @@ class WeatherExecutor:
 
     def __init__(self, on_log=None):
         self.on_log = on_log or (lambda i, m: None)
+        try:
+            from modules.candidate_log import CandidateLogger
+            self._candidates = CandidateLogger(self.VENUE, on_log=self.on_log)
+        except Exception:  # noqa: BLE001
+            self._candidates = None     # recording must never block trading
         self.mode = "live" if (ENV_ARMED and START_LIVE) else "paper"
         self.stake_usd = STAKE_USD
         self.open = []            # position dicts
@@ -445,6 +452,13 @@ class WeatherExecutor:
         # poll loop opening a fresh one into a process that is about to exit.
         if shutting_down():
             return
+        # Shadow feature recorder. Runs before any gate so that BLOCKED and
+        # SKIPPED candidates are captured too — they are the counterfactuals a
+        # calibration set needs, and sampling only what we traded would
+        # condition the data on the very gates we want to evaluate. Writes
+        # nothing back and cannot raise; see modules/candidate_log.
+        if self._candidates is not None:
+            self._candidates.observe(rows, self)
         self._mark_open(rows)           # mark positions to market before anything else
         self._recheck_open(rows)        # is the thesis we bought on still true?
         self._watch_decline_confirm(rows)  # shadow-measure the wait-for-pullback rule

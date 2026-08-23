@@ -45,6 +45,7 @@ KALSHI_MISS_LOG = os.getenv("KALSHI_WEATHER_MISS_LOG", "kalshi_weather_misses.js
 
 class KalshiWeatherExecutor(WeatherExecutor):
     LOG_TAG = "kalshi-wx"
+    VENUE = "kalshi"
 
     def __init__(self, on_log=None):
         super().__init__(on_log=on_log)

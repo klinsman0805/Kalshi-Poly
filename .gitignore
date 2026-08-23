@@ -27,6 +27,10 @@ data/weather_climo.json
 # source — the analysis scripts that consume it are what belong in git.
 esports_data/
 
+# Shadow feature capture for the weather confidence model. Raw observation,
+# grows continuously; the scripts that consume it are what belong in git.
+candidate_data/
+
 # Belt-and-suspenders: ignore any .env variant (backups etc.)
 .env*
 *.pid
