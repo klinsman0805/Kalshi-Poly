@@ -27,7 +27,34 @@ heavy wheel to a 512MB box that runs live trading is not worth it.
 """
 
 import math
+import os
 from collections import Counter
+
+# A market priced at 2c or 99c is not a forecast, it is a settled outcome the
+# book has already absorbed. Scoring against it flatters the market to a Brier
+# near zero and tells us nothing about skill. The acceptance test therefore runs
+# on the contested band — where an actual forecast is still required.
+#
+# Measured 2026-08-24: of 72 labelled markets, 20 sat at 0-5c and 38 at 99-100c.
+# Only 9 were contested. The market's 0.0161 Brier over the full set was an
+# artifact of that, not evidence of forecasting skill.
+CONTESTED_LO_C = float(os.getenv("WEATHER_CONTESTED_LO_C", "15"))
+CONTESTED_HI_C = float(os.getenv("WEATHER_CONTESTED_HI_C", "85"))
+
+
+def is_contested(rec, lo=None, hi=None):
+    """Is this market still genuinely uncertain at the quoted price?"""
+    ask = rec.get("ask_c")
+    if ask is None:
+        return False
+    return (CONTESTED_LO_C if lo is None else lo) <= ask <= (CONTESTED_HI_C if hi is None else hi)
+
+
+def split_contested(records, outcomes, lo=None, hi=None):
+    """(contested_records, contested_outcomes, decided_count)."""
+    keep = [i for i, r in enumerate(records) if is_contested(r, lo, hi)]
+    return ([records[i] for i in keep], [outcomes[i] for i in keep],
+            len(records) - len(keep))
 
 
 # ── metrics ──────────────────────────────────────────────────────────────────
@@ -150,7 +177,12 @@ def evaluate(model_probs, market_probs, outcomes, label="model",
     beats_base = b_model is not None and b_base is not None and b_model < b_base
     beats_market = b_market is not None and b_model is not None and b_model < b_market
 
-    if benchmark:
+    if len(set(bool(o) for o in outcomes)) < 2:
+        # Every outcome identical. The base rate scores a perfect 0 and nothing
+        # can beat it; any verdict here would be an artifact.
+        verdict = ("INSUFFICIENT — every market in this set had the same outcome, "
+                   "so there is nothing to discriminate")
+    elif benchmark:
         # Scoring the market against itself. It is the bar, not a candidate.
         verdict = ("BENCHMARK — this is the bar a model has to clear"
                    + ("" if beats_base else "; note it does not beat the base rate here,"

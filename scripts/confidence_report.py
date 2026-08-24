@@ -96,7 +96,25 @@ def main():
     if not n_enter:
         print("       -> no tradeable row has settled yet, so nothing here "
               "describes a trade the bot would have placed.")
+    cont_r, cont_o, n_decided = C.split_contested(records, outcomes)
+    print(f"price split: {n_decided} already decided at the quote "
+          f"(<{C.CONTESTED_LO_C:.0f}c or >{C.CONTESTED_HI_C:.0f}c), "
+          f"{len(cont_r)} still contested")
+    print("       -> the acceptance test scores the CONTESTED set. A market at",
+          "2c or 99c is a settled outcome, not a forecast, and scoring")
+    print("          against it flatters the price to a near-zero Brier.")
     print()
+    # From here on the acceptance test runs on the contested set only.
+    if not cont_r:
+        print("── no contested markets labelled yet ──")
+        print("   Every settled market so far was already decided at its quote.")
+        print("   Nothing here can measure forecasting skill.")
+        return
+    records, outcomes = cont_r, cont_o
+    model_p = [r["model_p"] for r in records]
+    market_p = [C.market_prob(r) for r in records]
+    print(f"── acceptance test, contested markets only (n={len(records)}) ──")
+
 
     for probs, name, is_bench in ((model_p, "model_p (as shipped)", False),
                                   (market_p, "market price", True)):

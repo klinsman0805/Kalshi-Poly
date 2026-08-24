@@ -176,3 +176,64 @@ def test_the_market_is_scored_as_a_benchmark_not_a_candidate():
     market = [0.9, 0.8, 0.2, 0.3]
     ev = C.evaluate(market, market, outcomes, benchmark=True)
     assert ev["verdict"].startswith("BENCHMARK")
+
+
+# ── contested markets ────────────────────────────────────────────────────────
+
+def test_a_market_at_the_extremes_is_not_contested():
+    """2c or 99c is a settled outcome the book has absorbed, not a forecast."""
+    assert C.is_contested({"ask_c": 2.0}) is False
+    assert C.is_contested({"ask_c": 99.0}) is False
+    assert C.is_contested({"ask_c": 50.0}) is True
+
+
+def test_the_contested_band_includes_its_own_edges():
+    assert C.is_contested({"ask_c": C.CONTESTED_LO_C}) is True
+    assert C.is_contested({"ask_c": C.CONTESTED_HI_C}) is True
+
+
+def test_a_market_with_no_quote_is_not_contested():
+    assert C.is_contested({"ask_c": None}) is False
+
+
+def test_split_separates_decided_from_contested():
+    records = [{"ask_c": 2.0}, {"ask_c": 50.0}, {"ask_c": 99.5}, {"ask_c": 70.0}]
+    outcomes = [False, True, True, False]
+    cont_r, cont_o, n_decided = C.split_contested(records, outcomes)
+    assert n_decided == 2
+    assert [r["ask_c"] for r in cont_r] == [50.0, 70.0]
+    assert cont_o == [True, False]
+
+
+def test_the_full_set_flatters_the_market_and_the_contested_set_does_not():
+    """The 2026-08-24 shape: mostly resolved markets priced at the extremes,
+    where the price is trivially right. Restricting to contested must raise the
+    market's Brier — that is the whole reason for the cut."""
+    decided = ([{"ask_c": 1.0}] * 8) + ([{"ask_c": 99.0}] * 8)
+    dec_out = ([False] * 8) + ([True] * 8)
+    contested = [{"ask_c": 50.0}, {"ask_c": 45.0}, {"ask_c": 60.0}, {"ask_c": 55.0}]
+    con_out = [True, False, False, True]
+    records, outcomes = decided + contested, dec_out + con_out
+
+    full = C.brier([C.market_prob(r) for r in records], outcomes)
+    cr, co, _ = C.split_contested(records, outcomes)
+    cut = C.brier([C.market_prob(r) for r in cr], co)
+    # The point is the ratio, not an absolute: resolved markets dilute the
+    # score toward zero and hide whatever the price does where it matters.
+    assert full < 0.10, "resolved markets make the price look near-perfect"
+    assert cut > full * 4, "on contested markets the price has to actually forecast"
+    assert cut > 0.20
+
+
+def test_a_set_with_one_outcome_reports_insufficient_not_a_verdict():
+    """All-wins or all-losses gives the base rate a perfect score that nothing
+    can beat; any PASS/REJECT there would be an artifact."""
+    ev = C.evaluate([0.6, 0.7, 0.8], [0.5, 0.5, 0.5], [False, False, False])
+    assert ev["verdict"].startswith("INSUFFICIENT")
+    ev = C.evaluate([0.6, 0.7], [0.5, 0.5], [True, True])
+    assert ev["verdict"].startswith("INSUFFICIENT")
+
+
+def test_a_mixed_set_still_returns_a_real_verdict():
+    ev = C.evaluate([0.9, 0.1], [0.5, 0.5], [True, False])
+    assert not ev["verdict"].startswith("INSUFFICIENT")
