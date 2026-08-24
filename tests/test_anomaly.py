@@ -143,3 +143,13 @@ def test_scan_reports_several_problems_at_once():
     issues = A.scan([(_rec(lo=104, hi=105), 84)], stale, 100, 5, now=NOW)
     assert {i["code"] for i in issues} == {"implausible_miss", "capture_stalled",
                                            "labels_stalled"}
+
+
+def test_the_stall_detector_fires_at_the_ratios_it_is_meant_to():
+    """Guard for the off-by-one that once made settleable come out zero, which
+    silently disabled this detector entirely."""
+    assert A.labels_stalled(100, 10)[0] is True      # 90% backlog
+    assert A.labels_stalled(100, 49)[0] is True      # 51% backlog
+    assert A.labels_stalled(100, 51)[0] is False     # 49% backlog
+    assert A.labels_stalled(40, 19)[0] is True       # >20 rows outstanding
+    assert A.labels_stalled(30, 15)[0] is False      # exactly 15, under the floor

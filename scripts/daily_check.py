@@ -14,7 +14,7 @@ import os
 import subprocess
 import sys
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -63,9 +63,13 @@ def main():
 
     pairs = [(r, labels[m]["actual_extreme"])
              for m, r in latest.items() if m in labels]
-    # a market whose day closed yesterday or earlier should be resolvable
-    cutoff = (now - timedelta(days=1)).date().isoformat()
-    settleable = [m for m, r in latest.items() if (r.get("date") or "9999") < cutoff]
+    # A market is settleable once its own day has closed, i.e. its date is
+    # strictly before today. Using yesterday made every 08-23 market fail the
+    # comparison on 08-24, so the count came out zero and labels_stalled — the
+    # detector meant to catch exactly the resolver bug we just had — could
+    # never fire.
+    today = now.date().isoformat()
+    settleable = [m for m, r in latest.items() if (r.get("date") or "9999") < today]
 
     # ── anomalies first ──────────────────────────────────────────────────────
     issues = A.scan(pairs, latest_capture_ts=newest_ts,
