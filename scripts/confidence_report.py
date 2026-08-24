@@ -79,6 +79,7 @@ def main():
 
     records = [r for r, _ in rows]
     outcomes = [o for _, o in rows]
+    all_records, all_outcomes = records, outcomes
     model_p = [r["model_p"] for r in records]
     market_p = [C.market_prob(r) for r in records]
 
@@ -110,10 +111,21 @@ def main():
         print("   Every settled market so far was already decided at its quote.")
         print("   Nothing here can measure forecasting skill.")
         return
-    records, outcomes = cont_r, cont_o
+    # Narrow again. model_p is a "the extreme has plateaued, will it hold"
+    # model; rows that failed a timing gate never reached it, and scoring it
+    # there measures a regime the strategy deliberately avoids.
+    tim_r, tim_o, n_timing = C.split_timing(cont_r, cont_o)
+    print(f"timing split: {n_timing} of the {len(cont_r)} contested markets were",
+          "refused before the model was consulted")
+    if not tim_r:
+        print("       -> nothing left. The acceptance test needs a market that",
+              "cleared data and timing AND is still contested.")
+        _gates(cont_r, cont_o)
+        return
+    records, outcomes = tim_r, tim_o
     model_p = [r["model_p"] for r in records]
     market_p = [C.market_prob(r) for r in records]
-    print(f"── acceptance test, contested markets only (n={len(records)}) ──")
+    print(f"── acceptance test: contested AND past timing (n={len(records)}) ──")
 
 
     for probs, name, is_bench in ((model_p, "model_p (as shipped)", False),
@@ -188,6 +200,31 @@ def main():
         print("   Until a row the engine wanted to trade settles, the acceptance")
         print("   test describes the candidate population, not the strategy.")
 
+    _gates(all_records, all_outcomes)
+
+
+
+
+def _gates(records, outcomes):
+    """What each gate saved or cost, on labelled markets."""
+    rows = C.gate_scorecard(records, outcomes)
+    if not rows:
+        return
+    print()
+    print("── gate scorecard: what each refusal was worth ──")
+    print("   (cents per share if we had bought at the quoted ask;",
+          "negative means the gate saved money)")
+    print("   %-12s %-4s %-8s %-9s %-10s %-9s %s" % (
+        "gate", "n", "won", "avg ask", "total EV", "per trade", "verdict"))
+    for g in rows:
+        print("   %-12s %-4d %-8s %-9.0f %-10.1f %-9.2f %s" % (
+            g["signal"], g["n"], "%d (%.0f%%)" % (g["wins"], 100 * g["win_rate"]),
+            g["avg_ask_c"], g["total_ev_c"], g["ev_per_trade_c"], g["verdict"]))
+    total = sum(g["total_ev_c"] for g in rows)
+    print("   %-12s %-4d %-8s %-9s %-10.1f" % (
+        "ALL", sum(g["n"] for g in rows), "", "", total))
+    print("   -> refusing every one of these was worth %+.1fc per share overall"
+          % -total)
 
 if __name__ == "__main__":
     main()

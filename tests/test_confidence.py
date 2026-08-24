@@ -250,3 +250,68 @@ def test_evaluate_on_an_empty_split_returns_a_shaped_result():
               "mean_predicted", "overconfidence", "reliability", "base_rate"):
         assert k in ev, k
     assert ev["brier_model"] is None
+
+
+# ── timing gates and the gate scorecard ──────────────────────────────────────
+
+def test_timing_blocked_signals_are_recognised():
+    """These all fail before the model is consulted, so model_p was never the
+    reason the candidate was refused."""
+    for sig in ("EARLY", "NOT-LOCKED", "NO-DATA", "WAIT", "MONITOR"):
+        assert C.cleared_timing({"signal": sig}) is False
+
+
+def test_signals_after_the_model_count_as_cleared():
+    for sig in ("NO-LOCK", "PRICED", "THIN-EDGE", "TOO-GOOD", "WIDE",
+                "MKT-LOCKED", "ENTER"):
+        assert C.cleared_timing({"signal": sig}) is True
+
+
+def test_split_timing_separates_the_two():
+    records = [{"signal": "EARLY"}, {"signal": "ENTER"},
+               {"signal": "NOT-LOCKED"}, {"signal": "PRICED"}]
+    outcomes = [False, True, False, True]
+    kept_r, kept_o, blocked = C.split_timing(records, outcomes)
+    assert blocked == 2
+    assert [r["signal"] for r in kept_r] == ["ENTER", "PRICED"]
+    assert kept_o == [True, True]
+
+
+def test_realized_ev_of_a_winner_is_the_upside_less_fees():
+    assert C.realized_ev_c(True, 70.0) == pytest.approx(30.0)
+    assert C.realized_ev_c(True, 70.0, fee_c=1.2) == pytest.approx(28.8)
+
+
+def test_realized_ev_of_a_loser_is_the_whole_stake():
+    assert C.realized_ev_c(False, 70.0) == pytest.approx(-70.0)
+    assert C.realized_ev_c(False, 70.0, fee_c=1.2) == pytest.approx(-71.2)
+
+
+def test_a_gate_that_blocked_losers_is_credited_with_saving_money():
+    """The counterfactual the candidate recorder exists to make possible."""
+    records = [{"signal": "NOT-LOCKED", "ask_c": 60.0}] * 3
+    outcomes = [False, False, False]
+    row = C.gate_scorecard(records, outcomes)[0]
+    assert row["signal"] == "NOT-LOCKED"
+    assert row["total_ev_c"] == pytest.approx(-180.0)
+    assert row["verdict"] == "saved money"
+
+
+def test_a_gate_that_blocked_winners_is_charged_with_costing_money():
+    records = [{"signal": "EARLY", "ask_c": 40.0}] * 2
+    row = C.gate_scorecard(records, [True, True])[0]
+    assert row["total_ev_c"] == pytest.approx(120.0)
+    assert row["verdict"] == "cost money"
+
+
+def test_the_scorecard_groups_by_gate_and_sorts_worst_first():
+    records = [{"signal": "EARLY", "ask_c": 40.0},
+               {"signal": "NOT-LOCKED", "ask_c": 60.0},
+               {"signal": "NOT-LOCKED", "ask_c": 60.0}]
+    rows = C.gate_scorecard(records, [True, False, False])
+    assert [r["signal"] for r in rows] == ["NOT-LOCKED", "EARLY"]
+    assert rows[0]["n"] == 2 and rows[1]["n"] == 1
+
+
+def test_rows_without_a_quote_are_skipped_rather_than_scored_as_zero():
+    assert C.gate_scorecard([{"signal": "EARLY", "ask_c": None}], [False]) == []

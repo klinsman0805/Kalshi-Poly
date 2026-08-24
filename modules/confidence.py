@@ -242,3 +242,75 @@ def break_even_by_price(records, outcomes, bands=((0, 70), (70, 80), (80, 101)))
 
 def signal_mix(records):
     return dict(Counter(r.get("signal") for r in records).most_common())
+
+# ── which gate stopped a candidate ───────────────────────────────────────────
+#
+# The engine checks in a fixed order: source, day, observations, local hour,
+# extreme age, model probability, then price and book. So the signal alone says
+# how far a candidate got. Anything in TIMING_BLOCKED failed before the model
+# was consulted at all.
+#
+# This matters because model_p is a "given the extreme has plateaued, will it
+# hold" model. Asking it at 11am with thirteen hours of daylight left is out of
+# its domain, and scoring it there measures a regime the strategy never trades.
+TIMING_BLOCKED = {"MONITOR", "WAIT", "NO-DATA", "EARLY", "NOT-LOCKED"}
+
+
+def cleared_timing(rec):
+    """Did this candidate get past the data and timing gates?"""
+    return rec.get("signal") not in TIMING_BLOCKED
+
+
+def split_timing(records, outcomes):
+    """(cleared_records, cleared_outcomes, blocked_count)."""
+    keep = [i for i, r in enumerate(records) if cleared_timing(r)]
+    return ([records[i] for i in keep], [outcomes[i] for i in keep],
+            len(records) - len(keep))
+
+
+def realized_ev_c(won, ask_c, fee_c=0.0):
+    """Cents per share this market would have returned if bought at the ask.
+
+    Win pays 100, so the gain is (100 - ask). A loss costs the ask. Fees are
+    charged on entry either way.
+    """
+    if ask_c is None:
+        return None
+    return (100.0 - ask_c - (fee_c or 0.0)) if won else (-ask_c - (fee_c or 0.0))
+
+
+def gate_scorecard(records, outcomes):
+    """What each gate actually saved or cost, on labelled markets.
+
+    This is the counterfactual the candidate recorder exists to make possible:
+    for every row a gate refused, we know what buying it would have returned.
+    A gate that blocks money-losers is earning its place; one that blocks
+    winners is costing frequency for nothing.
+    """
+    by = {}
+    for r, o in zip(records, outcomes):
+        sig = r.get("signal") or "?"
+        ev = realized_ev_c(o, r.get("ask_c"), r.get("fee_c"))
+        if ev is None:
+            continue
+        d = by.setdefault(sig, {"signal": sig, "n": 0, "wins": 0, "ev_c": 0.0,
+                                "ask_sum": 0.0})
+        d["n"] += 1
+        d["wins"] += 1 if o else 0
+        d["ev_c"] += ev
+        d["ask_sum"] += r["ask_c"]
+    out = []
+    for d in by.values():
+        n = d["n"]
+        out.append({
+            "signal": d["signal"], "n": n, "wins": d["wins"],
+            "win_rate": round(d["wins"] / n, 4),
+            "avg_ask_c": round(d["ask_sum"] / n, 1),
+            "total_ev_c": round(d["ev_c"], 1),
+            "ev_per_trade_c": round(d["ev_c"] / n, 2),
+            # A blocking gate helps when the rows it refused would have lost.
+            "verdict": ("saved money" if d["ev_c"] < 0 else
+                        "cost money" if d["ev_c"] > 0 else "neutral"),
+        })
+    out.sort(key=lambda x: x["total_ev_c"])
+    return out
