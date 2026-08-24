@@ -28,7 +28,8 @@ one, because nothing downstream can detect it.
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -40,8 +41,10 @@ GAMMA_MARKETS = "https://gamma-api.polymarket.com/markets"
 TIMEOUT = 20
 UA = {"User-Agent": "Mozilla/5.0"}
 
-# CLI issues once or twice a day; six products reaches a few days back.
-CLI_LOOKBACK_PRODUCTS = 6
+# NWS issues SEVERAL CLI products per station-day: preliminaries through the
+# day, then a final after the climate day closes, plus occasional corrections.
+# 40 covers roughly a week at that rate.
+CLI_LOOKBACK_PRODUCTS = 40
 
 _session = requests.Session()
 _session.headers.update(UA)
@@ -61,15 +64,37 @@ class SettlementTruth:
                       "errors": 0}
 
     # ── Kalshi: the NWS climate report ───────────────────────────────────────
-    def cli_extremes(self, icao, date_iso):
-        """{"high": F, "low": F} for a station-day, or None if not published.
+    def cli_extremes(self, icao, date_iso, tz_name=None):
+        """{"high": F, "low": F} for a station-day, or None if not yet FINAL.
 
-        `icao` is the four-letter station (KMSY); the CLI location code is it
-        without the leading K.
+        The subtlety that matters: a CLI issued *during* its own day reports the
+        extreme so far, not the day's extreme. Austin 2026-08-23 published
+        MAXIMUM 84 at 07:35 local and MAXIMUM 105 after midnight — taking the
+        first product that matched the date labelled a 105F day as 84F, a 21
+        degree error that then trained the model.
+
+        So a report only counts once it was issued after the end of the climate
+        day it describes, in local STANDARD time — the same boundary Kalshi
+        settles on. Without a timezone we cannot establish that, and the honest
+        answer is "not yet knowable".
         """
         key = (icao, date_iso)
         if key in self._cli:
             return self._cli[key]
+        if not tz_name:
+            return None
+
+        try:
+            tz = ZoneInfo(tz_name)
+            day = datetime.fromisoformat(date_iso).date()
+        except Exception:  # noqa: BLE001
+            return None
+        # end of the climate day = next midnight in local standard time
+        probe = datetime.combine(day, datetime.min.time()).replace(tzinfo=timezone.utc)
+        local = probe.astimezone(tz)
+        std_off = local.utcoffset() - (local.dst() or timedelta(0))
+        day_end_utc = (datetime.combine(day, datetime.min.time())
+                       + timedelta(days=1)).replace(tzinfo=timezone.utc) - std_off
 
         station = icao[1:] if icao and icao.startswith("K") else icao
         try:
@@ -79,13 +104,29 @@ class SettlementTruth:
         except Exception as e:  # noqa: BLE001
             self.stats["errors"] += 1
             log.debug("CLI list failed for %s: %s", station, e)
-            return None       # deliberately NOT cached: a transport failure is
-                              # not evidence the report does not exist
+            return None       # transport failure is not evidence of absence
+
+        # Only products issued after the day closed can be final. Newest first,
+        # so a later correction supersedes an earlier final.
+        eligible = []
+        for prod in products[:CLI_LOOKBACK_PRODUCTS]:
+            ts = prod.get("issuanceTime")
+            if not ts:
+                continue
+            try:
+                issued = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if issued.tzinfo is None:
+                issued = issued.replace(tzinfo=timezone.utc)
+            if issued >= day_end_utc:
+                eligible.append((issued, prod))
+        eligible.sort(key=lambda x: -x[0].timestamp())
 
         text = None
-        for p in products[:CLI_LOOKBACK_PRODUCTS]:
+        for _, prod in eligible:
             try:
-                rr = _session.get(NWS_PRODUCT.format(pid=p["id"]), timeout=TIMEOUT)
+                rr = _session.get(NWS_PRODUCT.format(pid=prod["id"]), timeout=TIMEOUT)
                 body = rr.json().get("productText", "")
             except Exception:  # noqa: BLE001
                 continue
@@ -102,7 +143,7 @@ class SettlementTruth:
 
         if text is None:
             self.stats["cli_miss"] += 1
-            return None       # not published yet — retry on a later pass
+            return None       # no final report yet — retry on a later pass
 
         m_hi = re.search(r"MAXIMUM\s+(-?\d+)", text)
         m_lo = re.search(r"MINIMUM\s+(-?\d+)", text)
@@ -175,10 +216,13 @@ class SettlementTruth:
             if not icao or not date:
                 return {"won": None, "actual_extreme": None,
                         "source": "cli", "reason": "no station or date"}
-            ext = self.cli_extremes(icao, date)
+            if not rec.get("station_tz"):
+                return {"won": None, "actual_extreme": None, "source": "cli",
+                        "reason": "no station timezone; cannot tell final from preliminary"}
+            ext = self.cli_extremes(icao, date, rec.get("station_tz"))
             if ext is None:
                 return {"won": None, "actual_extreme": None,
-                        "source": "cli", "reason": "CLI not published yet"}
+                        "source": "cli", "reason": "no FINAL CLI yet"}
             actual = ext["high"] if kind == "high" else ext["low"]
             return {"won": self.bucket_contains(actual, rec.get("lo"), rec.get("hi")),
                     "actual_extreme": actual, "source": "cli", "reason": "ok"}

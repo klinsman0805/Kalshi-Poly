@@ -39,14 +39,29 @@ def truth():
     return SettlementTruth()
 
 
-def _stub_cli(monkeypatch, product_text=CLI_TEXT, listing=None):
+# Austin's real 2026-08-23 sequence: a morning preliminary reporting the max so
+# far, then the final issued after the climate day closed. Taking the first
+# date match labelled a 105F day as 84F.
+PRELIM_TEXT = CLI_TEXT.replace("MAXIMUM         78", "MAXIMUM         60")
+# KSEA is UTC-8 standard, so the 2026-08-21 climate day closes at 08:00Z on
+# the 22nd. "final" clears that boundary; "prelim" is issued inside the day.
+FINAL_LISTING = {"@graph": [
+    {"id": "final",  "issuanceTime": "2026-08-22T09:00:00+00:00"},
+    {"id": "prelim", "issuanceTime": "2026-08-21T13:00:00+00:00"},
+]}
+
+
+def _stub_cli(monkeypatch, product_text=CLI_TEXT, listing=None, bodies=None):
     calls = {"n": 0}
-    listing = listing if listing is not None else {"@graph": [{"id": "p1"}]}
+    listing = listing if listing is not None else FINAL_LISTING
 
     def get(url, params=None, timeout=None):
         calls["n"] += 1
         if "/types/CLI/" in url:
             return _Resp(listing)
+        if bodies:
+            pid = url.rsplit("/", 1)[-1]
+            return _Resp({"productText": bodies.get(pid, product_text)})
         return _Resp({"productText": product_text})
 
     monkeypatch.setattr(st._session, "get", get)
@@ -77,20 +92,20 @@ def test_bucket_contains_is_none_without_an_extreme():
 
 def test_cli_parses_both_extremes(truth, monkeypatch):
     _stub_cli(monkeypatch)
-    assert truth.cli_extremes("KSEA", "2026-08-21") == {"high": 78, "low": 60}
+    assert truth.cli_extremes("KSEA", "2026-08-21", "America/Los_Angeles") == {"high": 78, "low": 60}
 
 
 def test_cli_result_is_cached(truth, monkeypatch):
     calls = _stub_cli(monkeypatch)
-    truth.cli_extremes("KSEA", "2026-08-21")
+    truth.cli_extremes("KSEA", "2026-08-21", "America/Los_Angeles")
     first = calls["n"]
-    truth.cli_extremes("KSEA", "2026-08-21")
+    truth.cli_extremes("KSEA", "2026-08-21", "America/Los_Angeles")
     assert calls["n"] == first, "a station-day should be fetched once"
 
 
 def test_cli_for_a_different_day_is_not_yet_published(truth, monkeypatch):
     _stub_cli(monkeypatch)
-    assert truth.cli_extremes("KSEA", "2026-08-22") is None
+    assert truth.cli_extremes("KSEA", "2026-08-22", "America/Los_Angeles") is None
 
 
 def test_a_transport_failure_is_not_cached_as_absent(truth, monkeypatch):
@@ -98,14 +113,15 @@ def test_a_transport_failure_is_not_cached_as_absent(truth, monkeypatch):
     def boom(url, params=None, timeout=None):
         raise RuntimeError("connection reset")
     monkeypatch.setattr(st._session, "get", boom)
-    assert truth.cli_extremes("KSEA", "2026-08-21") is None
+    assert truth.cli_extremes("KSEA", "2026-08-21", "America/Los_Angeles") is None
     assert ("KSEA", "2026-08-21") not in truth._cli
 
 
 def test_label_resolves_a_kalshi_low(truth, monkeypatch):
     _stub_cli(monkeypatch)
     rec = {"venue": "kalshi", "station": "KSEA", "date": "2026-08-21",
-           "kind": "low", "lo": 61, "hi": None}
+           "kind": "low", "lo": 61, "hi": None,
+           "station_tz": "America/Los_Angeles"}
     out = truth.label(rec)
     assert out["actual_extreme"] == 60
     assert out["won"] is False, "the minimum came in at 60, below a >=61 bucket"
@@ -114,21 +130,23 @@ def test_label_resolves_a_kalshi_low(truth, monkeypatch):
 def test_label_resolves_a_kalshi_high(truth, monkeypatch):
     _stub_cli(monkeypatch)
     rec = {"venue": "kalshi", "station": "KSEA", "date": "2026-08-21",
-           "kind": "high", "lo": 77, "hi": 79}
+           "kind": "high", "lo": 77, "hi": 79,
+           "station_tz": "America/Los_Angeles"}
     assert truth.label(rec)["won"] is True
 
 
 def test_unpublished_cli_labels_nothing(truth, monkeypatch):
     _stub_cli(monkeypatch, listing={"@graph": []})
     rec = {"venue": "kalshi", "station": "KSEA", "date": "2026-08-21",
-           "kind": "high", "lo": 77, "hi": 79}
+           "kind": "high", "lo": 77, "hi": 79,
+           "station_tz": "America/Los_Angeles"}
     out = truth.label(rec)
-    assert out["won"] is None and "not published" in out["reason"]
+    assert out["won"] is None and "no FINAL CLI" in out["reason"]
 
 
 def test_a_malformed_report_labels_nothing(truth, monkeypatch):
     _stub_cli(monkeypatch, product_text="CLIMATE SUMMARY FOR AUGUST 21 2026\ngarbage")
-    assert truth.cli_extremes("KSEA", "2026-08-21") is None
+    assert truth.cli_extremes("KSEA", "2026-08-21", "America/Los_Angeles") is None
 
 
 # ── Polymarket via its own resolution ────────────────────────────────────────
@@ -170,3 +188,46 @@ def test_an_unknown_venue_labels_nothing(truth):
 def test_missing_identity_labels_nothing(truth):
     assert truth.label({"venue": "kalshi", "kind": "high"})["won"] is None
     assert truth.label({"venue": "poly", "kind": "high"})["won"] is None
+
+
+# ── preliminary vs final ─────────────────────────────────────────────────────
+
+def test_a_preliminary_report_is_never_used(truth, monkeypatch):
+    """The bug this caught: NWS publishes the max SO FAR during the day. Austin
+    2026-08-23 read 84F at 07:35 local and 105F after midnight. Only a report
+    issued after the climate day closed can be final."""
+    _stub_cli(monkeypatch, bodies={"prelim": PRELIM_TEXT, "final": CLI_TEXT})
+    ext = truth.cli_extremes("KSEA", "2026-08-21", "America/Los_Angeles")
+    assert ext == {"high": 78, "low": 60}, "must take the final, not the preliminary"
+
+
+def test_only_same_day_reports_means_not_yet_resolvable(truth, monkeypatch):
+    """Every product still issued inside the day it describes."""
+    listing = {"@graph": [{"id": "prelim",
+                           "issuanceTime": "2026-08-21T13:00:00+00:00"}]}
+    _stub_cli(monkeypatch, listing=listing, bodies={"prelim": PRELIM_TEXT})
+    assert truth.cli_extremes("KSEA", "2026-08-21", "America/Los_Angeles") is None
+
+
+def test_without_a_timezone_nothing_can_be_called_final(truth, monkeypatch):
+    _stub_cli(monkeypatch)
+    assert truth.cli_extremes("KSEA", "2026-08-21", None) is None
+
+
+def test_the_labeller_refuses_a_record_with_no_timezone(truth, monkeypatch):
+    _stub_cli(monkeypatch)
+    out = truth.label({"venue": "kalshi", "station": "KSEA",
+                       "date": "2026-08-21", "kind": "high", "lo": 77, "hi": 79})
+    assert out["won"] is None and "timezone" in out["reason"]
+
+
+def test_a_later_correction_supersedes_an_earlier_final(truth, monkeypatch):
+    corrected = CLI_TEXT.replace("MAXIMUM         78", "MAXIMUM         79")
+    listing = {"@graph": [
+        {"id": "corr",  "issuanceTime": "2026-08-23T07:00:00+00:00"},
+        {"id": "final", "issuanceTime": "2026-08-22T07:00:00+00:00"},
+    ]}
+    _stub_cli(monkeypatch, listing=listing,
+              bodies={"corr": corrected, "final": CLI_TEXT})
+    ext = truth.cli_extremes("KSEA", "2026-08-21", "America/Los_Angeles")
+    assert ext["high"] == 79, "newest eligible report should win"
