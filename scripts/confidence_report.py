@@ -120,7 +120,8 @@ def main():
     if not tim_r:
         print("       -> nothing left. The acceptance test needs a market that",
               "cleared data and timing AND is still contested.")
-        _gates(cont_r, cont_o)
+        _gates(cont_r, cont_o, "contested markets only")
+        _gates(all_records, all_outcomes, "every labelled market")
         return
     records, outcomes = tim_r, tim_o
     model_p = [r["model_p"] for r in records]
@@ -205,13 +206,13 @@ def main():
 
 
 
-def _gates(records, outcomes):
+def _gates(records, outcomes, scope="all labelled markets"):
     """What each gate saved or cost, on labelled markets."""
     rows = C.gate_scorecard(records, outcomes)
     if not rows:
         return
     print()
-    print("── gate scorecard: what each refusal was worth ──")
+    print(f"── gate scorecard ({scope}): what each refusal was worth ──")
     print("   (cents per share if we had bought at the quoted ask;",
           "negative means the gate saved money)")
     print("   %-12s %-4s %-8s %-9s %-10s %-9s %s" % (
