@@ -38,6 +38,7 @@ log = logging.getLogger("modules.settlement_truth")
 NWS_CLI = "https://api.weather.gov/products/types/CLI/locations/{station}"
 NWS_PRODUCT = "https://api.weather.gov/products/{pid}"
 GAMMA_MARKETS = "https://gamma-api.polymarket.com/markets"
+GAMMA_EVENTS = "https://gamma-api.polymarket.com/events"
 TIMEOUT = 20
 UA = {"User-Agent": "Mozilla/5.0"}
 
@@ -48,6 +49,24 @@ CLI_LOOKBACK_PRODUCTS = 40
 
 _session = requests.Session()
 _session.headers.update(UA)
+
+
+def _bucket_value(question):
+    """Midpoint of the bucket that settled true, or None.
+
+    An open-tailed bucket ("30C or below") has no midpoint and returns None
+    rather than a number that would read as precise.
+    """
+    if not question:
+        return None
+    try:
+        from feeds.poly_weather import _parse_bucket
+        lo, hi, _unit = _parse_bucket(question)
+    except Exception:  # noqa: BLE001
+        return None
+    if lo is None or hi is None:
+        return None
+    return lo if lo == hi else round((lo + hi) / 2, 1)
 
 
 class SettlementTruth:
@@ -157,36 +176,65 @@ class SettlementTruth:
         self.stats["cli_hit"] += 1
         return out
 
-    # ── Polymarket: the market's own resolution ──────────────────────────────
-    def gamma_resolved(self, slug):
-        """True/False if the market has settled, else None."""
-        if slug in self._gamma:
-            return self._gamma[slug]
+    # ── Polymarket: the event's own resolution ───────────────────────────────
+    def gamma_event(self, event_slug):
+        """Resolve a whole temperature event: {token_id: won} plus the bucket
+        that settled true.
+
+        A temperature event is a LADDER of bucket markets — Ankara 2026-08-23
+        had eleven — and each is a separate market with its own slug and token.
+        The slug recorded on a candidate is the EVENT slug, which /markets does
+        not accept; querying it there silently returned nothing and left every
+        non-Kalshi market permanently unlabelled. Going through /events fixes
+        that, and because exactly one bucket resolves to 1, it also recovers the
+        settled TEMPERATURE — which is otherwise unavailable outside the US,
+        where there is no NWS climate report.
+        """
+        if event_slug in self._gamma:
+            return self._gamma[event_slug]
         try:
-            r = _session.get(GAMMA_MARKETS, params={"slug": slug}, timeout=TIMEOUT)
+            r = _session.get(GAMMA_EVENTS, params={"slug": event_slug}, timeout=TIMEOUT)
             r.raise_for_status()
-            markets = r.json()
+            events = r.json()
         except Exception as e:  # noqa: BLE001
             self.stats["errors"] += 1
-            log.debug("gamma lookup failed for %s: %s", slug, e)
+            log.debug("gamma event lookup failed for %s: %s", event_slug, e)
             return None
-        if not markets:
+        if not events:
             self.stats["gamma_miss"] += 1
             return None
-        m = markets[0] if isinstance(markets, list) else markets
-        if m.get("umaResolutionStatus") != "resolved":
+        ev = events[0] if isinstance(events, list) else events
+
+        by_token, winner_q, unresolved = {}, None, False
+        for m in (ev.get("markets") or []):
+            if m.get("umaResolutionStatus") != "resolved":
+                unresolved = True
+                continue
+            try:
+                prices = m.get("outcomePrices")
+                prices = json.loads(prices) if isinstance(prices, str) else prices
+                won = float(prices[0]) >= 0.5
+            except (TypeError, ValueError, IndexError):
+                continue
+            try:
+                toks = m.get("clobTokenIds")
+                toks = json.loads(toks) if isinstance(toks, str) else (toks or [])
+            except (TypeError, ValueError):
+                toks = []
+            if toks:
+                by_token[str(toks[0])] = won
+            if won:
+                winner_q = m.get("question") or ""
+
+        if not by_token or (unresolved and winner_q is None):
             self.stats["gamma_miss"] += 1
-            return None       # not settled yet; do not cache
-        try:
-            prices = m.get("outcomePrices")
-            prices = json.loads(prices) if isinstance(prices, str) else prices
-            won = float(prices[0]) >= 0.5
-        except (TypeError, ValueError, IndexError):
-            self.stats["gamma_miss"] += 1
-            return None
-        self._gamma[slug] = won
+            return None       # still settling; do not cache a partial ladder
+
+        out = {"by_token": by_token, "winning_question": winner_q,
+               "settled": _bucket_value(winner_q)}
+        self._gamma[event_slug] = out
         self.stats["gamma_hit"] += 1
-        return won
+        return out
 
     # ── the one entry point the labeller uses ────────────────────────────────
     @staticmethod
@@ -229,16 +277,21 @@ class SettlementTruth:
 
         if venue == "poly":
             slug = rec.get("slug")
+            token = rec.get("token_yes")
             if not slug:
                 return {"won": None, "actual_extreme": None,
-                        "source": "gamma", "reason": "no slug"}
-            won = self.gamma_resolved(slug)
-            if won is None:
+                        "source": "gamma", "reason": "no event slug"}
+            res = self.gamma_event(slug)
+            if res is None:
                 return {"won": None, "actual_extreme": None,
-                        "source": "gamma", "reason": "not resolved yet"}
-            # Gamma resolves the WHOLE event; the per-bucket outcome comes from
-            # the bucket's own market, which is what `slug` addresses here.
-            return {"won": won, "actual_extreme": None,
+                        "source": "gamma", "reason": "event not resolved yet"}
+            if token is None or str(token) not in res["by_token"]:
+                return {"won": None, "actual_extreme": None, "source": "gamma",
+                        "reason": "our bucket's token is not in the resolved ladder"}
+            return {"won": res["by_token"][str(token)],
+                    # Recovered from whichever bucket settled true. Outside the
+                    # US this is the only route to a settled temperature.
+                    "actual_extreme": res.get("settled"),
                     "source": "gamma", "reason": "ok"}
 
         return {"won": None, "actual_extreme": None,

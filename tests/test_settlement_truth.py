@@ -156,27 +156,75 @@ def _stub_gamma(monkeypatch, payload):
                         lambda url, params=None, timeout=None: _Resp(payload))
 
 
-def test_gamma_reports_a_win(truth, monkeypatch):
-    _stub_gamma(monkeypatch, [{"umaResolutionStatus": "resolved",
-                               "outcomePrices": json.dumps(["1", "0"])}])
-    assert truth.gamma_resolved("some-slug") is True
+def _event(markets):
+    return [{"markets": markets}]
 
 
-def test_gamma_reports_a_loss(truth, monkeypatch):
-    _stub_gamma(monkeypatch, [{"umaResolutionStatus": "resolved",
-                               "outcomePrices": ["0", "1"]}])
-    assert truth.gamma_resolved("some-slug") is False
+def _mkt(token, won, question, resolved=True):
+    return {"umaResolutionStatus": "resolved" if resolved else "pending",
+            "outcomePrices": json.dumps(["1", "0"] if won else ["0", "1"]),
+            "clobTokenIds": json.dumps([token, token + "-no"]),
+            "question": question}
 
 
-def test_an_unresolved_market_labels_nothing(truth, monkeypatch):
-    _stub_gamma(monkeypatch, [{"umaResolutionStatus": "pending"}])
-    out = truth.label({"venue": "poly", "slug": "s", "kind": "high"})
+LADDER = _event([
+    _mkt("t30", False, "Will the highest temperature in Ankara be 30°C or below on August 23?"),
+    _mkt("t31", False, "Will the highest temperature in Ankara be 31°C on August 23?"),
+    _mkt("t32", True,  "Will the highest temperature in Ankara be 32°C on August 23?"),
+    _mkt("t33", False, "Will the highest temperature in Ankara be 33°C on August 23?"),
+])
+
+
+def test_a_temperature_event_resolves_the_whole_ladder(truth, monkeypatch):
+    """The recorded slug is the EVENT slug. Querying it against /markets
+    silently returned nothing, which left every non-Kalshi market permanently
+    unlabelled - 73% of everything captured."""
+    _stub_gamma(monkeypatch, LADDER)
+    res = truth.gamma_event("highest-temperature-in-ankara-on-august-23-2026")
+    assert res["by_token"]["t32"] is True
+    assert res["by_token"]["t31"] is False
+
+
+def test_the_winning_bucket_recovers_the_settled_temperature(truth, monkeypatch):
+    """Outside the US there is no NWS climate report, so the bucket that
+    settled true is the only route to a settled temperature."""
+    _stub_gamma(monkeypatch, LADDER)
+    res = truth.gamma_event("slug")
+    assert res["settled"] == 32
+
+
+def test_an_open_tailed_winner_has_no_midpoint(truth, monkeypatch):
+    _stub_gamma(monkeypatch, _event([
+        _mkt("t30", True, "Will the highest temperature in Ankara be 30°C or below on August 23?"),
+    ]))
+    assert truth.gamma_event("slug")["settled"] is None
+
+
+def test_label_reads_our_own_bucket_out_of_the_ladder(truth, monkeypatch):
+    _stub_gamma(monkeypatch, LADDER)
+    win = truth.label({"venue": "poly", "slug": "s", "token_yes": "t32", "kind": "high"})
+    lose = truth.label({"venue": "poly", "slug": "s", "token_yes": "t31", "kind": "high"})
+    assert win["won"] is True and win["actual_extreme"] == 32
+    assert lose["won"] is False
+
+
+def test_a_token_absent_from_the_ladder_labels_nothing(truth, monkeypatch):
+    _stub_gamma(monkeypatch, LADDER)
+    out = truth.label({"venue": "poly", "slug": "s", "token_yes": "nope", "kind": "high"})
+    assert out["won"] is None and "not in the resolved ladder" in out["reason"]
+
+
+def test_an_unresolved_event_labels_nothing(truth, monkeypatch):
+    _stub_gamma(monkeypatch, _event([
+        _mkt("t31", False, "Will the highest temperature be 31°C?", resolved=False),
+    ]))
+    out = truth.label({"venue": "poly", "slug": "s", "token_yes": "t31", "kind": "high"})
     assert out["won"] is None and "not resolved" in out["reason"]
 
 
-def test_an_unresolved_market_is_not_cached(truth, monkeypatch):
-    _stub_gamma(monkeypatch, [{"umaResolutionStatus": "pending"}])
-    truth.gamma_resolved("s")
+def test_an_unresolved_event_is_not_cached(truth, monkeypatch):
+    _stub_gamma(monkeypatch, [])
+    truth.gamma_event("s")
     assert "s" not in truth._gamma, "must be retried once it settles"
 
 
