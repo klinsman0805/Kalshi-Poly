@@ -237,3 +237,16 @@ def test_a_set_with_one_outcome_reports_insufficient_not_a_verdict():
 def test_a_mixed_set_still_returns_a_real_verdict():
     ev = C.evaluate([0.9, 0.1], [0.5, 0.5], [True, False])
     assert not ev["verdict"].startswith("INSUFFICIENT")
+
+
+def test_evaluate_on_an_empty_split_returns_a_shaped_result():
+    """Narrowing the population to contested markets can leave a train/test
+    split with nothing on one side. evaluate must return something the caller
+    can print rather than a dict missing its keys."""
+    ev = C.evaluate([], [], [])
+    assert ev["n"] == 0
+    # subscript, not .get — the caller prints these directly
+    for k in ("verdict", "brier_model", "brier_base_rate", "brier_market",
+              "mean_predicted", "overconfidence", "reliability", "base_rate"):
+        assert k in ev, k
+    assert ev["brier_model"] is None

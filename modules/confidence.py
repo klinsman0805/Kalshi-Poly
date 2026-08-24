@@ -168,7 +168,14 @@ def evaluate(model_probs, market_probs, outcomes, label="model",
     """
     n = len(outcomes)
     if not n:
-        return {"n": 0, "verdict": "no labelled data"}
+        # Fully shaped, so a caller can subscript it without guarding. Narrowing
+        # the population can legitimately leave a split empty.
+        return {"label": label, "n": 0, "base_rate": None,
+                "brier_model": None, "brier_base_rate": None, "brier_market": None,
+                "log_loss_model": None, "mean_predicted": None,
+                "overconfidence": None, "beats_base_rate": False,
+                "beats_market": False, "reliability": [],
+                "verdict": "no labelled data"}
     br = base_rate(outcomes)
     b_model = brier(model_probs, outcomes)
     b_base = brier([br] * n, outcomes)

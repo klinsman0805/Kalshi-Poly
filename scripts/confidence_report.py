@@ -136,8 +136,8 @@ def main():
 
     # Out-of-sample Platt calibration. Split by market so the same day cannot
     # appear on both sides.
-    if len(rows) >= args.min_n:
-        half = len(rows) // 2
+    if len(records) >= args.min_n:
+        half = len(records) // 2
         fit_p, fit_y = model_p[:half], outcomes[:half]
         test_p, test_y = model_p[half:], outcomes[half:]
         params = C.fit_platt(fit_p, fit_y)
@@ -151,7 +151,7 @@ def main():
               f"market {_fmt(ev['brier_market'])}")
         print(f"   {ev['verdict']}\n")
     else:
-        print(f"── calibration skipped: {len(rows)} labelled rows, "
+        print(f"── calibration skipped: {len(records)} contested markets, "
               f"need {args.min_n} ──")
         print("   Fitting below that is how this project produced two filters "
               "that inverted on re-check.\n")
