@@ -84,7 +84,19 @@ def main():
 
     print(f"labelled rows scored: {len(rows)}"
           + (f"   venue={args.venue}" if args.venue else ""))
-    print(f"signal mix: {C.signal_mix(records)}\n")
+    mix = C.signal_mix(records)
+    print(f"signal mix: {mix}")
+    # Scope matters and is easy to misread. These are ALL scored candidates,
+    # including every row a gate refused — that is the point of recording them,
+    # but it makes the numbers non-comparable with any figure computed over
+    # trades actually taken. The ENTER subset is the one the decision rides on.
+    n_enter = mix.get("ENTER", 0)
+    print(f"scope: every scored candidate, entered or not. "
+          f"ENTER rows in this set: {n_enter}")
+    if not n_enter:
+        print("       -> no tradeable row has settled yet, so nothing here "
+              "describes a trade the bot would have placed.")
+    print()
 
     for probs, name, is_bench in ((model_p, "model_p (as shipped)", False),
                                   (market_p, "market price", True)):
@@ -126,11 +138,37 @@ def main():
         print("   Fitting below that is how this project produced two filters "
               "that inverted on re-check.\n")
 
-    print("── break-even by price band ──")
+    print("── break-even by price band (all scored candidates) ──")
     for b in C.break_even_by_price(records, outcomes):
         flag = "LOSES" if b["gap_pp"] < 0 else "clears"
         print(f"   {b['band']:<9} n={b['n']:<4} win {b['win_rate']:.0%}  "
               f"needs {b['break_even']:.0%}  gap {b['gap_pp']:+.1f}pp  {flag}")
+
+
+
+    enter = [(r, o) for r, o in zip(records, outcomes)
+             if r.get("signal") == "ENTER"]
+    if enter:
+        er, eo = [r for r, _ in enter], [o for _, o in enter]
+        print()
+        print("── the ENTER subset: rows the engine actually wanted ──")
+        ev = C.evaluate([r["model_p"] for r in er],
+                        [C.market_prob(r) for r in er], eo, label="ENTER only")
+        print(f"   n {ev['n']}   base rate {_fmt(ev['base_rate'])}   "
+              f"overconfidence {ev['overconfidence']:+.4f}")
+        print(f"   Brier  model {_fmt(ev['brier_model'])}   "
+              f"base-rate {_fmt(ev['brier_base_rate'])}   "
+              f"market {_fmt(ev['brier_market'])}")
+        print(f"   {ev['verdict']}")
+        for b in C.break_even_by_price(er, eo):
+            flag = "LOSES" if b["gap_pp"] < 0 else "clears"
+            print(f"   {b['band']:<9} n={b['n']:<4} win {b['win_rate']:.0%}  "
+                  f"needs {b['break_even']:.0%}  gap {b['gap_pp']:+.1f}pp  {flag}")
+    else:
+        print()
+        print("── the ENTER subset is still empty ──")
+        print("   Until a row the engine wanted to trade settles, the acceptance")
+        print("   test describes the candidate population, not the strategy.")
 
 
 if __name__ == "__main__":
