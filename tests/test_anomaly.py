@@ -41,27 +41,56 @@ def test_no_settled_value_means_no_miss():
 
 # ── the preliminary-CLI failure ──────────────────────────────────────────────
 
-def test_a_twenty_degree_miss_is_flagged_as_a_label_problem():
-    """Austin 2026-08-23: labelled 84F from a mid-day preliminary report when
-    the day actually reached 105F. Weather does not move that far past a
-    forecast; the label was wrong, not the model."""
-    assert A.implausible_miss(_rec(lo=104, hi=105, unit="F"), 84) is True
+def test_a_label_that_contradicts_our_observation_is_flagged():
+    """Austin 2026-08-23: our METAR read said 98.96F, the label said 84F,
+    because the climate report taken was a mid-day preliminary."""
+    rec = _rec(lo=104, hi=105, unit="F", ext_c=98.96, signal="PRICED")
+    assert A.implausible_miss(rec, 84) is True
 
 
-def test_an_ordinary_miss_is_not_flagged():
-    assert A.implausible_miss(_rec(), 82) is False
+def test_a_label_that_agrees_with_our_observation_is_not_flagged():
+    rec = _rec(lo=77, hi=79, unit="F", ext_c=78.1, signal="PRICED")
+    assert A.implausible_miss(rec, 78) is False
+
+
+def test_a_far_out_of_the_money_bucket_is_not_a_label_bug():
+    """The real false positive this replaced. An 11-wide ladder is scored every
+    cycle, so at 8am the engine holds a bucket eight degrees from where the day
+    ends — priced at 0.1c because the market knows it is dead. Sao Paulo,
+    Madrid and Buenos Aires were all flagged this way while every ladder had
+    resolved correctly."""
+    rec = _rec(lo=27, hi=27, unit="C", ext_c=19.0, signal="PRICED")
+    assert A.implausible_miss(rec, 19) is False, "our observation matched the label"
+
+
+def test_an_unlocked_row_is_never_flagged():
+    """Before the extreme locks, our reading is legitimately behind the day and
+    a gap is information rather than a fault."""
+    rec = _rec(lo=26, hi=26, unit="C", ext_c=15.0, signal="EARLY")
+    assert A.implausible_miss(rec, 19) is False
 
 
 def test_celsius_uses_a_tighter_threshold_than_fahrenheit():
     """Seven Celsius degrees is about thirteen Fahrenheit; the same physical
     limit has to be expressed per unit."""
-    assert A.implausible_miss(_rec(lo=30, hi=31, unit="C"), 40) is True
-    assert A.implausible_miss(_rec(lo=30, hi=31, unit="C"), 34) is False
-    assert A.implausible_miss(_rec(lo=86, hi=88, unit="F"), 94) is False
+    assert A.implausible_miss(_rec(unit="C", ext_c=30.0, signal="PRICED"), 40) is True
+    assert A.implausible_miss(_rec(unit="C", ext_c=30.0, signal="PRICED"), 34) is False
+    assert A.implausible_miss(_rec(unit="F", ext_c=86.0, signal="PRICED"), 94) is False
+
+
+def test_a_row_without_an_observation_cannot_be_judged():
+    assert A.implausible_miss(_rec(signal="PRICED"), 84) is False
+
+
+def test_observation_divergence_is_signed():
+    assert A.observation_divergence(_rec(ext_c=98.96), 84) == pytest.approx(-14.96)
+    assert A.observation_divergence(_rec(ext_c=None), 84) is None
 
 
 def test_find_implausible_returns_only_the_bad_rows():
-    pairs = [(_rec(lo=104, hi=105), 84), (_rec(), 78), (_rec(), 81)]
+    pairs = [(_rec(lo=104, hi=105, ext_c=98.96, signal="PRICED"), 84),
+             (_rec(ext_c=78.0, signal="PRICED"), 78),
+             (_rec(ext_c=15.0, signal="EARLY"), 19)]
     assert len(A.find_implausible(pairs)) == 1
 
 
@@ -126,13 +155,15 @@ def test_nothing_settleable_is_not_a_stall():
 
 def test_a_clean_system_reports_no_issues():
     fresh = (NOW - timedelta(minutes=5)).isoformat()
-    pairs = [(_rec(), 78), (_rec(), 79)]
+    pairs = [(_rec(ext_c=78.0, signal="PRICED"), 78),
+             (_rec(ext_c=79.0, signal="PRICED"), 79)]
     assert A.scan(pairs, fresh, 10, 9, now=NOW) == []
 
 
 def test_scan_surfaces_the_bad_rows_for_eyeballing():
     fresh = (NOW - timedelta(minutes=5)).isoformat()
-    issues = A.scan([(_rec(lo=104, hi=105), 84)], fresh, 10, 9, now=NOW)
+    issues = A.scan([(_rec(lo=104, hi=105, ext_c=98.96, signal="PRICED"), 84)],
+                    fresh, 10, 9, now=NOW)
     assert issues[0]["code"] == "implausible_miss"
     assert issues[0]["level"] == "ERROR"
     assert issues[0]["rows"][0]["settled"] == 84
@@ -140,7 +171,8 @@ def test_scan_surfaces_the_bad_rows_for_eyeballing():
 
 def test_scan_reports_several_problems_at_once():
     stale = (NOW - timedelta(hours=6)).isoformat()
-    issues = A.scan([(_rec(lo=104, hi=105), 84)], stale, 100, 5, now=NOW)
+    issues = A.scan([(_rec(lo=104, hi=105, ext_c=98.96, signal="PRICED"), 84)],
+                    stale, 100, 5, now=NOW)
     assert {i["code"] for i in issues} == {"implausible_miss", "capture_stalled",
                                            "labels_stalled"}
 

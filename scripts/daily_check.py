@@ -86,8 +86,8 @@ def main():
     for i in issues:
         print("   [%s] %s: %s" % (i["level"], i["code"], i["detail"]))
         for row in i.get("rows", []):
-            print("        %-30s bucket %s settled %s (miss %+.1f%s)"
-                  % (row["key"], row["bucket"], row["settled"],
+            print("        %-30s we observed %s, label says %s (off by %+.1f%s)"
+                  % (row["key"], row.get("observed"), row["settled"],
                      row["miss"], row.get("unit") or ""))
 
     # ── capture ──────────────────────────────────────────────────────────────

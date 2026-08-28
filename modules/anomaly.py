@@ -7,12 +7,18 @@ concrete numbers. Brier scores cannot distinguish a confidently wrong model
 from a confidently wrong label; a reliability table looks identical either way.
 So these look at the raw quantities instead.
 
-  implausible_miss    A settled value 15-20 degrees from our bucket is not a
-                      forecasting error, it is a bad label. Austin 2026-08-23
-                      was recorded as 84F when the day reached 105F, because
-                      the NWS climate report we read was a mid-day preliminary
-                      rather than the final. Six labels were wrong before the
-                      settled-vs-predicted table exposed them.
+  implausible_miss    A settled value far from OUR OWN OBSERVATION is a bad
+                      label. Austin 2026-08-23 was recorded as 84F while our
+                      METAR read said 98.96F, because the climate report we
+                      took was a mid-day preliminary rather than the final.
+
+                      The comparison must be against the observation, not
+                      against the bucket. An 11-wide ladder is scored every
+                      cycle, so at 8am the engine legitimately holds a bucket
+                      eight degrees from where the day ends — priced at 0.1c,
+                      because the market knows it is dead. Measuring against
+                      the bucket flagged three such rows as label bugs when
+                      every ladder had in fact resolved correctly.
 
   mixed_units         Polymarket trades whole degrees Celsius abroad and
                       Fahrenheit in the US. Aggregating a "median miss" across
@@ -65,13 +71,28 @@ def bucket_miss(rec, actual):
     return 0.0
 
 
+def observation_divergence(rec, actual):
+    """Degrees between the settled value and what WE observed. None if unknown."""
+    obs = rec.get("ext_c")
+    if obs is None or actual is None:
+        return None
+    return actual - obs
+
+
 def implausible_miss(rec, actual):
-    """Is this miss too large to be weather?"""
-    miss = bucket_miss(rec, actual)
-    if miss is None:
+    """Does the settled value contradict our own observation?
+
+    Only meaningful once the extreme has locked. Before that our reading is
+    legitimately behind the day, and a gap is information rather than a fault.
+    """
+    from modules.confidence import cleared_timing
+    if not cleared_timing(rec):
+        return False
+    div = observation_divergence(rec, actual)
+    if div is None:
         return False
     limit = IMPLAUSIBLE_MISS.get(rec.get("unit"), IMPLAUSIBLE_MISS["F"])
-    return abs(miss) > limit
+    return abs(div) > limit
 
 
 def find_implausible(pairs):
@@ -110,12 +131,12 @@ def scan(pairs, latest_capture_ts=None, n_settleable=0, n_labelled=0, now=None):
     if bad:
         out.append({
             "level": "ERROR", "code": "implausible_miss",
-            "detail": "%d labelled market(s) settled further from our bucket "
-                      "than weather moves in a day — suspect the LABEL, not the "
-                      "model" % len(bad),
+            "detail": "%d locked market(s) whose settled value contradicts our "
+                      "own observation — suspect the LABEL, not the model" % len(bad),
             "rows": [{"key": r.get("key"), "unit": r.get("unit"),
                       "bucket": [r.get("lo"), r.get("hi")], "settled": a,
-                      "miss": bucket_miss(r, a)} for r, a in bad[:8]],
+                      "observed": r.get("ext_c"),
+                      "miss": observation_divergence(r, a)} for r, a in bad[:8]],
         })
     stalled, age = capture_stalled(latest_capture_ts, now)
     if stalled:
