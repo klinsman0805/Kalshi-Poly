@@ -39,6 +39,17 @@ TIMEOUT = 20
 # small chunks so every station gets its full LOOKBACK_HOURS of history.
 CHUNK = 10
 
+# A 6-hourly max/min group exists to catch an extreme that fell BETWEEN hourly
+# observations, so it should sit within a degree or two of what we saw. Some
+# stations emit groups that decode to nonsense: Ankara 2026-08-28 reported
+# minT=-0.4 and maxT=-0.8 on a day whose 37 observations ran 15-27C. Folding
+# that in dropped the running minimum to -0.4 and, because a bogus MAX is only
+# folded when it is higher, corrupted low markets exclusively — the model then
+# read the day's minimum as already locked and returned p=1.0 on a bucket that
+# could not win. Anything further outside the observed range than this is a
+# decode error, not an extreme we missed.
+SIX_HOURLY_TOLERANCE_C = 5.0
+
 
 class MetarFeed:
     """Tracks running local-day max temperature for a set of ICAO stations."""
@@ -159,12 +170,21 @@ class MetarFeed:
         # report: a correct LOWER bound on the age (conservative — never overstates
         # how long the extreme has held).
         six_max_ts = six_min_ts = None
+        obs_max, obs_min = max_c, min_c        # what the hourly obs actually saw
         for ts, _t, mx, mn in today:
             if ts.astimezone(tz).hour >= 6:
-                if mx is not None and float(mx) > max_c:
+                if (mx is not None and float(mx) > max_c
+                        and float(mx) - obs_max <= SIX_HOURLY_TOLERANCE_C):
                     max_c, six_max_ts = float(mx), ts
-                if mn is not None and float(mn) < min_c:
+                if (mn is not None and float(mn) < min_c
+                        and obs_min - float(mn) <= SIX_HOURLY_TOLERANCE_C):
                     min_c, six_min_ts = float(mn), ts
+                if ((mx is not None and float(mx) - obs_max > SIX_HOURLY_TOLERANCE_C)
+                        or (mn is not None
+                            and obs_min - float(mn) > SIX_HOURLY_TOLERANCE_C)):
+                    log.warning("%s: discarding implausible 6-hourly group "
+                                "max=%s min=%s against observed %.1f..%.1f",
+                                icao, mx, mn, obs_min, obs_max)
 
         # ── age of each extreme, measured over the CURRENT diurnal swing ──────
         # Naively "first touch today" breaks when the day STARTS near its extreme:
