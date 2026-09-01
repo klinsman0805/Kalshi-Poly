@@ -126,3 +126,14 @@ def test_kalshi_fetch_failure_returns_none():
 def test_no_event_ticker_is_empty_not_a_call():
     assert OB.fetch_kalshi_ladder(None) == {}
     assert OB.fetch_kalshi_ladder("") == {}
+
+
+def test_kalshi_carries_no_book_timestamp():
+    """`updated_time` is when the market RECORD changed, not when the book did.
+    The first live slice read a median age of 93,176s from it on quotes that
+    were plainly current, so it must not masquerade as a book timestamp."""
+    with patch("engine.kalshi_get", return_value={"markets": [_kalshi_market()]}):
+        out = OB.fetch_kalshi_ladder("EV")
+    r = out["KXHIGHNY-26SEP01-B85.5"]
+    assert r["book_ts"] is None, "a wrong age is worse than no age"
+    assert r["market_updated"] == "2026-09-01T12:00:00Z"

@@ -124,7 +124,13 @@ def fetch_kalshi_ladder(event_ticker, timeout=TIMEOUT):
             "ask_levels": ([[round(ask * 100.0, 4),
                              _f(m.get("yes_ask_size_fp")) or 0.0]]
                            if ask is not None else []),
-            "book_ts": m.get("updated_time"),
+            # NOT a book timestamp. `updated_time` is when the market RECORD
+            # last changed, and the first live slice read a median age of
+            # 93,176s (26 hours) from it on quotes that were plainly current.
+            # Kalshi publishes no per-book timestamp, so book_ts stays None and
+            # the misleading field is kept under its own name.
+            "book_ts": None,
+            "market_updated": m.get("updated_time"),
             "tick_size": 0.01,          # price_level_structure: linear_cent
             "min_order_size": 1.0,
             "last_trade_c": (lambda v: round(v * 100.0, 4) if v is not None else None)(

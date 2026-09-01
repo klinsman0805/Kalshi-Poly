@@ -247,8 +247,11 @@ class BookLogger:
                 "n_bid_levels": len(bids),
                 "n_ask_levels": len(asks),
                 # ── venue metadata ──
+                # Polymarket stamps each book; Kalshi does not, so book_age_s
+                # is None there rather than a plausible-looking wrong number.
                 "book_ts": bk.get("book_ts"),
                 "book_age_s": _age_s(bk.get("book_ts"), now),
+                "market_updated": bk.get("market_updated"),
                 "tick_size": bk.get("tick_size"),
                 "min_order_size": bk.get("min_order_size"),
                 "last_trade_c": bk.get("last_trade_c"),
