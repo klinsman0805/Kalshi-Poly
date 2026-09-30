@@ -17,7 +17,11 @@ NOW = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
 
 
 def _event(city="London", d=None, kind="low", n=3, tokens=None):
-    d = d if d is not None else date(2026, 9, 1)
+    # Relative to today, never a literal. These tests were written on
+    # 2026-09-01 with date(2026, 9, 1) hard-coded, and quietly started failing
+    # four weeks later when the recorder correctly filtered the fixture out as
+    # a past event.
+    d = d if d is not None else datetime.now(timezone.utc).date()
     toks = tokens or [f"tok{i}" for i in range(n)]
     return {
         "venue": "poly", "city": city, "date": d, "kind": kind,
@@ -126,7 +130,8 @@ def test_a_recently_captured_event_is_skipped():
 
 
 def test_events_further_ahead_than_the_window_are_ignored():
-    far = _event(d=date(2026, 9, 1) + timedelta(days=B.MAX_DAYS_OUT + 1))
+    far = _event(d=datetime.now(timezone.utc).date()
+                 + timedelta(days=B.MAX_DAYS_OUT + 1))
     assert BookLogger("poly")._due([far], 1000.0) == []
 
 
