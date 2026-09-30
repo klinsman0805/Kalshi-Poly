@@ -68,6 +68,12 @@ _MARKETS_TTL_SEC = float(os.getenv("POLY_REWARDS_MARKETS_TTL_SEC", "60"))
 def fetch_reward_markets(tag_slug="weather", min_rate=0.0, max_pages=20, use_cache=True):
     """Bulk-pull every active market with a reward config under `tag_slug`.
 
+    Pass tag_slug=None to drop the filter and pull the WHOLE reward universe —
+    18,323 markets paying $224,149/day between them, against which "weather"
+    was a rounding error. The money is steeply concentrated: the median pool is
+    $3/day, but 151 markets pay $100/day or more and carry 27% of the pot.
+    Sorting by rate_per_day and taking a min_rate is how you reach them.
+
     One paginated endpoint (`/rewards/markets/multi`), no per-market calls —
     this is the cheap, always-safe half of the scanner. Returns a list of
     dicts: condition_id, question, slug, rate_per_day (summed across reward
@@ -86,8 +92,10 @@ def fetch_reward_markets(tag_slug="weather", min_rate=0.0, max_pages=20, use_cac
 
     out, cursor = [], None
     for _ in range(max_pages):
-        params = {"tag_slug": tag_slug, "page_size": PAGE_SIZE,
-                   "order_by": "rate_per_day", "position": "DESC"}
+        params = {"page_size": PAGE_SIZE,
+                  "order_by": "rate_per_day", "position": "DESC"}
+        if tag_slug:
+            params["tag_slug"] = tag_slug
         if cursor:
             params["next_cursor"] = cursor
         r = requests.get(CLOB_MULTI, params=params, timeout=TIMEOUT)
@@ -374,8 +382,10 @@ def _find_reward_market(condition_id, tag_slug="weather"):
     endpoint fetch_reward_markets uses until it finds the id."""
     cursor = None
     for _ in range(20):
-        params = {"tag_slug": tag_slug, "page_size": PAGE_SIZE,
-                   "order_by": "rate_per_day", "position": "DESC"}
+        params = {"page_size": PAGE_SIZE,
+                  "order_by": "rate_per_day", "position": "DESC"}
+        if tag_slug:
+            params["tag_slug"] = tag_slug
         if cursor:
             params["next_cursor"] = cursor
         r = requests.get(CLOB_MULTI, params=params, timeout=TIMEOUT)
@@ -499,8 +509,10 @@ def get_band(condition_id, tag_slug="weather"):
     market = None
     cursor = None
     for _ in range(20):
-        params = {"tag_slug": tag_slug, "page_size": PAGE_SIZE,
-                   "order_by": "rate_per_day", "position": "DESC"}
+        params = {"page_size": PAGE_SIZE,
+                  "order_by": "rate_per_day", "position": "DESC"}
+        if tag_slug:
+            params["tag_slug"] = tag_slug
         if cursor:
             params["next_cursor"] = cursor
         r = requests.get(CLOB_MULTI, params=params, timeout=TIMEOUT)
