@@ -197,3 +197,52 @@ def test_complement_levels_are_stored_unconverted():
     books = {"tokYES": ([], []), "tokNO": ([[58.0, 700.0]], [])}
     rec = lg._record(_market(), books, {"mid_c": 40.0}, NOW)
     assert rec["no_bid_levels"] == [[58.0, 700.0]]
+
+
+# ── discovery paging ─────────────────────────────────────────────────────────
+
+def test_paging_stops_at_the_first_market_under_the_floor():
+    """Ordered rate_per_day DESC, so the first row below min_rate means every
+    remaining row is too. Without the early break a min_rate=50 pull walks all
+    37 pages of the 18,323-market universe to throw 99% of it away."""
+    from feeds import poly_rewards as PR
+
+    def page(rates, cursor):
+        return {"data": [{"condition_id": f"0x{r}", "question": "q",
+                          "market_slug": "s", "rewards_max_spread": 3.5,
+                          "rewards_min_size": 200, "tokens": [],
+                          "rewards_config": [{"rate_per_day": r}]} for r in rates],
+                "next_cursor": cursor}
+
+    calls = []
+
+    class _R:
+        def __init__(self, p): self._p = p
+        def raise_for_status(self): pass
+        def json(self): return self._p
+
+    def fake_get(url, params=None, timeout=None):
+        calls.append(params.get("next_cursor"))
+        return _R(page([500, 200, 10], "MORE") if len(calls) == 1
+                  else page([1, 1, 1], "MORE"))
+
+    with patch.object(PR.requests, "get", side_effect=fake_get):
+        out = PR.fetch_reward_markets(tag_slug=None, min_rate=50, use_cache=False)
+    assert [m["rate_per_day"] for m in out] == [500.0, 200.0]
+    assert len(calls) == 1, "must not fetch a second page once under the floor"
+
+
+def test_no_floor_still_pages_through():
+    from feeds import poly_rewards as PR
+
+    class _R:
+        def __init__(self, p): self._p = p
+        def raise_for_status(self): pass
+        def json(self): return self._p
+
+    pages = [{"data": [{"condition_id": "0x1", "rewards_config": [{"rate_per_day": 5}],
+                        "tokens": [], "rewards_max_spread": 3, "rewards_min_size": 1}],
+              "next_cursor": "LTE="}]
+    with patch.object(PR.requests, "get", side_effect=lambda *a, **k: _R(pages[0])):
+        out = PR.fetch_reward_markets(tag_slug=None, min_rate=0, use_cache=False)
+    assert len(out) == 1

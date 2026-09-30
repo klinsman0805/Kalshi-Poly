@@ -101,10 +101,17 @@ def fetch_reward_markets(tag_slug="weather", min_rate=0.0, max_pages=20, use_cac
         r = requests.get(CLOB_MULTI, params=params, timeout=TIMEOUT)
         r.raise_for_status()
         page = r.json()
+        exhausted = False
         for m in page.get("data") or []:
             rate = sum(float(c.get("rate_per_day") or 0) for c in (m.get("rewards_config") or []))
             if rate < min_rate:
-                continue
+                # The endpoint is queried order_by=rate_per_day DESC, so the
+                # first row under the floor means every remaining row is too.
+                # Without this, a min_rate=50 pull still walks all 37 pages of
+                # the 18,323-market universe to discard 99% of them — minutes
+                # of paging on a box that runs this from a 15-minute cron.
+                exhausted = True
+                break
             tokens = m.get("tokens") or []
             out.append({
                 "condition_id": m.get("condition_id"),
@@ -118,7 +125,8 @@ def fetch_reward_markets(tag_slug="weather", min_rate=0.0, max_pages=20, use_cac
                             "price": float(t.get("price") or 0)} for t in tokens],
             })
         cursor = page.get("next_cursor")
-        if not cursor or cursor == "LTE=" or len(page.get("data") or []) < PAGE_SIZE:
+        if (exhausted or not cursor or cursor == "LTE="
+                or len(page.get("data") or []) < PAGE_SIZE):
             break
     _MARKETS_CACHE[key] = (time.monotonic(), out)
     return out
