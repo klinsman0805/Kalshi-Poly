@@ -40,15 +40,18 @@ from modules.reward_book_log import LOG_PATH, RewardBookLogger    # noqa: E402
 
 
 def survey(min_rate):
-    """What is on offer, without writing anything."""
+    """What is on offer at or above the floor, without writing anything.
+
+    Deliberately does NOT pull at min_rate=0. The universe is 18,323 markets
+    across 37 pages of 500, and pulling all of it to discard 99% took over two
+    minutes — the early break in fetch_reward_markets only helps when there is
+    a floor to break on. Universe-wide totals belong in a one-off probe, not in
+    something that runs from cron.
+    """
     from feeds.poly_rewards import fetch_reward_markets
-    allm = fetch_reward_markets(tag_slug=None, min_rate=0.0, use_cache=False)
-    tgt = [m for m in allm if (m.get("rate_per_day") or 0) >= min_rate]
-    total = sum(m.get("rate_per_day") or 0 for m in allm)
+    tgt = fetch_reward_markets(tag_slug=None, min_rate=min_rate, use_cache=False)
     tsum = sum(m.get("rate_per_day") or 0 for m in tgt)
-    print(f"reward universe : {len(allm):,} markets, ${total:,.0f}/day")
-    print(f"at >= ${min_rate:g}/day : {len(tgt):,} markets, ${tsum:,.0f}/day "
-          f"({100*tsum/total if total else 0:.0f}% of the pot)")
+    print(f"at >= ${min_rate:g}/day : {len(tgt):,} markets, ${tsum:,.0f}/day")
     print(f"\n{'pool $/day':>10}  {'band':>5}  {'minsz':>6}  question")
     for m in sorted(tgt, key=lambda x: -(x.get("rate_per_day") or 0))[:20]:
         print(f"{m.get('rate_per_day') or 0:10.0f}  {m.get('max_spread_c'):5}  "
